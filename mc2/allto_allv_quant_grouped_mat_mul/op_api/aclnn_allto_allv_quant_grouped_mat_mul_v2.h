@@ -7,8 +7,8 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
   */
-#ifndef OP_API_INC_QUANT_ALL_TO_ALLV_GROUPED_MATMUL_
-#define OP_API_INC_QUANT_ALL_TO_ALLV_GROUPED_MATMUL_
+#ifndef OP_API_INC_QUANT_ALL_TO_ALLV_GROUPED_MATMUL_V2_
+#define OP_API_INC_QUANT_ALL_TO_ALLV_GROUPED_MATMUL_V2_
 
 #include <string>
 
@@ -50,6 +50,8 @@ extern "C" {
  * @param [in] mmXQuantMode: 共享专家matmul计算中的左矩阵的量化模式，同上，当前仅支持配置为1或6。
  * @param [in] mmWeightQuantMode: 共享专家matmul计算中的右矩阵的量化模式，同上，当前仅支持配置为1或6。
  * @param [in] group: 计算输入，str。ep通信域名称，专家并行的通信域。
+ * @param [in] commMode: 计算输入，str。通信引擎参数，指定当前通信类型，支持输入"default"、"ai_cpu"和"ccu"
+ * @param [in] epWorldSize: 计算输入，int。ep通信域size
  * @param [in] epWorldSize: 计算输入，int。ep通信域size。
  * @param [in] sendCounts: 计算输入，list int。通信发送的数据量。
  * @param [in] recvCounts: 计算输入，list int。通信接受的数据量。
@@ -83,29 +85,30 @@ extern "C" {
  * e表示单卡上的专家数量;
  * A = recvCounts的累加和;
  */
-__attribute__((visibility("default"))) aclnnStatus aclnnAlltoAllvQuantGroupedMatMulGetWorkspaceSize(
+__attribute__((visibility("default"))) aclnnStatus aclnnAlltoAllvQuantGroupedMatMulV2GetWorkspaceSize(
     const aclTensor *gmmX, const aclTensor *gmmWeight, const aclTensor *gmmXScale, const aclTensor *gmmWeightScale,
     const aclTensor *sendCountsTensorOptional, const aclTensor *recvCountsTensorOptional, const aclTensor *mmXOptional,
     const aclTensor *mmWeightOptional, const aclTensor *mmXScaleOptional, const aclTensor *mmWeightScaleOptional,
     int64_t gmmXQuantMode, int64_t gmmWeightQuantMode, int64_t mmXQuantMode, int64_t mmWeightQuantMode,
-    const char *group, int64_t epWorldSize, const aclIntArray *sendCounts, const aclIntArray *recvCounts,
-    bool transGmmWeight, bool transMmWeight, int64_t groupSize, bool permuteOutFlag, aclTensor *gmmY,
-    aclTensor *mmYOptional, aclTensor *permuteOutOptional, uint64_t *workspaceSize, aclOpExecutor **executor);
+    const char *group, const char *commMode, int64_t epWorldSize, const aclIntArray *sendCounts,
+    const aclIntArray *recvCounts, bool transGmmWeight, bool transMmWeight, int64_t groupSize,
+    bool permuteOutFlag, aclTensor *gmmY, aclTensor *mmYOptional, aclTensor *permuteOutOptional,
+    uint64_t *workspaceSize, aclOpExecutor **executor);
 
 /* *
- * @brief aclnnAlltoAllvGroupedMatMul的第二段接口，用于执行计算。
+ * @brief aclnnAlltoAllvGroupedMatMulV2的第二段接口，用于执行计算。
  * @param [in] workspace: 在npu device侧申请的workspace内存起址。
  * @param [in] workspaceSize: 在npu
- * device侧申请的workspace大小，由第一段接口aclnnAlltoAllvGroupedMatMulGetWorkspaceSize获取。
+ * device侧申请的workspace大小，由第一段接口aclnnAlltoAllvGroupedMatMulV2GetWorkspaceSize获取。
  * @param [in] executor: op执行器，包含了算子计算流程。
  * @param [in] stream: acl stream流。
  * @return aclnnStatus: 返回状态码
  */
-__attribute__((visibility("default"))) aclnnStatus aclnnAlltoAllvQuantGroupedMatMul(void *workspace,
+__attribute__((visibility("default"))) aclnnStatus aclnnAlltoAllvQuantGroupedMatMulV2(void *workspace,
     uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // OP_API_INC_QUANT_ALL_TO_ALLV_GROUPED_MATMUL_
+#endif // OP_API_INC_QUANT_ALL_TO_ALLV_GROUPED_MATMUL_V2_
