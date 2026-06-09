@@ -7,27 +7,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-add_op_to_compiled_list()
 
-if (BUILD_OPEN_PROJECT)
-    target_sources(op_host_aclnn PRIVATE
-        sparse_flash_mla_def.cpp
-    )
+if(UT_TEST_ALL OR OP_HOST_UT)
+    add_modules_ut_sources(UT_NAME ${OP_TILING_MODULE_NAME} MODE PRIVATE DIR ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
-add_ops_compile_options(
-    OP_NAME SparseFlashMla
-    OPTIONS --cce-auto-sync=off
-            -Wno-deprecated-declarations
-            -Werror
-            -mllvm -cce-vf-remove-membar=false
-            -mllvm -cce-aicore-hoist-movemask=false
-)
-
-add_modules_sources(OPTYPE sparse_flash_mla ACLNNTYPE aclnn)
-
-if(NOT BUILD_OPS_RTY_KERNEL)
-    target_sources(${OPHOST_NAME}_tiling_obj PRIVATE
-        ./arch22/sparse_flash_mla_tiling_arch22.cpp
-    )
-endif()
+file(GLOB CURRENT_DIRS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/*)
+foreach(SUB_DIR ${CURRENT_DIRS})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SUB_DIR}/CMakeLists.txt")
+        add_subdirectory(${SUB_DIR})
+    endif()
+endforeach()
