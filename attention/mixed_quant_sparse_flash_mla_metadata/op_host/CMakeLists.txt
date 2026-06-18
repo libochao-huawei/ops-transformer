@@ -9,4 +9,4 @@
 # -----------------------------------------------------------------------------------------------------------
 add_op_to_compiled_list()
 
-add_modules_sources(OPTYPE sparse_flash_mla_metadata ACLNNTYPE aclnn)
+add_modules_sources(OPTYPE mixed_quant_sparse_flash_mla_metadata ACLNNTYPE aclnn)

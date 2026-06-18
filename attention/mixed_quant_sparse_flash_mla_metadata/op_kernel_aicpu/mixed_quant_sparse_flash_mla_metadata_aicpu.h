@@ -9,12 +9,12 @@
  */
 
 /*!
- * \file sparse_flash_mla_metadata_aicpu.h
+ * \file mixed_quant_sparse_flash_mla_metadata_aicpu.h
  * \brief
  */
 
-#ifndef SPARSE_FLASH_MLA_METADATA_AICPU_H
-#define SPARSE_FLASH_MLA_METADATA_AICPU_H
+#ifndef MIXED_QUANT_SPARSE_FLASH_MLA_METADATA_AICPU_H
+#define MIXED_QUANT_SPARSE_FLASH_MLA_METADATA_AICPU_H
 
 #include <array>
 #include <string>
@@ -22,7 +22,7 @@
 #include "cpu_context.h"
 #include "cpu_kernel.h"
 #include "cpu_tensor.h"
-#include "../../sparse_flash_mla/op_kernel/sparse_flash_mla_metadata.h"
+#include "../../mixed_quant_sparse_flash_mla/op_kernel/mixed_quant_sparse_flash_mla_metadata.h"
 #include "../../common/op_kernel/aicpu_common.h"
 
 namespace aicpu {
@@ -234,10 +234,10 @@ struct AssignContext {
     CoreCache coreCache {};
 };
 
-class SparseFlashMlaMetadataCpuKernel : public CpuKernel {
+class MixedQuantSparseFlashMlaMetadataCpuKernel : public CpuKernel {
 public:
-    SparseFlashMlaMetadataCpuKernel() = default;
-    ~SparseFlashMlaMetadataCpuKernel() = default;
+    MixedQuantSparseFlashMlaMetadataCpuKernel() = default;
+    ~MixedQuantSparseFlashMlaMetadataCpuKernel() = default;
     uint32_t Compute(CpuKernelContext &ctx) override;
 
 private:

@@ -9,7 +9,7 @@
  */
 
 /**
- * @file test_aclnn_sparse_flash_mla_metadata.cpp
+ * @file test_aclnn_mixed_quant_sparse_flash_mla_metadata.cpp
  */
 #include <iostream>
 #include <vector>
@@ -19,7 +19,7 @@
 #include <functional>
 #include <utility>
 #include "acl/acl.h"
-#include "aclnnop/aclnn_sparse_flash_mla_metadata.h"
+#include "aclnnop/aclnn_mixed_quant_sparse_flash_mla_metadata.h"
 
 #define CHECK_LOG_RET(cond, ret_val, fmt, ...)      \
     do {                                            \
@@ -29,10 +29,10 @@
         }                                           \
     } while (0)
 
-// 参考 sparse_flash_mla_metadata.h
+// 参考 mixed_quant_sparse_flash_mla_metadata.h
 constexpr uint32_t AIC_CORE_MAX_NUM = 36;
 constexpr uint32_t AIV_CORE_MAX_NUM = 72;
-constexpr uint32_t SMLA_METADATA_TOTAL_SIZE = 1024;
+constexpr uint32_t MQSMLA_METADATA_TOTAL_SIZE = 1024;
 constexpr uint32_t FA_METADATA_SIZE = 9;
 constexpr uint32_t FD_METADATA_SIZE = 8;
 
@@ -56,7 +56,7 @@ constexpr uint32_t FD_WORKSPACE_NUM_INDEX = 4;
 constexpr uint32_t FD_M_START_INDEX = 5;
 constexpr uint32_t FD_M_NUM_INDEX = 6;
 
-struct SmlaMetadata {
+struct MqsmlaMetadata {
     uint32_t faMetadata[AIC_CORE_MAX_NUM][FA_METADATA_SIZE];
     uint32_t fdMetadata[AIV_CORE_MAX_NUM][FD_METADATA_SIZE];
 };
@@ -101,6 +101,7 @@ struct ArgContext {
     int64_t numHeadsQ { 0 };
     int64_t numHeadsKv { 0 };
     int64_t headDim { 0 };
+    int64_t quantMode { 1 };
     // optional input
     Tensor cuSeqlensQOptional {};
     Tensor cuSeqlensOriKvOptional {};
@@ -117,6 +118,7 @@ struct ArgContext {
     int64_t maxSeqlenCmpKv { 0 };
     int64_t oriTopk { 0 };
     int64_t cmpTopk { 0 };
+    int64_t ropeHeadDim { 64 };
     int64_t cmpRatio { 0 };
     int64_t oriMaskMode { 0 };
     int64_t cmpMaskMode { 0 };
@@ -225,10 +227,12 @@ aclnnStatus CreateArgs(const ArgScenario &scenario, ArgContext &context)
     context.numHeadsQ = 64;
     context.numHeadsKv = 1;
     context.headDim = 512;
-    ret = CreateTensor(aclDataType::ACL_INT32, { SMLA_METADATA_TOTAL_SIZE }, context.metadata);     // 1024: Fix size
+    context.quantMode = 1;
+    ret = CreateTensor(aclDataType::ACL_INT32, { MQSMLA_METADATA_TOTAL_SIZE }, context.metadata);     // 1024: Fix size
     CHECK_LOG_RET(ret == ACL_SUCCESS, ret, "Create metadata failed. Error: %d", ret);
     context.oriTopk = 0;
     context.cmpTopk = 0;
+    context.ropeHeadDim = 64;
     context.cmpRatio = 128;
     context.oriMaskMode = 4;
     context.cmpMaskMode = 3;
@@ -297,20 +301,21 @@ int main() {
     ScopeGuard argsGuard([&] { DestroyArgs(context); });
 
     // 3. 调用CANN算子库API，需要修改为具体的API
-    // 调用aclnnSparseFlashMlaMetadata第一段接口
+    // 调用aclnnMixedQuantSparseFlashMlaMetadata第一段接口
     uint64_t workspaceSize = 0;
     aclOpExecutor *executor = nullptr;
     void *workspaceAddr = nullptr;
-    ret = aclnnSparseFlashMlaMetadataGetWorkspaceSize(
+    ret = aclnnMixedQuantSparseFlashMlaMetadataGetWorkspaceSize(
         context.cuSeqlensQOptional.data, context.cuSeqlensOriKvOptional.data, context.cuSeqlensCmpKvOptional.data,
         context.sequsedQOptional.data, context.sequsedOriKvOptional.data, context.sequsedCmpKvOptional.data,
         context.cmpResidualKvOptional.data, context.oriTopkLengthOptional.data, context.cmpTopkLengthOptional.data, 
-        context.numHeadsQ, context.numHeadsKv, context.headDim, context.batchSize, context.maxSeqlenQ,
-        context.maxSeqlenOriKv, context.maxSeqlenCmpKv, context.oriTopk, context.cmpTopk, context.cmpRatio,
-        context.oriMaskMode, context.cmpMaskMode, context.oriWinLeft, context.oriWinRight, context.layoutQOptional,
-        context.layoutKvOptional, context.hasOriKv, context.hasCmpKv, context.metadata.data, &workspaceSize, &executor);
+        context.numHeadsQ, context.numHeadsKv, context.headDim, context.quantMode, context.batchSize,
+        context.maxSeqlenQ, context.maxSeqlenOriKv, context.maxSeqlenCmpKv, context.oriTopk, context.cmpTopk,
+        context.ropeHeadDim, context.cmpRatio, context.oriMaskMode, context.cmpMaskMode, context.oriWinLeft,
+        context.oriWinRight, context.layoutQOptional, context.layoutKvOptional, context.hasOriKv, context.hasCmpKv,
+        context.metadata.data, &workspaceSize, &executor);
     CHECK_LOG_RET(ret == ACL_SUCCESS, ret,
-        "aclnnSparseFlashMlaMetadataGetWorkspaceSize failed. ERROR: %d\n", ret);
+        "aclnnMixedQuantSparseFlashMlaMetadataGetWorkspaceSize failed. ERROR: %d\n", ret);
 
     if (workspaceSize > static_cast<uint64_t>(0)) {
         ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
@@ -323,16 +328,16 @@ int main() {
         }
     });
     
-    // 调用aclnnSparseFlashMlaMetadata第二段接口
-    ret = aclnnSparseFlashMlaMetadata(workspaceAddr, workspaceSize, executor, stream);
-    CHECK_LOG_RET(ret == ACL_SUCCESS, ret, "aclnnSparseFlashMlaMetadata failed. ERROR: %d\n", ret);
+    // 调用aclnnMixedQuantSparseFlashMlaMetadata第二段接口
+    ret = aclnnMixedQuantSparseFlashMlaMetadata(workspaceAddr, workspaceSize, executor, stream);
+    CHECK_LOG_RET(ret == ACL_SUCCESS, ret, "aclnnMixedQuantSparseFlashMlaMetadata failed. ERROR: %d\n", ret);
 
     // 4. （固定写法）同步等待任务执行结束
     ret = aclrtSynchronizeStream(stream);
     CHECK_LOG_RET(ret == ACL_SUCCESS, ret, "aclrtSynchronizeStream failed. ERROR: %d\n", ret);
 
     // 5. 打印输出
-    SmlaMetadata result {};
+    MqsmlaMetadata result {};
     ret = aclrtMemcpy(&result, sizeof(result), context.metadata.deviceAddr, sizeof(result), ACL_MEMCPY_DEVICE_TO_HOST);
     CHECK_LOG_RET(ret == ACL_SUCCESS, ret, "aclrtMemcpy failed. ERROR: %d\n", ret);
 

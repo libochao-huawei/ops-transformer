@@ -8,31 +8,22 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef ACLNN_SPARSE_FLASH_MLA_METADATA_H
-#define ACLNN_SPARSE_FLASH_MLA_METADATA_H
+#ifndef L0_MIXED_QUANT_SPARSE_FLASH_MLA_METADATA_H
+#define L0_MIXED_QUANT_SPARSE_FLASH_MLA_METADATA_H
 
-#include "aclnn/aclnn_base.h"
+#include "opdev/op_executor.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-__attribute__((visibility("default"))) aclnnStatus aclnnSparseFlashMlaMetadataGetWorkspaceSize(
+namespace l0op {
+const aclTensor* MixedQuantSparseFlashMlaMetadata(
     const aclTensor *cuSeqlensQOptional, const aclTensor *cuSeqlensOriKvOptional,
     const aclTensor *cuSeqlensCmpKvOptional, const aclTensor *sequsedQOptional, const aclTensor *sequsedOriKvOptional,
     const aclTensor *sequsedCmpKvOptional, const aclTensor *cmpResidualKvOptional,
     const aclTensor *oriTopkLengthOptional, const aclTensor *cmpTopkLengthOptional, int64_t numHeadsQ,
-    int64_t numHeadsKv, int64_t headDim, int64_t batchSize, int64_t maxSeqlenQ, int64_t maxSeqlenOriKv,
-    int64_t maxSeqlenCmpKv, int64_t oriTopk, int64_t cmpTopk, int64_t cmpRatio, int64_t oriMaskMode,
-    int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight, const char *layoutQOptional,
-    const char *layoutKvOptional, bool hasOriKv, bool hasCmpKv, const aclTensor *metaData, uint64_t *workspaceSize,
-    aclOpExecutor **executor);
+    int64_t numHeadsKv, int64_t headDim, int64_t quantMode, int64_t batchSize, int64_t maxSeqlenQ,
+    int64_t maxSeqlenOriKv, int64_t maxSeqlenCmpKv, int64_t oriTopk, int64_t cmpTopk, int64_t ropeHeadDim,
+    int64_t cmpRatio, int64_t oriMaskMode, int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight,
+    const char *layoutQOptional, const char *layoutKvOptional, bool hasOriKv, bool hasCmpKv, const char *socVersion,
+    int64_t aicCoreNum, int64_t aivCoreNum, const aclTensor *metaData, aclOpExecutor *executor);
+} // namespace l0op
 
-__attribute__((visibility("default"))) aclnnStatus aclnnSparseFlashMlaMetadata(
-    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
-
-#ifdef __cplusplus
-}
 #endif
-
-#endif // ACLNN_SPARSE_FLASH_MLA_METADATA_H
