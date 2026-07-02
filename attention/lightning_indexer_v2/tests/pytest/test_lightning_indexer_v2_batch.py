@@ -13,7 +13,7 @@
 import itertools
 import torch
 import result_compare_method
-from batch import quant_lightning_indexer_v2_pt_loadprocess
+from batch import lightning_indexer_v2_pt_loadprocess
 import pytest
 import random
 import pandas as pd
@@ -42,8 +42,8 @@ if os.path.isdir(pt_dir):
 else:
     print(f"错误: 输出目录不存在: {pt_dir}")
 
-def qliv2(testcase_files):   # 初始化参数和tensor
-    cpu_result, npu_result, topk_value, output_idx_offset, params = quant_lightning_indexer_v2_pt_loadprocess.test_qliv2_process(testcase_files, device_id=0)
+def liv2(testcase_files):   # 初始化参数和tensor
+    cpu_result, npu_result, topk_value, output_idx_offset, params = lightning_indexer_v2_pt_loadprocess.test_liv2_process(testcase_files, device_id=0)
     if npu_result != None:
         result, fulfill_percent = result_compare_method.check_result(cpu_result, npu_result, topk_value, output_idx_offset, params)
     else:
@@ -63,25 +63,22 @@ def qliv2(testcase_files):   # 初始化参数和tensor
         "block_size": params[8],
         "block_num": params[9],
         "qk_dtype": params[10],
-        "dequant_dtype": params[11],
-        "actual_seq_dtype": params[12],
-        "cu_seq_q": params[13],
-        "cu_seq_k": params[14],
-        "act_seq_q": params[15],
-        "act_seq_k": params[16],
-        "cmp_residual_k": params[17],
-        "quant_mode": params[18],
-        "layout_query": params[19],
-        "layout_key": params[20],
-        "sparse_count":params[21],
-        "sparse_mode":params[22],
-        "query_datarange":params[23],
-        "key_datarange":params[24],
-        "weights_datarange":params[25],
-        "q_scale_datarange":params[26],
-        "k_scale_datarange":params[27],
-        "cmp_ratio":params[28],
-        "output_idx_offset": params[29],
+        "cu_seqlens_q": params[11],
+        "cu_seqlens_k": params[12],
+        "seqused_q": params[13],
+        "seqused_k": params[14],
+        "cmp_residual_k": params[15],
+        "output_idx_offset": params[16],
+        "layout_q": params[17],
+        "layout_k": params[18],
+        "topk":params[19],
+        "mask_mode":params[20],
+        "query_datarange":params[21],
+        "key_datarange":params[22],
+        "weights_datarange":params[23],
+        "cmp_ratio":params[24],
+        "return_value": params[25],
+        "max_seqlen_q":params[26],
         "result":result,
         "fulfill_percent":fulfill_percent
     }
@@ -111,10 +108,10 @@ def qliv2(testcase_files):   # 初始化参数和tensor
 
 @pytest.mark.ci
 @pytest.mark.parametrize("testcase_files", locals()["testcase_files"])
-def test_qliv2(testcase_files):   # 初始化参数和tensor
+def test_liv2(testcase_files):   # 初始化参数和tensor
     with ProcessPoolExecutor(max_workers=1) as executor:
         # 创建当前用例子进程
-        future1 = executor.submit(qliv2, testcase_files)
+        future1 = executor.submit(liv2, testcase_files)
         # 检查退出码
         for future in as_completed([future1]):
             try:
