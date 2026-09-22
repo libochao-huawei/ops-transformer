@@ -8,10 +8,10 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "matmul_all_to_all_transpose_a5_fusion_pass.h"
+#include "all_to_all_matmul_transpose_a5_fusion_pass.h"
 
 #if GE_COMPILER_VERSION_NUM >= GRAPH_FUSION_SUPPORT_VERSION
-#include "es_MatmulAlltoAll.h" // es autogen header
+#include "es_AlltoAllMatmul.h" // es autogen header
 #include "es_math_ops.h"       // math ops stub
 #include "mc2_platform_info.h"
 #include "mc2_common_log.h"
@@ -20,14 +20,14 @@
 #include "acl/acl_rt.h" // 运行时判断cann ver
 
 namespace ops {
-const std::string FUSION_PASS_NAME = "MatmulAllToAllTransposeA5FusionPass";
+const std::string FUSION_PASS_NAME = "AllToAllMatmulTransposeA5FusionPass";
 const std::string PATTERN_TRANSPOSE = "Transpose";
 const std::string PATTERN_BIAS = "HasBias";
-const std::string PATTERN_SCALE = "HasScale"; // MX：scale 固定进 pattern
+const std::string PATTERN_SCALE = "HasScale"; // MX：scale 固定进 pattern，仅写入名字便于区分
 const std::string PATTERN_BITCAST = "X2Bitcast";
 
 const int64_t MX_QUANT_MODE = 6;
-const int64_t MMALL2ALL_CAPTURE_IDX = 0l;
+const int64_t ALL2ALLMM_CAPTURE_IDX = 0l;
 const int64_t TRANSPOSE_CAPTURE_IDX = 1l;
 const int64_t TRANSPOSE_PERM_IDX = 1l;
 const int64_t X2_INPUT_IDX = 1l; // IR: x1 / x2 / ...
@@ -42,7 +42,7 @@ const ge::DataType BITCAST_PATTERN_DTYPE = ge::DT_HIFLOAT8;
 
 struct OriginalGraphInfo {
     bool hasBias = false;
-    bool hasBitcast = false; // true：Transpose → Bitcast → x2（对齐 canndev）
+    bool hasBitcast = false; // true：Transpose → Bitcast → x2
 };
 
 struct ReplaceGraphInputs {
@@ -58,19 +58,19 @@ struct ReplaceGraphInputs {
 
 // 加载 EsTranspose 符号
 namespace {
-using EsTransposeFunc = EsCTensorHolder *(*)(EsCTensorHolder *, EsCTensorHolder *);
+typedef EsCTensorHolder *(*EsTransposeFunc)(EsCTensorHolder *, EsCTensorHolder *);
 
 EsTransposeFunc GetEsTransposeFunc()
 {
     void *handle = dlopen("libes_math.so", RTLD_LAZY | RTLD_GLOBAL);
     if (!handle) {
-        OPS_LOG_E("MatmulAllToAllTransposeA5FusionPass", "dlopen failed: %s", dlerror());
+        OPS_LOG_E("AllToAllMatmulTransposeA5FusionPass", "dlopen failed: %s", dlerror());
         return nullptr;
     }
     dlerror();
     auto func = reinterpret_cast<EsTransposeFunc>(dlsym(handle, "EsTranspose"));
     if (dlerror() != nullptr) {
-        OPS_LOG_E("MatmulAllToAllTransposeA5FusionPass", "dlsym EsTranspose failed");
+        OPS_LOG_E("AllToAllMatmulTransposeA5FusionPass", "dlsym EsTranspose failed");
         return nullptr;
     }
     return func;
@@ -84,7 +84,7 @@ ge::es::EsTensorHolder TransposeDL(const ge::es::EsTensorLike &x, const ge::es::
     return result;
 }
 
-ge::CustomPassStage GetMatmulAlltoAllTransposeA5FusionPassStage()
+ge::CustomPassStage GetAllToAllMatmulTransposeA5FusionPassStage()
 {
     int32_t version = 0;
     aclsysGetVersionNum("ge_compiler", &version);
@@ -135,18 +135,18 @@ static ge::fusion::PatternUniqPtr MakePattern(const OriginalGraphInfo &info)
 
     const char *group = "";
     int64_t worldSize = 0;
-    auto mc2 = ge::es::MatmulAlltoAll(x1, x2In, bias, x1Scale, x2Scale, nullptr, nullptr, nullptr, group, worldSize);
-    auto graph = graphBuilder.BuildAndReset({mc2});
+    auto mc2 = ge::es::AlltoAllMatmul(x1, x2In, bias, x1Scale, x2Scale, nullptr, nullptr, nullptr, group, worldSize);
+    auto graph = graphBuilder.BuildAndReset({mc2.y, mc2.all2all_out});
     auto pattern = std::make_unique<ge::fusion::Pattern>(std::move(*graph));
-    pattern->CaptureTensor({*mc2.GetProducer(), 0}).CaptureTensor({*transpose.GetProducer(), 0});
+    pattern->CaptureTensor({*mc2.y.GetProducer(), 0}).CaptureTensor({*transpose.GetProducer(), 0});
     return pattern;
 }
 
 static bool IsMXQuantMode(const std::unique_ptr<ge::fusion::MatchResult> &matchResult)
 {
     ge::fusion::NodeIo mc2NodeIo;
-    OP_LOGE_IF(matchResult->GetCapturedTensor(MMALL2ALL_CAPTURE_IDX, mc2NodeIo) != ge::SUCCESS, false,
-               FUSION_PASS_NAME.c_str(), "Get MatmulAlltoAll node failed.");
+    OP_LOGE_IF(matchResult->GetCapturedTensor(ALL2ALLMM_CAPTURE_IDX, mc2NodeIo) != ge::SUCCESS, false,
+               FUSION_PASS_NAME.c_str(), "Get AlltoAllMatmul node failed.");
     ge::GNode mc2Node = mc2NodeIo.node;
 
     int64_t x1QuantMode = 0;
@@ -276,6 +276,7 @@ static bool CreateReplaceGraphInputs(ReplaceGraphInputs &inputs, ge::es::EsGraph
                                      const std::vector<ge::fusion::SubgraphInput> &subgraphInputs,
                                      const std::unique_ptr<ge::fusion::MatchResult> &matchResult)
 {
+    // 按 MakePattern 的 CreateInputs 顺序映射 subgraph 边界
     std::vector<ge::Shape> inputShapes;
     std::vector<ge::DataType> inputDTypes;
     std::vector<ge::Format> inputFormats;
@@ -327,8 +328,8 @@ static bool CreateReplaceGraphInputs(ReplaceGraphInputs &inputs, ge::es::EsGraph
 static bool GetCapturedMc2Node(const std::unique_ptr<ge::fusion::MatchResult> &matchResult, ge::GNode &mc2Node)
 {
     ge::fusion::NodeIo mc2NodeIo;
-    OP_LOGE_IF(matchResult->GetCapturedTensor(MMALL2ALL_CAPTURE_IDX, mc2NodeIo) != ge::SUCCESS, false,
-               FUSION_PASS_NAME.c_str(), "Capture MatmulAlltoAll node failed.");
+    OP_LOGE_IF(matchResult->GetCapturedTensor(ALL2ALLMM_CAPTURE_IDX, mc2NodeIo) != ge::SUCCESS, false,
+               FUSION_PASS_NAME.c_str(), "Capture AlltoAllMatmul node failed.");
     mc2Node = mc2NodeIo.node;
     return true;
 }
@@ -401,6 +402,10 @@ static ge::fusion::GraphUniqPtr BuildReplaceGraph(const std::vector<ge::fusion::
     OP_LOGE_IF(mc2Node.GetAttr("comm_quant_mode", commQuantMode) != ge::GRAPH_SUCCESS, nullptr,
                FUSION_PASS_NAME.c_str(), "Get Attr comm_quant_mode failed.");
 
+    int64_t x1QuantDtype = 28;
+    OP_LOGE_IF(mc2Node.GetAttr("x1_quant_dtype", x1QuantDtype) != ge::GRAPH_SUCCESS, nullptr, FUSION_PASS_NAME.c_str(),
+               "Get Attr x1_quant_dtype failed.");
+
     int64_t commQuantDtype = 28;
     OP_LOGE_IF(mc2Node.GetAttr("comm_quant_dtype", commQuantDtype) != ge::GRAPH_SUCCESS, nullptr,
                FUSION_PASS_NAME.c_str(), "Get Attr comm_quant_dtype failed.");
@@ -412,8 +417,8 @@ static ge::fusion::GraphUniqPtr BuildReplaceGraph(const std::vector<ge::fusion::
     bool transposeX2 = false;
     OP_LOGE_IF(mc2Node.GetAttr("transpose_x2", transposeX2) != ge::GRAPH_SUCCESS, nullptr, FUSION_PASS_NAME.c_str(),
                "Get Attr transpose_x2 failed.");
-    // 对齐 canndev UpdateTransAttr：吸收 x2 Transpose 后置反
-    transposeX2 = !transposeX2;
+    // MX tiling 要求吸收 x2 Transpose 后 transpose_x2 必须为 true
+    transposeX2 = true;
 
     int64_t groupSize = 0;
     OP_LOGE_IF(mc2Node.GetAttr("group_size", groupSize) != ge::GRAPH_SUCCESS, nullptr, FUSION_PASS_NAME.c_str(),
@@ -423,12 +428,16 @@ static ge::fusion::GraphUniqPtr BuildReplaceGraph(const std::vector<ge::fusion::
     OP_LOGE_IF(mc2Node.GetAttr("comm_mode", commMode) != ge::GRAPH_SUCCESS, nullptr, FUSION_PASS_NAME.c_str(),
                "Get Attr comm_mode failed.");
 
-    auto mc2 = ge::es::MatmulAlltoAll(inputTensors.rX1, x2In, inputTensors.rBias, inputTensors.rX1Scale,
+    bool alltoallOutFlag = true;
+    OP_LOGE_IF(mc2Node.GetAttr("alltoall_out_flag", alltoallOutFlag) != ge::GRAPH_SUCCESS, nullptr,
+               FUSION_PASS_NAME.c_str(), "Get Attr alltoall_out_flag failed.");
+
+    auto mc2 = ge::es::AlltoAllMatmul(inputTensors.rX1, x2In, inputTensors.rBias, inputTensors.rX1Scale,
                                       inputTensors.rX2Scale, inputTensors.rCommScale, inputTensors.rX1Offset,
                                       inputTensors.rX2Offset, group.GetString(), worldSize, all2allAxes, yDtype,
-                                      x1QuantMode, x2QuantMode, commQuantMode, commQuantDtype, transposeX1, transposeX2,
-                                      groupSize, commMode.GetString());
-    return replaceGraphBuilder.BuildAndReset({mc2});
+                                      x1QuantMode, x2QuantMode, commQuantMode, x1QuantDtype, commQuantDtype,
+                                      transposeX1, transposeX2, groupSize, commMode.GetString(), alltoallOutFlag);
+    return replaceGraphBuilder.BuildAndReset({mc2.y, mc2.all2all_out});
 }
 
 static bool InferShapeReplaceGraph(const ge::fusion::GraphUniqPtr &replaceGraph,
@@ -456,9 +465,9 @@ static bool InferShapeReplaceGraph(const ge::fusion::GraphUniqPtr &replaceGraph,
     return true;
 }
 
-std::vector<ge::fusion::PatternUniqPtr> MatmulAllToAllTransposeA5FusionPass::Patterns()
+std::vector<ge::fusion::PatternUniqPtr> AllToAllMatmulTransposeA5FusionPass::Patterns()
 {
-    OPS_LOG_D(FUSION_PASS_NAME.c_str(), "Enter Patterns for MatmulAllToAllTransposeA5FusionPass");
+    OPS_LOG_D(FUSION_PASS_NAME.c_str(), "Enter Patterns for AllToAllMatmulTransposeA5FusionPass");
     // ES：排列 hasBias × hasBitcast；MX scale 固定 → 共 4 种
     std::vector<ge::fusion::PatternUniqPtr> patternGraphs;
     for (bool hasBias : {false, true}) {
@@ -469,9 +478,9 @@ std::vector<ge::fusion::PatternUniqPtr> MatmulAllToAllTransposeA5FusionPass::Pat
     return patternGraphs;
 }
 
-bool MatmulAllToAllTransposeA5FusionPass::MeetRequirements(const std::unique_ptr<ge::fusion::MatchResult> &matchResult)
+bool AllToAllMatmulTransposeA5FusionPass::MeetRequirements(const std::unique_ptr<ge::fusion::MatchResult> &matchResult)
 {
-    OPS_LOG_D(FUSION_PASS_NAME.c_str(), "Enter MeetRequirements for MatmulAllToAllTransposeA5FusionPass");
+    OPS_LOG_D(FUSION_PASS_NAME.c_str(), "Enter MeetRequirements for AllToAllMatmulTransposeA5FusionPass");
 
     // 9.0.0 版本前运行降级stage 空跑
     int32_t geCompilerVersion = 0;
@@ -516,10 +525,10 @@ bool MatmulAllToAllTransposeA5FusionPass::MeetRequirements(const std::unique_ptr
     return true;
 }
 
-ge::fusion::GraphUniqPtr MatmulAllToAllTransposeA5FusionPass::Replacement(
+ge::fusion::GraphUniqPtr AllToAllMatmulTransposeA5FusionPass::Replacement(
     const std::unique_ptr<ge::fusion::MatchResult> &matchResult)
 {
-    OPS_LOG_D(FUSION_PASS_NAME.c_str(), "Enter Replacement for MatmulAllToAllTransposeA5FusionPass");
+    OPS_LOG_D(FUSION_PASS_NAME.c_str(), "Enter Replacement for AllToAllMatmulTransposeA5FusionPass");
     std::vector<ge::fusion::SubgraphInput> subgraphInputs;
     if (matchResult->ToSubgraphBoundary()->GetAllInputs(subgraphInputs) != ge::SUCCESS) {
         OPS_LOG_E(FUSION_PASS_NAME.c_str(), "Get subgraph inputs failed in Replacement.");
@@ -539,7 +548,7 @@ ge::fusion::GraphUniqPtr MatmulAllToAllTransposeA5FusionPass::Replacement(
     return replaceGraph;
 }
 
-REG_FUSION_PASS(MatmulAllToAllTransposeA5FusionPass).Stage(GetMatmulAlltoAllTransposeA5FusionPassStage());
+REG_FUSION_PASS(AllToAllMatmulTransposeA5FusionPass).Stage(GetAllToAllMatmulTransposeA5FusionPassStage());
 } // namespace ops
 
 #endif // GRAPH_FUSION_SUPPORT_VERSION
