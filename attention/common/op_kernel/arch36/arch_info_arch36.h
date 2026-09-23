@@ -9,22 +9,18 @@
  */
 
 /*!
- * \file arch_info.h
+ * \file arch_info_arch36.h
  * \brief Common constants
  */
-#ifndef ARCH_INFO_H
-#define ARCH_INFO_H
+#ifndef ARCH_INFO_ARCH36_H
+#define ARCH_INFO_ARCH36_H
 
-#if (__NPU_ARCH__ == 2201)
-#include "arch22/arch_info_arch22.h"
-#elif __NPU_ARCH__ == 3510
-#include "arch35/arch_info_arch35.h"
-#elif __NPU_ARCH__ == 9201
-#include "arch36/arch_info_arch36.h"
-#elif __NPU_ARCH__ == 9202
-#include "arch36/arch_info_arch36.h"
-#elif __NPU_ARCH__ == 5102
-#include "arch38/arch_info_arch38.h"
-#endif
+namespace ArchInfo {
+constexpr uint32_t CV_RATIO = 1;
+constexpr uint32_t NPU_MAX_CUBE_NUM = 64;
+constexpr uint32_t NPU_MAX_VEC_NUM = NPU_MAX_CUBE_NUM * CV_RATIO;
+} // namespace ArchInfo
+
+#define ATTN_MUTEX_ENABLE
 
 #endif
