@@ -13,7 +13,7 @@
 #include <memory>
 #include <cstring>
 #include "acl/acl.h"
-#include "aclnnop/aclnn_ffn_worker_batching.h"
+#include "aclnnop/aclnn_ffn_worker_batching_v2.h"
 
 #define CHECK_RET(cond, return_expr) \
     do { \
@@ -338,11 +338,11 @@ int main()
     // 3. 调用CANN算子库API
     uint64_t workspaceSize = 0;
     aclOpExecutor *executor = nullptr;
-    ret = aclnnFfnWorkerBatchingGetWorkspaceSize(scheduleContextRef, expertNum, maxOutShapeArray, tokenDtype,
-                                                 needSchedule, layerNum, yRef, groupListRef, sessionIdsRef,
-                                                 microBatchIdsRef, tokenIdsRef, expertOffsetsRef, dynamicScaleRef,
-                                                 actualTokenNumRef, &workspaceSize, &executor);
-    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnFfnWorkerBatchingGetWorkspaceSize failed. ERROR: %d\n", ret);
+    ret = aclnnFfnWorkerBatchingV2GetWorkspaceSize(scheduleContextRef, expertNum, maxOutShapeArray, tokenDtype,
+                                                   needSchedule, layerNum, false, yRef, groupListRef, sessionIdsRef,
+                                                   microBatchIdsRef, tokenIdsRef, expertOffsetsRef, dynamicScaleRef,
+                                                   actualTokenNumRef, &workspaceSize, &executor);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnFfnWorkerBatchingV2GetWorkspaceSize failed. ERROR: %d\n", ret);
               return ret);
 
     void *workspaceAddr = nullptr;
@@ -351,8 +351,8 @@ int main()
         CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
     }
 
-    ret = aclnnFfnWorkerBatching(workspaceAddr, workspaceSize, executor, stream);
-    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnFfnWorkerBatching failed. ERROR: %d\n", ret); return ret);
+    ret = aclnnFfnWorkerBatchingV2(workspaceAddr, workspaceSize, executor, stream);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnFfnWorkerBatchingV2 failed. ERROR: %d\n", ret); return ret);
 
     // 4.（固定写法）同步等待任务执行结束
     ret = aclrtSynchronizeStream(stream);

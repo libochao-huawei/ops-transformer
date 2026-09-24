@@ -1,19 +1,389 @@
-/**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+# aclnnFfnWorkerBatchingV2
 
+[📄 查看源码](https://gitcode.com/cann/ops-transformer/tree/master/ffn/ffn_worker_batching)
+
+## 产品支持情况
+
+<!-- npu="950" id1 -->
+- <term>Ascend 950PR/Ascend 950DT</term>：支持
+<!-- end id1 -->
+<!-- npu="A3" id2 -->
+- <term>Atlas A3 训练系列产品/Atlas A3 推理系列产品</term>：不支持
+<!-- end id2 -->
+<!-- npu="910b" id3 -->
+- <term>Atlas A2 训练系列产品/Atlas A2 推理系列产品</term>：不支持
+<!-- end id3 -->
+<!-- npu="310b" id4 -->
+- <term>Atlas 200I/500 A2 推理产品</term>：不支持
+<!-- end id4 -->
+<!-- npu="310p" id5 -->
+- <term>Atlas 推理系列产品</term>：不支持
+<!-- end id5 -->
+<!-- npu="910" id6 -->
+- <term>Atlas 训练系列产品</term>：不支持
+<!-- end id6 -->
+
+## 功能说明
+
+- 接口功能：Attention与FFN分离部署场景下，FFN worker侧的token重排算子。Attention将token按专家路由发送到对应FFN worker的预分配数据区，本接口从该数据区中扫描调度信息，按专家维度聚合并重排token，产出各专家对应的连续token数据块。
+
+  1. 接收Attention侧发送的数据。该数据以ScheduleContext结构体内存排布方式存储。其具体定义参见[调用示例](#调用示例)。该结构体包含CommonArea、ControlArea、AttentionArea、FfnArea域。本接口从FfnArea中读取token_info_buf和token_data_buf获取待重排的token数据与描述信息，并获取layer_id、session_id、micro_batch_id、expert_ids等路由信息。
+
+  2. 对`expert_ids_in`中所有token的专家ID进行排序（被mask的token初始化为大值），生成gather索引。
+
+  3. 多核并行按gather索引从`token_data`中提取token的hidden states和dynamic scale，同时查表得到对应的session_id、micro_batch_id、token_id。
+
+  4. 单核扫描排序后的专家ID序列，查找跳变点，生成`groupList`（每个专家处理的token数）。
+
+  其中 $Y = A \times BS \times (K+1)$，$A$ 为Attention worker数量，$BS$ 为micro batch size，$K+1$ 为topK加共享专家数。
+
+- `syncFlag` 为布尔类型，控制接收阶段的就绪条件，行为差异如下：
+
+  | needSchedule | syncFlag | 接收行为 |
+  | --- | --- | --- |
+  | 0（NORM） | false / true | 不轮询session就绪状态，按已有token信息执行batching；syncFlag不影响执行。 |
+  | 1（RECV） | false | 同步接收：等待当前micro batch的全部session就绪后统一处理，保持V1接口的接收语义。 |
+  | 1（RECV） | true | 异步接收：循环扫描micro batch，首次发现非空ready session快照后，仅处理该快照选中的session，不等待其余session；若没有数据就绪，则继续等待。 |
+
+  异步接收允许同一micro batch的已就绪session来自不同层，要求`layerNum > 0`且`expertNum`能被`layerNum`整除，并按`layer_id * (expertNum / layerNum) + expert_id`生成跨层专家号进行排序、重排和`groupList`统计。同步接收与NORM使用原专家号。
+
+## 函数原型
+
+每个算子分为[两段式接口](../../../docs/zh/context/two_phase_api.md)，必须先调用“aclnnFfnWorkerBatchingV2GetWorkspaceSize”接口获取计算所需workspace大小以及包含了算子计算流程的执行器，再调用“aclnnFfnWorkerBatchingV2”接口执行计算。
+
+```Cpp
+aclnnStatus aclnnFfnWorkerBatchingV2GetWorkspaceSize(
+    const aclTensor   *scheduleContext,
+    int64_t            expertNum,
+    const aclIntArray *maxOutShape,
+    int64_t            tokenDtype,
+    int64_t            needSchedule,
+    int64_t            layerNum,
+    bool               syncFlag,
+    const aclTensor   *y,
+    const aclTensor   *groupList,
+    const aclTensor   *sessionIds,
+    const aclTensor   *microBatchIds,
+    const aclTensor   *tokenIds,
+    const aclTensor   *expertOffsets,
+    const aclTensor   *dynamicScale,
+    const aclTensor   *actualTokenNum,
+    uint64_t          *workspaceSize,
+    aclOpExecutor    **executor)
+```
+
+```Cpp
+aclnnStatus aclnnFfnWorkerBatchingV2(
+    void*          workspace,
+    uint64_t       workspaceSize,
+    aclOpExecutor* executor,
+    const aclrtStream stream)
+```
+
+## aclnnFfnWorkerBatchingV2GetWorkspaceSize
+
+- **参数说明**
+
+  <table style="undefined;table-layout: fixed; width: 1540px"><colgroup>
+  <col style="width: 210px">
+  <col style="width: 135px">
+  <col style="width: 360px">
+  <col style="width: 280px">
+  <col style="width: 130px">
+  <col style="width: 110px">
+  <col style="width: 170px">
+  <col style="width: 145px">
+  </colgroup>
+  <thead>
+    <tr>
+      <th>参数名</th>
+      <th>输入/输出</th>
+      <th>描述</th>
+      <th>使用说明</th>
+      <th>数据类型</th>
+      <th>数据格式</th>
+      <th>维度(shape)</th>
+      <th>非连续Tensor</th>
+    </tr></thead>
+  <tbody>
+    <tr>
+      <td>scheduleContext</td>
+      <td>输入</td>
+      <td>FFN侧接收的调度上下文，内含CommonArea、ControlArea、AttentionArea、FfnArea。算子从FfnArea中读取token_info_buf和token_data_buf获取待重排的token数据与描述信息。</td>
+      <td>包含的缓冲区地址必须为有效Device地址，生命周期见约束说明。</td>
+      <td>INT8</td>
+      <td>ND</td>
+      <td>1维，长度至少1024字节</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>expertNum</td>
+      <td>输入</td>
+      <td>本卡专家总数，等于每层本卡专家数 × layerNum。用于推导groupList输出大小。</td>
+      <td>取值范围为(0, 8192]。</td>
+      <td>INT64</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>maxOutShape</td>
+      <td>输入</td>
+      <td>输出shape上限，格式为 {A, BS, topK+1, H}。用于推导y输出的shape上限 Y = A × BS × (topK+1)，以及H值。</td>
+      <td>数组长度必须为4。其中A取值范围为(0, 1024]，BS大于0，topK+1取值范围为(0, 64]，H大于0。tokenDtype=5时H须为偶数。</td>
+      <td>LIST_INT64</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>tokenDtype</td>
+      <td>输入</td>
+      <td>输入token的数据类型：0为FP16；1为BF16；2为INT8动态量化，每行一个FP32 scale；3为FLOAT8_E5M2；4为FLOAT8_E4M3FN（float8_e4m3）；5为FLOAT4_E2M1。3、4、5每32个逻辑hidden state元素对应一个FLOAT8_E8M0 scale，全部scale紧跟整行token数据。</td>
+      <td>取值为0～5。y与dynamicScale的数据类型及shape须与tokenDtype对应，见下方映射表。</td>
+      <td>INT64</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>needSchedule</td>
+      <td>输入</td>
+      <td>调度模式。0表示仅做batching不扫描数据；1表示先扫描数据再做batching。</td>
+      <td>取值为0或1。</td>
+      <td>INT64</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>layerNum</td>
+      <td>输入</td>
+      <td>层数，每层专家独立索引。</td>
+      <td>取值范围为[0, expertNum]；needSchedule=1且syncFlag=true时，必须大于0且整除expertNum。</td>
+      <td>INT64</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>syncFlag</td>
+      <td>输入</td>
+      <td>接收同步方式。false：等待当前micro batch的全部session就绪；true：循环扫描micro batch，处理首次发现的非空ready session快照，无数据时等待。</td>
+      <td>取值为false或true，仅needSchedule=1时解释该属性；needSchedule=0时不影响执行。</td>
+      <td>BOOL</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>y</td>
+      <td>输出</td>
+      <td>重排后的token hidden states，按专家ID排序后连续存放。</td>
+      <td>数据类型由tokenDtype决定；FP4的逻辑shape仍为(Y, H)，两个元素打包为一个字节。</td>
+      <td>FP16、BF16、INT8、FLOAT8_E5M2、FLOAT8_E4M3FN、FLOAT4_E2M1</td>
+      <td>ND</td>
+      <td>2维，(Y, H)，其中Y = A × BS × K</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>groupList</td>
+      <td>输出</td>
+      <td>各非空专家的token数，按专家ID升序紧凑存放。每行为 [expert_id, expert_token_num]，剩余行填 [0, 0]。</td>
+      <td>-</td>
+      <td>INT64</td>
+      <td>ND</td>
+      <td>2维，(expertNum, 2)</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>sessionIds</td>
+      <td>输出</td>
+      <td>每个输出token对应的Attention session ID。</td>
+      <td>-</td>
+      <td>INT32</td>
+      <td>ND</td>
+      <td>1维，(Y)</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>microBatchIds</td>
+      <td>输出</td>
+      <td>每个输出token对应的micro batch ID。</td>
+      <td>-</td>
+      <td>INT32</td>
+      <td>ND</td>
+      <td>1维，(Y)</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>tokenIds</td>
+      <td>输出</td>
+      <td>每个输出token在原始输入中的位置索引。</td>
+      <td>-</td>
+      <td>INT32</td>
+      <td>ND</td>
+      <td>1维，(Y)</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>expertOffsets</td>
+      <td>输出</td>
+      <td>每个输出token在原始topK加共享专家选择中的位置索引。</td>
+      <td>-</td>
+      <td>INT32</td>
+      <td>ND</td>
+      <td>1维，(Y)</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>dynamicScale</td>
+      <td>输出</td>
+      <td>随token重排的scale值。tokenDtype=2时每行一个FP32 scale；tokenDtype=3、4、5时每32个逻辑元素一个FLOAT8_E8M0 scale。</td>
+      <td>tokenDtype=0、1时该输出无有效数据。尾部不足32个元素的分组仍占一个E8M0 scale。</td>
+      <td>FP32、FLOAT8_E8M0</td>
+      <td>ND</td>
+      <td>tokenDtype=0、1、2：(Y)；tokenDtype=3、4、5：(Y, ceil(H/32))</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>actualTokenNum</td>
+      <td>输出</td>
+      <td>所有专家有效token数之和。</td>
+      <td>-</td>
+      <td>INT64</td>
+      <td>ND</td>
+      <td>1维，(1)</td>
+      <td>×</td>
+    </tr>
+    <tr>
+      <td>workspaceSize</td>
+      <td>输出</td>
+      <td>返回需要在Device侧申请的workspace大小。</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+    <tr>
+      <td>executor</td>
+      <td>输出</td>
+      <td>返回op执行器，包含了算子计算流程。</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+      <td>-</td>
+    </tr>
+  </tbody>
+  </table>
+
+- **返回值：**
+
+  aclnnStatus：返回状态码，具体参见[aclnn返回码](../../../docs/zh/context/aclnn_return_code.md)。
+
+  第一段接口会完成入参校验，出现以下场景时报错：
+
+    <table style="undefined;table-layout: fixed;width: 1155px"><colgroup>
+    <col style="width: 319px">
+    <col style="width: 144px">
+    <col style="width: 671px">
+    </colgroup>
+        <thead>
+            <th>返回值</th>
+            <th>错误码</th>
+            <th>描述</th>
+        </thead>
+        <tbody>
+            <tr>
+                <td>ACLNN_ERR_PARAM_NULLPTR</td>
+                <td>161001</td>
+                <td>输入是空指针。</td>
+            </tr>
+            <tr>
+                <td>ACLNN_ERR_PARAM_INVALID</td>
+                <td>161002</td>
+                <td>输入数据类型不在支持的范围内。</td>
+            </tr>
+        </tbody>
+    </table>
+
+## aclnnFfnWorkerBatchingV2
+
+- **参数说明**
+
+  <table style="undefined;table-layout: fixed; width: 1151px"><colgroup>
+  <col style="width: 184px">
+  <col style="width: 134px">
+  <col style="width: 833px">
+  </colgroup>
+  <thead>
+    <tr>
+      <th>参数名</th>
+      <th>输入/输出</th>
+      <th>描述</th>
+    </tr></thead>
+  <tbody>
+    <tr>
+      <td>workspace</td>
+      <td>输入</td>
+      <td>在Device侧申请的workspace内存地址。</td>
+    </tr>
+    <tr>
+      <td>workspaceSize</td>
+      <td>输入</td>
+      <td>在Device侧申请的workspace大小，由第一段接口aclnnFfnWorkerBatchingV2GetWorkspaceSize获取。</td>
+    </tr>
+    <tr>
+      <td>executor</td>
+      <td>输入</td>
+      <td>op执行器，包含了算子计算流程。</td>
+    </tr>
+    <tr>
+      <td>stream</td>
+      <td>输入</td>
+      <td>指定执行任务的Stream。</td>
+    </tr>
+  </tbody>
+  </table>
+
+- **返回值：**
+
+  aclnnStatus：返回状态码，具体参见[aclnn返回码](../../../docs/zh/context/aclnn_return_code.md)。
+
+## 约束说明
+
+- 调度上下文中的缓冲区地址必须是有效Device地址，相关内存在算子执行完成前不得释放或被生产者覆盖；源行字节步长`attn_to_ffn_token_size`必须容纳完整token及scale数据。
+- 接收模式会更新就绪标志、专家ID及轮询位置；重复调用前须按调度协议准备新数据。
+- 参数A（Attention worker数量）支持 ≤ 1024。
+- 参数M（micro batch数量）支持 ≤ 64。
+- 参数K+1（topK加共享专家数）支持 ≤ 64。
+- 参数BS（micro batch size）和Y支持泛化，无硬上限（受内存限制）。
+- `y`、索引输出及有效的`dynamicScale`仅保证前`actualTokenNum`行有效；算子只做原始位模式搬运，不进行量化或反量化。
+<!-- npu="950" id7 -->
+- <term>Ascend 950PR/Ascend 950DT</term>有如下约束：
+  - 参数H（hidden size）大于0；`tokenDtype=5`时H须为偶数。
+  - 额外支持`tokenDtype=3、4、5`。
+  - 额外支持`syncFlag=true`。
+  - 令`S=ceil(H/32)`，tokenDtype=3、4、5时的`dynamicScale`为FLOAT8_E8M0，shape为`(Y,S)`。所有scale紧跟整行token数据，以字节计，可包含行尾padding。
+  - 异步接收（`need_schedule=1、sync_flag=true`）场景，要求`layer_num>0`且整除`expert_num`，按`layer_id * (expert_num / layer_num) + expert_id`生成跨层专家号进行排序、token重排和`group_list`统计。同步接收与NORM仍使用原专家号。
+<!-- end id7 -->
+
+- 确定性计算：
+  - aclnnFfnWorkerBatchingV2默认确定性实现。
+
+## 调用示例
+
+完整示例：[test_aclnn_ffn_worker_batching_v2.cpp](../examples/test_aclnn_ffn_worker_batching_v2.cpp)。示例代码如下，具体编译和执行过程请参考[编译与运行样例](../../../docs/zh/context/compile_and_run_sample.md)。
+
+```Cpp
 #include <iostream>
 #include <vector>
 #include <memory>
 #include <cstring>
 #include "acl/acl.h"
-#include "aclnnop/aclnn_ffn_worker_batching.h"
+#include "aclnnop/aclnn_ffn_worker_batching_v2.h"
 
 #define CHECK_RET(cond, return_expr) \
     do { \
@@ -338,11 +708,11 @@ int main()
     // 3. 调用CANN算子库API
     uint64_t workspaceSize = 0;
     aclOpExecutor *executor = nullptr;
-    ret = aclnnFfnWorkerBatchingGetWorkspaceSize(scheduleContextRef, expertNum, maxOutShapeArray, tokenDtype,
-                                                 needSchedule, layerNum, yRef, groupListRef, sessionIdsRef,
-                                                 microBatchIdsRef, tokenIdsRef, expertOffsetsRef, dynamicScaleRef,
-                                                 actualTokenNumRef, &workspaceSize, &executor);
-    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnFfnWorkerBatchingGetWorkspaceSize failed. ERROR: %d\n", ret);
+    ret = aclnnFfnWorkerBatchingV2GetWorkspaceSize(scheduleContextRef, expertNum, maxOutShapeArray, tokenDtype,
+                                                   needSchedule, layerNum, false, yRef, groupListRef, sessionIdsRef,
+                                                   microBatchIdsRef, tokenIdsRef, expertOffsetsRef, dynamicScaleRef,
+                                                   actualTokenNumRef, &workspaceSize, &executor);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnFfnWorkerBatchingV2GetWorkspaceSize failed. ERROR: %d\n", ret);
               return ret);
 
     void *workspaceAddr = nullptr;
@@ -351,8 +721,8 @@ int main()
         CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
     }
 
-    ret = aclnnFfnWorkerBatching(workspaceAddr, workspaceSize, executor, stream);
-    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnFfnWorkerBatching failed. ERROR: %d\n", ret); return ret);
+    ret = aclnnFfnWorkerBatchingV2(workspaceAddr, workspaceSize, executor, stream);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnFfnWorkerBatchingV2 failed. ERROR: %d\n", ret); return ret);
 
     // 4.（固定写法）同步等待任务执行结束
     ret = aclrtSynchronizeStream(stream);
@@ -420,3 +790,4 @@ int main()
     Finalize(deviceId, stream);
     return 0;
 }
+```
