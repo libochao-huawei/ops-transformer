@@ -26,12 +26,19 @@
   $$
   对计算结果按照groupNum进行分组，每组按照topN的sum值对group进行排序，取前groupTopk个组：
   $$
-  groupOut, groupId = TopK(ReduceSum(TopK(Split(normOut, groupCount), k=2, dim=-1), dim=-1),k=kGroup)
+  groupOut, groupId = TopK(ReduceSum(TopK(Split(normOut, groupCount), k=topN, dim=-1), dim=-1),k=groupTopk)
   $$
-  根据上一步的groupId获取normOut中对应的元素，将数据再做TopK，得到indices的结果：
+  将未选中组的normOut置为0（选中组保持不变），再对全部专家做TopK，得到indices的结果：
   $$
-  normY,indices=TopK(normOut[groupId, :],k=k)
+  normOut' = \begin{cases}
+  normOut, & group \in groupId \\
+  0, & group \notin groupId
+  \end{cases}
   $$
+  $$
+  normY,indices=TopK(normOut',k=k)
+  $$
+  > **说明**：未选中组的元素以0参与最终TopK，而不是被排除。因此当`addNum`使`normOut`为负时，未选中组的0可能排在被选中组的负值之前，从而被选入`indices`。
   根据indices从sigmoidRes中选出y:
   $$
   y = gather(sigmoidRes, indices)
