@@ -172,6 +172,8 @@ aclnnStatus aclnnMoeComputeExpertTokens(
     </tr>
   </tbody></table>
 
+  > 说明：当输出out为空tensor时，不校验numExperts的取值范围（需要大于0且不能超过2048），该场景直接返回成功。
+
 ## aclnnMoeComputeExpertTokens
 
 - **参数说明**
