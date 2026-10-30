@@ -21,6 +21,7 @@
 #if defined(ENABLE_BUILT_IN)
 #include "mc2_hcom_topo_info.h"
 #endif
+
 namespace ops {
 const size_t GROUP = 0;
 const size_t AG_IS_TRANS_A = 1;
