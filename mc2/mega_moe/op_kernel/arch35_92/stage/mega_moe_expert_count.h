@@ -27,6 +27,7 @@ constexpr int64_t COUNT_TABLE_POLL_BACKOFF_CYCLES = 500;
 __simd_vf__ inline void CheckCountRoundTagsVF(__ubuf__ uint32_t* counts, __ubuf__ uint32_t* pending,
                                               uint32_t elementCount, uint32_t expectedSyncRoundTag)
 {
+#if defined(MEGA_MOE_ARCH92_DEVICE)
     constexpr uint32_t ELEMENTS_PER_VECTOR = AscendC::GetVecLen() / sizeof(uint32_t);
     AscendC::Reg::RegTensor<uint32_t> countReg;
     AscendC::Reg::RegTensor<uint32_t> epochReg;
@@ -49,6 +50,29 @@ __simd_vf__ inline void CheckCountRoundTagsVF(__ubuf__ uint32_t* counts, __ubuf_
     }
     AscendC::Reg::Reduce<AscendC::Reg::ReduceType::MAX>(resultReg, pendingReg, fullMask);
     AscendC::Reg::StoreAlign(pending, resultReg, firstLaneMask);
+#else
+    constexpr uint32_t ELEMENTS_PER_VECTOR = static_cast<uint32_t>(asc_get_vf_len()) / sizeof(uint32_t);
+    vector_uint32_t countReg;
+    vector_uint32_t epochReg;
+    vector_uint32_t pendingReg;
+    vector_uint32_t oneReg;
+    vector_uint32_t resultReg;
+    vector_bool fullMask = asc_create_mask_b32(PAT_ALL);
+    vector_bool firstLaneMask = asc_create_mask_b32(PAT_VL1);
+    asc_duplicate_scalar(pendingReg, 0U, fullMask);
+    asc_duplicate_scalar(oneReg, 1U, fullMask);
+    for (uint32_t offset = 0U; offset < elementCount; offset += ELEMENTS_PER_VECTOR) {
+        uint32_t validCount = elementCount - offset;
+        vector_bool activeMask = asc_update_mask_b32(validCount);
+        vector_bool mismatchMask;
+        asc_loadalign(countReg, counts + offset);
+        asc_shiftright_scalar(epochReg, countReg, static_cast<int16_t>(24), activeMask);
+        asc_ne_scalar(mismatchMask, epochReg, expectedSyncRoundTag >> 24U, activeMask);
+        asc_select(pendingReg, oneReg, pendingReg, mismatchMask);
+    }
+    asc_reduce_max(resultReg, pendingReg, fullMask);
+    asc_storealign(pending, resultReg, firstLaneMask);
+#endif
 }
 
 // MTE GM count 表按 512B 槽存放；搬入后的 counts 为连续 UB 表。
@@ -92,6 +116,7 @@ __simd_vf__ inline void ComputeExpertCountTablesVF(__ubuf__ int32_t* count, __ub
     InclusivePrefixSumInt32<0x00FFFFFF>(count, elementCount);
 
     // prefix 已写回 UB；后续从同一区域 Gather 前建立 VEC_STORE -> VEC_LOAD 可见性。
+#if defined(MEGA_MOE_ARCH92_DEVICE)
     AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
 
     constexpr uint32_t ELEMENTS_PER_VECTOR = GetVecLen() / sizeof(int32_t);
@@ -141,6 +166,52 @@ __simd_vf__ inline void ComputeExpertCountTablesVF(__ubuf__ int32_t* count, __ub
         AscendC::Reg::Gather(previousVectorEndReg, expertEndPrefixReg,
                              reinterpret_cast<AscendC::Reg::RegTensor<uint32_t>&>(previousLaneIndexReg));
     }
+#else
+    asc_mem_bar(VST_VLD);
+
+    constexpr uint32_t ELEMENTS_PER_VECTOR = static_cast<uint32_t>(asc_get_vf_len()) / sizeof(int32_t);
+    vector_int32_t expertEndPrefixReg;
+    vector_int32_t previousEndPrefixReg;
+    vector_int32_t expertCountReg;
+    vector_int32_t previousVectorEndReg;
+    vector_int32_t maxOutputSizeReg;
+    vector_int32_t laneIndexReg;
+    vector_int32_t gatherIndexReg;
+    vector_int32_t previousLaneIndexReg;
+    vector_bool fullMask = asc_create_mask_b32(PAT_ALL);
+    vector_bool firstLaneMask = asc_create_mask_b32(PAT_VL1);
+
+    int32_t maxOutputSizeInt32 = static_cast<int32_t>(maxOutputSize);
+    asc_arange(laneIndexReg, 0);
+    asc_duplicate_scalar(previousVectorEndReg, 0, fullMask);
+    asc_duplicate_scalar(maxOutputSizeReg, maxOutputSizeInt32, fullMask);
+    for (uint32_t expertOffset = 0U; expertOffset < expertCount; expertOffset += ELEMENTS_PER_VECTOR) {
+        uint32_t validCount = expertCount - expertOffset;
+        validCount = validCount < ELEMENTS_PER_VECTOR ? validCount : ELEMENTS_PER_VECTOR;
+        uint32_t maskCount = validCount;
+        vector_bool activeMask = asc_update_mask_b32(maskCount);
+
+        asc_add_scalar(gatherIndexReg, laneIndexReg, static_cast<int32_t>(expertOffset), fullMask);
+        asc_mul_scalar(gatherIndexReg, gatherIndexReg, static_cast<int32_t>(worldSize), fullMask);
+        asc_add_scalar(gatherIndexReg, gatherIndexReg, static_cast<int32_t>(worldSize - 1U), fullMask);
+        asc_gather(expertEndPrefixReg, count, reinterpret_cast<vector_uint32_t&>(gatherIndexReg), activeMask);
+
+        asc_add_scalar(previousLaneIndexReg, laneIndexReg, -1, fullMask);
+        asc_max_scalar(previousLaneIndexReg, previousLaneIndexReg, 0, fullMask);
+        asc_gather(previousEndPrefixReg, expertEndPrefixReg, reinterpret_cast<vector_uint32_t&>(previousLaneIndexReg));
+        asc_select(previousEndPrefixReg, previousVectorEndReg, previousEndPrefixReg, firstLaneMask);
+        vector_bool overflowMask;
+        asc_ge_scalar(overflowMask, expertEndPrefixReg, maxOutputSizeInt32, activeMask);
+        asc_select(expertCountReg, maxOutputSizeReg, expertEndPrefixReg, overflowMask);
+        asc_ge_scalar(overflowMask, previousEndPrefixReg, maxOutputSizeInt32, activeMask);
+        asc_select(previousEndPrefixReg, maxOutputSizeReg, previousEndPrefixReg, overflowMask);
+        asc_sub(expertCountReg, expertCountReg, previousEndPrefixReg, activeMask);
+        asc_storealign(expertCounts + expertOffset, expertCountReg, activeMask);
+
+        asc_duplicate_scalar(previousLaneIndexReg, static_cast<int32_t>(validCount - 1U), fullMask);
+        asc_gather(previousVectorEndReg, expertEndPrefixReg, reinterpret_cast<vector_uint32_t&>(previousLaneIndexReg));
+    }
+#endif
 }
 
 __aicore__ inline void ComputeExpertCountTables(__ubuf__ int32_t* countTensor, __ubuf__ int32_t* expertCountTensor,

@@ -794,7 +794,8 @@ __aicore__ inline void RunGmm2Generic(const AscendC::Shape<int64_t, int64_t, int
                                       uint32_t activationOutputDivisor = ACTIVATION_N_HALF,
                                       uint32_t expertTokenCount = 0U)
 {
-    BlockJobContext blockJob{MegaMoeHardwarePolicy::GetAicBlockIdx(), static_cast<uint32_t>(GetBlockNum())};
+    BlockJobContext blockJob{MegaMoeHardwarePolicy::GetAicBlockIdx(),
+                             static_cast<uint32_t>(MegaMoeHardwarePolicy::GetBlockNum())};
     RunGmm2Generic<CombineQuantMode, ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, IsWeightNZ,
                    IsLayered, Gmm1TileM, TopkWeightsPrefetch, IsShared, IsWaveFlagGrained, NotifyCombineTileReady>(
         problemShape, gmmAddrInfo, startBlockIdx, blockJob, blockMmadContext, allowWeightL2Bypass, rowOffsetInExpert,
@@ -852,7 +853,8 @@ __aicore__ inline void RunGmm2A8W4(const BlockContext& pipeline,
                                    const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
                                    const Params* params = nullptr, uint32_t activationOutputDivisor = ACTIVATION_N_HALF)
 {
-    BlockJobContext blockJob{MegaMoeHardwarePolicy::GetAicBlockIdx(), static_cast<uint32_t>(GetBlockNum())};
+    BlockJobContext blockJob{MegaMoeHardwarePolicy::GetAicBlockIdx(),
+                             static_cast<uint32_t>(MegaMoeHardwarePolicy::GetBlockNum())};
     RunGmm2A8W4<ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, Gmm1TileM, TopkWeightsPrefetch,
                 IsShared, IsLayered, IsWaveFlagGrained, NotifyCombineTileReady>(
         pipeline, problemShape, gmmAddrInfo, startBlockIdx, blockJob, static_cast<uint32_t>(Get<M_VALUE>(problemShape)),
@@ -992,6 +994,7 @@ __aicore__ inline void NotifyWaveGmm2Ready(const AivJobContext& job, const Param
 }
 
 // 一个 AIV Combine 任务等待指定专家的全部 GMM2 结果落地。
+#if defined(MEGA_MOE_ARCH92_DEVICE)
 __aicore__ inline void WaitWaveGmm2Ready(const AivJobContext& job, const Params& params, uint32_t slotIdx)
 {
     const auto& workspace = params.workspace.layout;
@@ -1027,6 +1030,65 @@ __aicore__ inline void WaitWaveGmm2Ready(const AivJobContext& job, const Params&
         }
     }
 }
+#else
+// Compact搬入各槽首项后，只对实际任务取最小值；原scan预留区覆盖完整向量加载。
+__simd_vf__ inline void CheckWaveGmm2ReadyVF(__ubuf__ int32_t* doneUb, __ubuf__ int32_t* scanUb, uint32_t jobCount)
+{
+    constexpr uint32_t ELEMENTS_PER_VECTOR = static_cast<uint32_t>(asc_get_vf_len()) / sizeof(int32_t);
+    uint32_t remaining = jobCount;
+    vector_bool active = asc_update_mask_b32(remaining);
+    vector_int32_t inputReg;
+    vector_int32_t resultReg;
+    asc_loadalign(inputReg, scanUb);
+    asc_reduce_min(resultReg, inputReg, active);
+    // 常见任务数不超过一个向量；保留分块处理，避免未来任务数增加时被掩码截断。
+    for (uint32_t offset = ELEMENTS_PER_VECTOR; remaining > 0U; offset += ELEMENTS_PER_VECTOR) {
+        active = asc_update_mask_b32(remaining);
+        asc_loadalign(inputReg, scanUb + offset);
+        vector_int32_t blockMinReg;
+        asc_reduce_min(blockMinReg, inputReg, active);
+        // 仅保留各块lane0的最小值，非空块的active始终包含lane0。
+        asc_min(resultReg, resultReg, blockMinReg, active);
+    }
+    asc_storealign_1st(doneUb, resultReg);
+}
+
+__aicore__ inline void WaitWaveGmm2Ready(const AivJobContext& job, const Params& params, uint32_t slotIdx)
+{
+    const auto& workspace = params.workspace.layout;
+    const auto& buffer = params.workspace.base;
+    if constexpr (g_coreType == AIC) {
+        return;
+    }
+    if (job.totalJobs == 0U) {
+        return;
+    }
+    __gm__ int32_t* readyBase = workspace.mte.sync.gmm2Ready.get_ptr<int32_t>(buffer);
+    uint64_t readySlotOffset = static_cast<uint64_t>(slotIdx) * GetWaveGmm2ReadySlotStride(job);
+    __gm__ int32_t* readyGm = readyBase;
+    __ubuf__ int32_t* scanUb = reinterpret_cast<__ubuf__ int32_t*>(WAVE_GMM2_READY_SCAN_UB_ADDR);
+    __ubuf__ int32_t* sumUb = reinterpret_cast<__ubuf__ int32_t*>(WAVE_GMM2_READY_SUM_UB_ADDR);
+    while (true) {
+        CopyGmToUb(scanUb, readyGm + readySlotOffset,
+                   CopyRows{static_cast<uint16_t>(job.totalJobs), sizeof(int32_t), INT_CACHELINE * sizeof(int32_t),
+                            sizeof(int32_t)},
+                   GmLoadCacheMode::NORMAL_FIRST_VICTIM, true);
+        PipeNotify<PIPE_MTE2, PIPE_V>(EVENT_ID0);
+        PipeWait<PIPE_MTE2, PIPE_V>(EVENT_ID0);
+        if constexpr (g_coreType == AIV) {
+            CheckWaveGmm2ReadyVF(sumUb, scanUb, job.totalJobs);
+        }
+        PipeNotify<PIPE_V, PIPE_S>(EVENT_ID0);
+        PipeWait<PIPE_V, PIPE_S>(EVENT_ID0);
+        if (sumUb[0] != 0) {
+            return;
+        }
+        int64_t waitStart = GetDeviceCycle();
+        while (GetDeviceCycle() - waitStart < GM_FLAG_POLL_BACKOFF_CYCLES) {
+        }
+    }
+}
+#endif
 
 template <uint8_t CombineMode, bool IncludeAiv0 = false>
 __aicore__ inline void RunWaveCombineStage(const MoeStageCommonConfig& common, const AivJobContext& job,

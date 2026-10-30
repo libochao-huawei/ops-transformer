@@ -30,6 +30,7 @@ struct SwiGluOaiParams {
     float beta = 0.0F;
 };
 
+#if (__NPU_ARCH__ != 3510) || !defined(__ASC_FTZ__)
 template <typename InputType>
 __simd_callee__ inline void LoadSwiGluOaiInputAsFp32(AscendC::Reg::RegTensor<float>& dstReg,
                                                      AscendC::Reg::RegTensor<InputType>& inputReg,
@@ -152,6 +153,84 @@ __simd_vf__ inline void RunSwiGLUOAI(GatedActivationTileContext<InputType> conte
         }
     }
 }
+
+#else
+template <typename InputType, bool TopkWeightsPrefetch>
+__simd_callee__ inline void ComputeSwiGluOai(__ubuf__ uint32_t*& output, __ubuf__ InputType*& gate,
+                                             __ubuf__ InputType*& up, vector_float& weight, vector_bool computeMask,
+                                             vector_bool storeMask, SwiGluOaiParams params)
+{
+    vector_float gateReg;
+    vector_float upReg;
+    vector_float resultReg;
+    LoadActivationInput<InputType>(gateReg, gate, computeMask);
+    LoadActivationInput<InputType>(upReg, up, computeMask);
+    asc_min_scalar(gateReg, gateReg, params.clampLimit, computeMask);
+    asc_min_scalar(upReg, upReg, params.clampLimit, computeMask);
+    asc_max_scalar(upReg, upReg, -params.clampLimit, computeMask);
+    asc_add_scalar(upReg, upReg, params.beta, computeMask);
+    asc_mul_scalar(resultReg, gateReg, -params.alpha, computeMask);
+    asc_exp(resultReg, resultReg, computeMask);
+    asc_add_scalar(resultReg, resultReg, 1.0F, computeMask);
+    asc_div(resultReg, gateReg, resultReg, computeMask);
+    asc_mul(resultReg, resultReg, upReg, computeMask);
+    if constexpr (TopkWeightsPrefetch) {
+        asc_mul(resultReg, resultReg, weight, computeMask);
+    }
+    StoreActivationOutput(output, resultReg, computeMask, storeMask);
+}
+
+template <typename InputType, bool TopkWeightsPrefetch>
+__simd_vf__ inline void RunSwiGLUOAI(GatedActivationTileContext<InputType> context, SwiGluOaiParams params)
+{
+    vector_bool fullMask = asc_create_mask_b32(PAT_ALL);
+    vector_bool tailComputeMask;
+    vector_bool tailStoreMask;
+    if (context.needTailVectorCompute != 0U) {
+        uint32_t tailComputeCount = context.tailComputeMaskElementCount;
+        tailComputeMask = asc_update_mask_b32(tailComputeCount);
+        if (context.tailStoreMaskElementCount == VECTOR_LENGTH_FP32) {
+            tailStoreMask = fullMask;
+        } else {
+            uint32_t tailStoreCount = context.tailStoreMaskElementCount;
+            tailStoreMask = asc_update_mask_b32(tailStoreCount);
+        }
+    }
+    vector_bool additionalPaddingStoreMask;
+    if (context.needAdditionalPaddingStore != 0U) {
+        uint32_t paddingStoreCount = context.additionalPaddingStoreMaskElementCount;
+        additionalPaddingStoreMask = asc_update_mask_b16(paddingStoreCount);
+    }
+    vector_float weightReg;
+    __ubuf__ float* topkWeights = context.topkWeights;
+    if constexpr (TopkWeightsPrefetch) {
+        topkWeights += WEIGHT_INDEX;
+    }
+
+    for (uint16_t rowIndex = 0; rowIndex < context.rowLoopCount; ++rowIndex) {
+        if constexpr (TopkWeightsPrefetch) {
+            asc_loadalign_brc_elem_postupdate(weightReg, topkWeights, INT32_PER_256B);
+        }
+        const uint32_t inputRowOffset = static_cast<uint32_t>(rowIndex) * context.inputRowStrideElements;
+        const uint32_t outputRowOffset = static_cast<uint32_t>(rowIndex) * context.outputRowStrideElements;
+        __ubuf__ InputType* gate = context.gate + inputRowOffset;
+        __ubuf__ InputType* up = context.up + inputRowOffset;
+        __ubuf__ uint32_t* output = reinterpret_cast<__ubuf__ uint32_t*>(context.output + outputRowOffset);
+        for (uint16_t vectorIndex = 0; vectorIndex < context.fullVectorLoopCount; ++vectorIndex) {
+            ComputeSwiGluOai<InputType, TopkWeightsPrefetch>(output, gate, up, weightReg, fullMask, fullMask, params);
+        }
+        if (context.needTailVectorCompute != 0U) {
+            ComputeSwiGluOai<InputType, TopkWeightsPrefetch>(output, gate, up, weightReg, tailComputeMask,
+                                                             tailStoreMask, params);
+        }
+        if (context.needAdditionalPaddingStore != 0U) {
+            vector_bfloat16_t zeroReg;
+            asc_duplicate_scalar(zeroReg, static_cast<bfloat16_t>(0), additionalPaddingStoreMask);
+            asc_storealign(reinterpret_cast<__ubuf__ bfloat16_t*>(output), zeroReg, additionalPaddingStoreMask);
+        }
+    }
+}
+#endif
 
 } // namespace Activation
 } // namespace MegaMoeImpl

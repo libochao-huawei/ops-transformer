@@ -464,7 +464,8 @@ __aicore__ inline void LoadAndComputeExpertCountTable(const MoeStageCommonConfig
      * 本核已在输入准备阶段更新同步计数，直接读取本核计数生成预期标签。
      * 整表搬入 UB 后批量检查本轮标签，包括零 count；失败退避重试，成功快照直接用于 cumsum。
      */
-    auto* syncCountAddr = GetSyncCountAddress(peermem.rankSync.get_ptr(commBuffer), GetBlockIdx());
+    auto* syncCountAddr =
+        GetSyncCountAddress(peermem.rankSync.get_ptr(commBuffer), MegaMoeHardwarePolicy::GetAivBlockIdx());
     const int32_t syncCount = GmRead(syncCountAddr);
     const uint32_t expectedSyncRoundTag = GetSyncRoundTag(syncCount);
     __gm__ int32_t* peerCountsGm = peermem.expertCountRecv.template get_ptr<int32_t>(commBuffer);
@@ -475,7 +476,7 @@ __aicore__ inline void LoadAndComputeExpertCountTable(const MoeStageCommonConfig
     ComputeExpertCountTables(scratch.cumsumInfoTensor, scratch.expertTokenNumsOutTensor, common.moeExpertPerRank,
                              common.worldSize, static_cast<uint32_t>(params.tilingData->compute.maxOutputSize));
     // 后续只使用 UB 结果及 workspace 副本，不再读取 peermem 原始 count 表。
-    ArriveAllAiv<PIPE_V>(COUNT_TABLE_READ_DONE_FLAG);
+    SyncInterArrive<PIPE_V>(COUNT_TABLE_READ_DONE_FLAG);
     PipeFence<PIPE_V, PIPE_S, SYNC_EVENT_ID2>();
 }
 
@@ -499,7 +500,7 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
         // 否则计算主导档的 AIV0 无人上报，ExportAndResetExpertCounts 等 read-done 挂死。
         if (params.tilingData->compute.dedupMode == 0 ||
             params.tilingData->compute.hiddenDim > DEDUP_AIV0_PREPASS_MAX_HIDDEN_DIM) {
-            ArriveAllAiv<PIPE_V>(COUNT_TABLE_READ_DONE_FLAG);
+            SyncInterArrive<PIPE_V>(COUNT_TABLE_READ_DONE_FLAG);
         }
         return;
     }

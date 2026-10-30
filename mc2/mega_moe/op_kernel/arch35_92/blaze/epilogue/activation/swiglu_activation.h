@@ -23,6 +23,7 @@
 namespace MegaMoeImpl {
 namespace Activation {
 
+#if (__NPU_ARCH__ != 3510) || !defined(__ASC_FTZ__)
 template <typename InputType>
 __simd_callee__ inline void LoadSwiGluInputAsFp32(AscendC::Reg::RegTensor<float>& dstReg,
                                                   AscendC::Reg::RegTensor<InputType>& inputReg, __ubuf__ InputType* src,
@@ -146,6 +147,95 @@ __simd_vf__ inline void RunSwiGLU(GatedActivationTileContext<InputType> context,
         }
     }
 }
+
+#else
+template <bool IsStep>
+__simd_callee__ inline void ComputeSwiGlu(vector_float& outputReg, vector_float& gateReg, vector_float& upReg,
+                                          vector_bool computeMask, float clampLimit)
+{
+    if constexpr (!IsStep) {
+        asc_min_scalar(gateReg, gateReg, clampLimit, computeMask);
+    }
+    asc_min_scalar(upReg, upReg, clampLimit, computeMask);
+    asc_max_scalar(upReg, upReg, -clampLimit, computeMask);
+
+    vector_float denominatorReg;
+    vector_float sigmoidReg;
+    asc_mul_scalar(denominatorReg, gateReg, -1.0F, computeMask);
+    asc_exp(denominatorReg, denominatorReg, computeMask);
+    asc_add_scalar(denominatorReg, denominatorReg, 1.0F, computeMask);
+    asc_div(sigmoidReg, gateReg, denominatorReg, computeMask);
+    if constexpr (IsStep) {
+        asc_min_scalar(sigmoidReg, sigmoidReg, clampLimit, computeMask);
+    }
+    asc_mul(outputReg, sigmoidReg, upReg, computeMask);
+}
+
+template <typename InputType, bool TopkWeightsPrefetch, bool IsStep>
+__simd_vf__ inline void RunSwiGLU(GatedActivationTileContext<InputType> context, float clampLimit)
+{
+    vector_bool fullMask = asc_create_mask_b32(PAT_ALL);
+    vector_bool tailComputeMask;
+    vector_bool tailStoreMask;
+    vector_bool additionalPaddingStoreMask;
+    if (context.needTailVectorCompute != 0U) {
+        uint32_t computeCount = context.tailComputeMaskElementCount;
+        tailComputeMask = asc_update_mask_b32(computeCount);
+        if (context.tailStoreMaskElementCount == VECTOR_LENGTH_FP32) {
+            tailStoreMask = fullMask;
+        } else {
+            uint32_t storeCount = context.tailStoreMaskElementCount;
+            tailStoreMask = asc_update_mask_b32(storeCount);
+        }
+    }
+    if (context.needAdditionalPaddingStore != 0U) {
+        uint32_t paddingCount = context.additionalPaddingStoreMaskElementCount;
+        additionalPaddingStoreMask = asc_update_mask_b16(paddingCount);
+    }
+
+    __ubuf__ float* topkWeights = context.topkWeights;
+    if constexpr (TopkWeightsPrefetch) {
+        topkWeights += WEIGHT_INDEX;
+    }
+    vector_float gateReg;
+    vector_float upReg;
+    vector_float outputReg;
+    vector_float weightReg;
+    for (uint16_t rowIndex = 0U; rowIndex < context.rowLoopCount; ++rowIndex) {
+        if constexpr (TopkWeightsPrefetch) {
+            asc_loadalign_brc_elem_postupdate(weightReg, topkWeights, INT32_PER_256B);
+        }
+        const uint32_t inputRowOffset = static_cast<uint32_t>(rowIndex) * context.inputRowStrideElements;
+        const uint32_t outputRowOffset = static_cast<uint32_t>(rowIndex) * context.outputRowStrideElements;
+        __ubuf__ InputType* gate = context.gate + inputRowOffset;
+        __ubuf__ InputType* up = context.up + inputRowOffset;
+        __ubuf__ uint32_t* output = reinterpret_cast<__ubuf__ uint32_t*>(context.output + outputRowOffset);
+        for (uint16_t vectorIndex = 0U; vectorIndex < context.fullVectorLoopCount; ++vectorIndex) {
+            LoadActivationInput<InputType>(gateReg, gate, fullMask);
+            LoadActivationInput<InputType>(upReg, up, fullMask);
+            ComputeSwiGlu<IsStep>(outputReg, gateReg, upReg, fullMask, clampLimit);
+            if constexpr (TopkWeightsPrefetch) {
+                asc_mul(outputReg, outputReg, weightReg, fullMask);
+            }
+            StoreActivationOutput(output, outputReg, fullMask, fullMask);
+        }
+        if (context.needTailVectorCompute != 0U) {
+            LoadActivationInput<InputType>(gateReg, gate, tailComputeMask);
+            LoadActivationInput<InputType>(upReg, up, tailComputeMask);
+            ComputeSwiGlu<IsStep>(outputReg, gateReg, upReg, tailComputeMask, clampLimit);
+            if constexpr (TopkWeightsPrefetch) {
+                asc_mul(outputReg, outputReg, weightReg, tailComputeMask);
+            }
+            StoreActivationOutput(output, outputReg, tailComputeMask, tailStoreMask);
+        }
+        if (context.needAdditionalPaddingStore != 0U) {
+            vector_bfloat16_t zeroReg;
+            asc_duplicate_scalar(zeroReg, static_cast<bfloat16_t>(0), additionalPaddingStoreMask);
+            asc_storealign(context.additionalPaddingOutput + outputRowOffset, zeroReg, additionalPaddingStoreMask);
+        }
+    }
+}
+#endif
 
 } // namespace Activation
 } // namespace MegaMoeImpl

@@ -216,6 +216,7 @@ __aicore__ inline void ConsumeDedupMemberSegment(WaveCombineDedupScratch& dedupS
     const TEventID memberEvent =
         static_cast<TEventID>(WAVE_COMBINE_DEDUP_MEMBER_EVENT_BASE + static_cast<int32_t>(buf));
     PipeWait<PIPE_MTE2, PIPE_V>(memberEvent);
+#if defined(MEGA_MOE_ARCH92_DEVICE)
     LocalTensor<bfloat16_t> memberUb(
         TPosition::VECIN, reinterpret_cast<uint64_t>(dedupScratch.memberTensor + buf * WAVE_COMBINE_DEDUP_SEG_ELEMS),
         segLen);
@@ -235,6 +236,26 @@ __aicore__ inline void ConsumeDedupMemberSegment(WaveCombineDedupScratch& dedupS
         }
         Add(accum, accum, memberFp32, segLen);
     }
+#else
+    if constexpr (g_coreType == AIV) {
+        auto* memberUb = dedupScratch.memberTensor + buf * WAVE_COMBINE_DEDUP_SEG_ELEMS;
+        auto* accum = dedupScratch.accumTensor;
+        if (mulWeights) {
+            float memberWeight = GetDedupMemberWeight(dedupScratch, params, descRowBase, memberIdx);
+            if (memberIdx == 0U) {
+                AccumulateBf16ExpertSlotVF<true, true>(accum, memberUb, memberWeight, segLen);
+            } else {
+                AccumulateBf16ExpertSlotVF<false, true>(accum, memberUb, memberWeight, segLen);
+            }
+        } else {
+            if (memberIdx == 0U) {
+                AccumulateBf16ExpertSlotVF<true, false>(accum, memberUb, 0.0f, segLen);
+            } else {
+                AccumulateBf16ExpertSlotVF<false, false>(accum, memberUb, 0.0f, segLen);
+            }
+        }
+    }
+#endif
 
     PipeNotify<PIPE_V, PIPE_MTE2>(memberEvent);
 }
@@ -308,11 +329,17 @@ __aicore__ inline void SendWaveCombineTokenDedupMerge(const MoeStageCommonConfig
         const uint32_t segLen = h - segBase < WAVE_COMBINE_DEDUP_SEG_ELEMS ? h - segBase : WAVE_COMBINE_DEDUP_SEG_ELEMS;
         AccumulateDedupMemberSegment(dedupScratch, gmm2AbsGm, params, descRowBase, memberCount, mulWeights, h, segBase,
                                      segLen);
+#if defined(MEGA_MOE_ARCH92_DEVICE)
         {
             LocalTensor<bfloat16_t> dst(TPosition::VECIN, reinterpret_cast<uint64_t>(mergeSendUb + segBase), segLen);
             LocalTensor<float> src(TPosition::VECCALC, reinterpret_cast<uint64_t>(dedupScratch.accumTensor), segLen);
             Cast(dst, src, RoundMode::CAST_RINT, segLen);
         }
+#else
+        if constexpr (g_coreType == AIV) {
+            CastFp32ToBf16VF(mergeSendUb + segBase, dedupScratch.accumTensor, segLen);
+        }
+#endif
     }
     if (mulWeights) {
         // 权重区读取全部结束，放行下一组的装载（与 LoadDedupMergeWeightBits 的装载配平，行内自闭环）。
@@ -348,11 +375,12 @@ __aicore__ inline void WaitDedupPrepassAllDone(const Params& params)
 {
     const auto& workspace = params.workspace.layout;
     const auto& buffer = params.workspace.base;
-    WaitUntilGmFlagEquals(reinterpret_cast<__gm__ int32_t*>(workspace.mte.sync.dedupReady.get_ptr(buffer)),
-                          params.tilingData->compute.hiddenDim <= DEDUP_AIV0_PREPASS_MAX_HIDDEN_DIM ?
-                              (static_cast<int32_t>(GetBlockNum()) |
-                               (static_cast<int32_t>(GetBlockNum()) << DEDUP_PREPASS_DONE_AIV0_SHIFT)) :
-                              static_cast<int32_t>(GetBlockNum()));
+    WaitUntilGmFlagEquals(
+        reinterpret_cast<__gm__ int32_t*>(workspace.mte.sync.dedupReady.get_ptr(buffer)),
+        params.tilingData->compute.hiddenDim <= DEDUP_AIV0_PREPASS_MAX_HIDDEN_DIM ?
+            (static_cast<int32_t>(MegaMoeHardwarePolicy::GetBlockNum()) |
+             (static_cast<int32_t>(MegaMoeHardwarePolicy::GetBlockNum()) << DEDUP_PREPASS_DONE_AIV0_SHIFT)) :
+            static_cast<int32_t>(MegaMoeHardwarePolicy::GetBlockNum()));
 }
 #endif
 
@@ -363,7 +391,7 @@ __aicore__ inline void WaitDedupPrepassAllDone(const Params& params)
     const auto& workspace = params.workspace.layout;
     const auto& buffer = params.workspace.base;
     WaitUntilGmFlagEquals(reinterpret_cast<__gm__ int32_t*>(workspace.mte.sync.dedupReady.get_ptr(buffer)),
-                          static_cast<int32_t>(GetBlockNum()));
+                          static_cast<int32_t>(MegaMoeHardwarePolicy::GetBlockNum()));
 }
 #endif
 

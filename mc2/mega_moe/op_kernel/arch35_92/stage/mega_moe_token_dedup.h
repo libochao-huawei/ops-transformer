@@ -478,11 +478,17 @@ __aicore__ inline void RunDedupPrepassWorkItem(DedupPrepassWorker<TopkIndexType>
         worker.topK, tokenHi);
     // 上一工作项的标量 count 写先于本项向量清零（S→V），再保证清零结果对标量可见（V→S）。
     PipeFence<PIPE_S, PIPE_V, SYNC_EVENT_ID2>();
+#if defined(MEGA_MOE_ARCH92_DEVICE)
     {
         LocalTensor<int32_t> values(TPosition::VECCALC, reinterpret_cast<uint64_t>(worker.countTensor),
                                     static_cast<int32_t>(dedup.prepassChunkTokens));
         Duplicate<int32_t>(values, DEDUP_PACK_INIT, static_cast<int32_t>(dedup.prepassChunkTokens));
     }
+#else
+    if constexpr (g_coreType == AIV) {
+        FillUbVF<int32_t>(worker.countTensor, DEDUP_PACK_INIT, static_cast<uint32_t>(dedup.prepassChunkTokens));
+    }
+#endif
     PipeFence<PIPE_V, PIPE_S, SYNC_EVENT_ID2>();
     DedupScanRouteSlots(worker, common, params, scratch, srcRank, window);
     DedupStoreRowDescChunk(worker, tokenHi - window.tokenLo);

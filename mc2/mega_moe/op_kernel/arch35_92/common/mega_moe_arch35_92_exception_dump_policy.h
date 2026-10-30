@@ -12,6 +12,7 @@
 #define MEGA_MOE_ARCH35_EXCEPTION_DUMP_POLICY_H
 
 #include "../../../../common/op_kernel/mc2_exception_dump.h"
+#include "mega_moe_arch_policy.h"
 #include "mega_moe_gm_layout.h"
 #include "../mega_moe_tiling.h"
 
@@ -76,7 +77,8 @@ __aicore__ inline __gm__ GmmLoopCount* RegisterMegaMoeExceptionDump(ExceptionDum
     if ASCEND_IS_NOT_AIV {
         return nullptr;
     }
-    __gm__ GmmLoopCount* loopCount = reinterpret_cast<__gm__ GmmLoopCount*>(loopCountBase) + GetBlockIdx();
+    __gm__ GmmLoopCount* loopCount =
+        reinterpret_cast<__gm__ GmmLoopCount*>(loopCountBase) + MegaMoeHardwarePolicy::GetAivBlockIdx();
     loopCount->gmm1Count = 0U;
     loopCount->gmm2Count = 0U;
     __gm__ uint8_t* loopCountGlobal = reinterpret_cast<GM_ADDR>(loopCount);

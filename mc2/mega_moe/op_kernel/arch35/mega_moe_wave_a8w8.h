@@ -238,7 +238,7 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
     const auto& workspace = params_.workspace.layout;
     const auto& buffer = params_.workspace.base;
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
             return gmm1Position;
         }
     }
@@ -375,7 +375,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Advance
     if (gmm2Position.tokenIndexInExpert >= expertRowCount) {
         if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
             if constexpr (g_coreType == AIV) {
-                if (GetSubBlockIdx() == 0U && gmm2Position.expertIdx == allCoreCombineExpertIndex) {
+                if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U &&
+                    gmm2Position.expertIdx == allCoreCombineExpertIndex) {
                     allCoreCombineExpertState = gmm2ExpertState;
                 }
             }
@@ -383,7 +384,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Advance
         } else if (IsCombineDedupOn(params_.tilingData->compute.dedupMode)) {
             // 非量化 combine 去重：独立 combine 阶段按 per-expert 标记推进；末专家状态供 AIV0 参战。
             if constexpr (g_coreType == AIV) {
-                if (GetSubBlockIdx() == 0U && gmm2Position.expertIdx == allCoreCombineExpertIndex) {
+                if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U &&
+                    gmm2Position.expertIdx == allCoreCombineExpertIndex) {
                     allCoreCombineExpertState = gmm2ExpertState;
                 }
             }
@@ -403,7 +405,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     const auto& workspace = params_.workspace.layout;
     const auto& buffer = params_.workspace.base;
     if constexpr (CombineQuantMode != COMBINE_NO_QUANT && g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
             return;
         }
     }
@@ -445,7 +447,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (GetSubBlockIdx() == 0U) {
+    if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
         if (allCoreCombineExpertIndex < expertBegin || allCoreCombineExpertIndex >= expertEnd) {
             return;
         }
@@ -563,7 +565,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (GetSubBlockIdx() == 0U) {
+    if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
         if (allCoreCombineExpertIndex < expertBegin || allCoreCombineExpertIndex >= expertEnd) {
             return;
         }
@@ -612,7 +614,7 @@ MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitMoeCombineBufferConfig(boo
         combineBufferConfig = InitCombineBuffers();
     } else if (dedupCombineActive) {
         if constexpr (g_coreType == AIV) {
-            if (GetSubBlockIdx() == 1U) {
+            if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
                 combineBufferConfig =
                     InitWaveCombineBuffersDedup(commonConfig_, waveCombineScratch_, waveCombineDedupScratch_);
             }
@@ -703,7 +705,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     bool hasPendingGmm2Wave = false;
 
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 0U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
             WaitForMoeExpertTokenCountReady(workspace.sync.countsReady.get_ptr(buffer), countWorkspace_, 0U);
         }
     }
@@ -714,7 +716,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         ExpertTokenPosition waveEndPosition =
             ProcessGmm1Wave(gmm1Position, gmm1ExpertState, gmm1AddrInfo, gmm1RuntimeState);
         if constexpr (g_coreType == AIV) {
-            if (GetSubBlockIdx() == 1U) {
+            if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
                 waveEndPosition = PrepareDispatchWave(waveBeginPosition, dispatchState, gmm1Count == 0U);
             }
         }

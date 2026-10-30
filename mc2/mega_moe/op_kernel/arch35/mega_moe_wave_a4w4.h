@@ -136,7 +136,7 @@ __aicore__ inline ExpertTokenPosition MegaMoeA4W4Wave<TemplateMegaMoeA4W4WaveTyp
     ExpertTokenPosition dispatchPosition{};
     // 启动阶段：GMM1 开始消费输入前，由 AIV1 先 Dispatch 第一个完整 Wave。
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() != 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() != 1U) {
             return dispatchPosition;
         }
         ExpertTokenRange firstDispatchRange{dispatchPosition, dispatchPosition};
@@ -166,7 +166,7 @@ __aicore__ inline void MegaMoeA4W4Wave<TemplateMegaMoeA4W4WaveTypeFunc>::Dispatc
     const auto& workspace = params_.workspace.layout;
     const auto& buffer = params_.workspace.base;
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() != 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() != 1U) {
             return;
         }
         ExpertTokenRange nextExpertDispatchRange = PlanNextExpertTokenRangeInWave<GMM1_TILE_M>(
@@ -196,7 +196,7 @@ __aicore__ inline ExpertTokenRange MegaMoeA4W4Wave<TemplateMegaMoeA4W4WaveTypeFu
     uint32_t nextDispatchWaveMGroupCount = 0U;
     bool nextWaveNeedsDispatch = false;
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
             nextWaveNeedsDispatch = IsPositionWithinWave(dispatchPosition, nextDispatchWaveMGroupCount);
         }
     }
@@ -269,7 +269,7 @@ __aicore__ inline void MegaMoeA4W4Wave<TemplateMegaMoeA4W4WaveTypeFunc>::Process
     using Config =
         GmmKernel::Config<true, 0, typename MoeQuantConfig::ActivationQuantOutType, MoeWeightType, bfloat16_t,
                           typename MoeQuantConfig::QuantScaleType, typename MoeQuantConfig::QuantScaleType>;
-    if (g_coreType == AscendC::AIC || GetSubBlockIdx() == 0U) {
+    if (g_coreType == AscendC::AIC || MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
         typename Config::BlockContext::Block block(params_.tilingData->a8w4L1Layout);
         ProcessCurrentWaveGmm2Loop(waveRange, gmm2State, gmm2AddrInfo, combineBufferConfig, combineRowSequence,
                                    {&block});
@@ -327,7 +327,7 @@ __aicore__ inline void MegaMoeA4W4Wave<TemplateMegaMoeA4W4WaveTypeFunc>::Process
     } else if (IsCombineDedupOn(params_.tilingData->compute.dedupMode)) {
         // 非量化 combine 去重：专家粒度独立消费（基类 RunGmm2CombineForExpert 内接入）。
         if constexpr (g_coreType == AIV) {
-            if (GetSubBlockIdx() == 1U) {
+            if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
                 combineBufferConfig =
                     InitWaveCombineBuffersDedup(commonConfig_, waveCombineScratch_, waveCombineDedupScratch_);
             }

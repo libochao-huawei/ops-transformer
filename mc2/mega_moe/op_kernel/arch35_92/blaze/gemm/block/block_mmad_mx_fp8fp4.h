@@ -13,6 +13,7 @@
  * \brief MMAD block implementation for weight-quant grouped matmul split-M pipeline.
  */
 #pragma once
+#include "../../../common/mega_moe_sync.h"
 #include "../tile/copy_gmm1_concat.h"
 #include "../policy/dispatch_policy_mega_moe.h"
 #include "blaze/gemm/tile/tile_trait.h"
@@ -27,18 +28,17 @@ namespace Gemm {
 namespace Block {
 
 using AscendC::BLOCK_CUBE;
-using AscendC::CrossCoreSetFlag;
-using AscendC::CrossCoreWaitFlag;
-using AscendC::HardEvent;
-using AscendC::SetFlag;
 using AscendC::TEventID;
-using AscendC::WaitFlag;
+using MegaMoeImpl::SyncIntraArrive;
+using MegaMoeImpl::PipeFence;
+using MegaMoeImpl::PipeNotify;
+using MegaMoeImpl::PipeWait;
+using MegaMoeImpl::SyncIntraWait;
 using Blaze::Gemm::DOUBLE_BUFFER;
 using Blaze::Gemm::FINAL_ACCUMULATION;
 using Blaze::Gemm::MXFP_DIVISOR_SIZE;
 using Blaze::Gemm::MXFP_MULTI_BASE_SIZE;
 using Blaze::Gemm::NON_FINAL_ACCUMULATION;
-using Blaze::Gemm::SYNC_MODE4;
 
 // Macro aliases keep the specialization declaration compact for this dispatch-policy binding.
 #define BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS \
@@ -291,7 +291,7 @@ __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::ProcessTileL1(int64_
         const bool finalK = isLastGmK && l1KOffset + realL0K == kbL1RealSize;
         // One B/scaleB load serves all M strips for this K split. Its free event
         // is returned only after the last strip's MAD has stopped reading it.
-        WaitFlag<HardEvent::M_MTE1>(eventIdMToMte1B_ + l0bBufIdx_);
+        PipeWait<PIPE_M, PIPE_MTE1>(eventIdMToMte1B_ + l0bBufIdx_);
         CopyBAndScaleBL1ToL0(tensorBL1, l1KOffset, kbOffset, realL0K, realL0ScaleK, param);
         for (uint64_t mOffset = 0; mOffset < param.mL1Size; mOffset += MX_FP8FP4_M_STRIP) {
             const uint64_t mSize = min(MX_FP8FP4_M_STRIP, param.mL1Size - mOffset);
@@ -299,13 +299,12 @@ __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::ProcessTileL1(int64_
             auto tensorBL0 =
                 asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::l0b, AType>(l0bBufIdx_ * L0_BUF_OFFSET),
                                      MakeLayoutBL0{}(realL0K, param.nL1Size));
-            WaitFlag<HardEvent::M_MTE1>(eventIdMToMte1_ + l0aBufIdx_);
+            PipeWait<PIPE_M, PIPE_MTE1>(eventIdMToMte1_ + l0aBufIdx_);
             CopyAAndScaleAL1ToL0(l1KOffset, kbOffset, realL0K, realL0ScaleK, mOffset, mSize, param);
             auto tensorAL0 =
                 asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::l0a, AType>(l0aBufIdx_ * L0_BUF_OFFSET),
                                      MakeLayoutAL0{}(mSize, realL0K));
-            SetFlag<HardEvent::MTE1_M>(eventIdMte1ToM_);
-            WaitFlag<HardEvent::MTE1_M>(eventIdMte1ToM_);
+            PipeFence<PIPE_MTE1, PIPE_M, eventIdMte1ToM_>();
 
             // Each strip owns a contiguous, 512-byte-aligned L0C range. Retain
             // the original per-element K order and the 2/3 unit-flag protocol.
@@ -325,14 +324,14 @@ __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::ProcessTileL1(int64_
                 asc::te::mmad_atom<asc::te::mmad_traits<asc::te::mmad_operation, Blaze::Gemm::Tile::MmadTraitMX>>{}
                     .with(params),
                 tensorL0C, tensorAL0, tensorBL0);
-            SetFlag<HardEvent::M_MTE1>(eventIdMToMte1_ + l0aBufIdx_);
+            PipeNotify<PIPE_M, PIPE_MTE1>(eventIdMToMte1_ + l0aBufIdx_);
             l0aBufIdx_ ^= 1;
 
             if (finalK) {
                 CopyCL0c2GmOrUb(tensorC, param, copyUbToV1, mOffset, mSize);
             }
         }
-        SetFlag<HardEvent::M_MTE1>(eventIdMToMte1B_ + l0bBufIdx_);
+        PipeNotify<PIPE_M, PIPE_MTE1>(eventIdMToMte1B_ + l0bBufIdx_);
         l0bBufIdx_ ^= 1;
     }
 }
@@ -340,26 +339,26 @@ __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::ProcessTileL1(int64_
 BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::WaitAMTE1ToMTE2()
 {
-    WaitFlag<HardEvent::MTE1_MTE2>(eventIdsMte1ToMte2_ + aL1BufIdx_);
+    PipeWait<PIPE_MTE1, PIPE_MTE2>(eventIdsMte1ToMte2_ + aL1BufIdx_);
 }
 
 BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::WaitScaleMTE1ToMTE2()
 {
-    WaitFlag<HardEvent::MTE1_MTE2>(eventIdsMxScaleMte1ToMte2_ + scaleL1BufIdx_);
+    PipeWait<PIPE_MTE1, PIPE_MTE2>(eventIdsMxScaleMte1ToMte2_ + scaleL1BufIdx_);
 }
 
 BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::SetScaleMTE1ToMTE2()
 {
-    SetFlag<HardEvent::MTE1_MTE2>(eventIdsMxScaleMte1ToMte2_ + scaleL1BufIdx_);
+    PipeNotify<PIPE_MTE1, PIPE_MTE2>(eventIdsMxScaleMte1ToMte2_ + scaleL1BufIdx_);
     scaleL1BufIdx_ ^= 1;
 }
 
 BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::SetMTE1ToMTE2()
 {
-    SetFlag<HardEvent::MTE1_MTE2>(eventIdsMte1ToMte2_ + aL1BufIdx_);
+    PipeNotify<PIPE_MTE1, PIPE_MTE2>(eventIdsMte1ToMte2_ + aL1BufIdx_);
     aL1BufIdx_ = (aL1BufIdx_ + 1) % layout_.aBufferNum;
 }
 
@@ -451,12 +450,12 @@ __aicore__ inline BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::BlockMmad(const MegaMoeL1
         SetAicToAiv();
     }
     for (uint64_t i = 0; i < DOUBLE_BUFFER; i++) {
-        SetFlag<HardEvent::M_MTE1>(eventIdMToMte1_ + i);
-        SetFlag<HardEvent::M_MTE1>(eventIdMToMte1B_ + i);
-        SetFlag<HardEvent::MTE1_MTE2>(eventIdsMxScaleMte1ToMte2_ + i);
+        PipeNotify<PIPE_M, PIPE_MTE1>(eventIdMToMte1_ + i);
+        PipeNotify<PIPE_M, PIPE_MTE1>(eventIdMToMte1B_ + i);
+        PipeNotify<PIPE_MTE1, PIPE_MTE2>(eventIdsMxScaleMte1ToMte2_ + i);
     }
     for (uint64_t i = 0; i < layout_.aBufferNum; i++) {
-        SetFlag<HardEvent::MTE1_MTE2>(eventIdsMte1ToMte2_ + i);
+        PipeNotify<PIPE_MTE1, PIPE_MTE2>(eventIdsMte1ToMte2_ + i);
     }
 }
 
@@ -464,12 +463,12 @@ BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::~BlockMmad()
 {
     for (uint64_t i = 0; i < DOUBLE_BUFFER; i++) {
-        WaitFlag<HardEvent::M_MTE1>(eventIdMToMte1_ + i);
-        WaitFlag<HardEvent::M_MTE1>(eventIdMToMte1B_ + i);
-        WaitFlag<HardEvent::MTE1_MTE2>(eventIdsMxScaleMte1ToMte2_ + i);
+        PipeWait<PIPE_M, PIPE_MTE1>(eventIdMToMte1_ + i);
+        PipeWait<PIPE_M, PIPE_MTE1>(eventIdMToMte1B_ + i);
+        PipeWait<PIPE_MTE1, PIPE_MTE2>(eventIdsMxScaleMte1ToMte2_ + i);
     }
     for (uint64_t i = 0; i < layout_.aBufferNum; i++) {
-        WaitFlag<HardEvent::MTE1_MTE2>(eventIdsMte1ToMte2_ + i);
+        PipeWait<PIPE_MTE1, PIPE_MTE2>(eventIdsMte1ToMte2_ + i);
     }
 }
 
@@ -542,15 +541,15 @@ __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::ProcessTilesL1(
         while (nextAKOffset < blockParam.kSize && nextAKOffset < aCopyLimit && nextAKOffset < scaleCopyLimit) {
             // 先搬对应 scale，再搬 A；不能让当前需要的 scale 排在未来 A 块之后。
             if (nextAKOffset == nextScaleKOffset) {
-                WaitFlag<HardEvent::MTE1_MTE2>(eventIdsMxScaleMte1ToMte2_ + scaleCopySlot);
+                PipeWait<PIPE_MTE1, PIPE_MTE2>(eventIdsMxScaleMte1ToMte2_ + scaleCopySlot);
                 CopyMxScaleGmToL1(tensorScaleA, tensorScaleB, blockParam, nextScaleKOffset, scaleCopySlot);
-                SetFlag<HardEvent::MTE2_MTE1>(eventIdsScaleReady_ + scaleCopySlot);
+                PipeNotify<PIPE_MTE2, PIPE_MTE1>(eventIdsScaleReady_ + scaleCopySlot);
                 nextScaleKOffset += blockParam.scaleKL1Size;
                 scaleCopySlot ^= 1;
             }
-            WaitFlag<HardEvent::MTE1_MTE2>(eventIdsMte1ToMte2_ + aCopySlot);
+            PipeWait<PIPE_MTE1, PIPE_MTE2>(eventIdsMte1ToMte2_ + aCopySlot);
             CopyAGmToL1(tensorA, blockParam, nextAKOffset, aCopySlot);
-            SetFlag<HardEvent::MTE2_MTE1>(eventIdsAReady_ + aCopySlot);
+            PipeNotify<PIPE_MTE2, PIPE_MTE1>(eventIdsAReady_ + aCopySlot);
             nextAKOffset += blockParam.kaL1Size;
             aCopySlot = (aCopySlot + 1) % layout_.aBufferNum;
         }
@@ -565,7 +564,7 @@ __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::ProcessTilesL1(
         const uint64_t kbL1RealSize = min(blockParam.kbL1Size, blockParam.kSize - kbGmOffset);
         // 消费端只绑定当前槽；提前搬入后续块不会修改这些 tensor 的地址和尾块布局。
         if (kbGmOffset % blockParam.scaleKL1Size == 0) {
-            WaitFlag<HardEvent::MTE2_MTE1>(eventIdsScaleReady_ + scaleL1BufIdx_);
+            PipeWait<PIPE_MTE2, PIPE_MTE1>(eventIdsScaleReady_ + scaleL1BufIdx_);
             const uint64_t realScaleK =
                 CeilDiv(min(blockParam.scaleKL1Size, blockParam.kSize - kbGmOffset), MXFP_DIVISOR_SIZE) *
                 MXFP_MULTI_BASE_SIZE;
@@ -577,7 +576,7 @@ __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::ProcessTilesL1(
                 MakeLayoutScaleBL1{}(realScaleK, blockParam.nL1Size));
         }
         if (kbGmOffset % blockParam.kaL1Size == 0) {
-            WaitFlag<HardEvent::MTE2_MTE1>(eventIdsAReady_ + aL1BufIdx_);
+            PipeWait<PIPE_MTE2, PIPE_MTE1>(eventIdsAReady_ + aL1BufIdx_);
             const uint64_t realKa = min(blockParam.kaL1Size, blockParam.kSize - kbGmOffset);
             tensorAL1_ =
                 asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::l1, AType>(layout_.aOffsets[aL1BufIdx_]),
@@ -598,13 +597,13 @@ __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::ProcessTilesL1(
 BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::WaitAivToAic()
 {
-    CrossCoreWaitFlag<SYNC_MODE4, PIPE_MTE1>(SYNC_AIC_AIV_FLAG);
+    SyncIntraWait<PIPE_MTE1>(SYNC_AIC_AIV_FLAG);
 }
 
 BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_MMAD_MX_FP8FP4_SPECIALIZATION::SetAicToAiv()
 {
-    CrossCoreSetFlag<SYNC_MODE4, PIPE_MTE1>(SYNC_AIV_AIC_FLAG);
+    SyncIntraArrive<PIPE_MTE1>(SYNC_AIV_AIC_FLAG);
 }
 
 #undef BLOCK_MMAD_MX_FP8FP4_TEMPLATE_PARAMS

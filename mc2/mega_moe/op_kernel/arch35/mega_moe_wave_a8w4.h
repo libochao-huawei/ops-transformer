@@ -134,7 +134,7 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTyp
     ExpertTokenPosition dispatchPosition{};
     // 启动阶段：GMM1 开始消费输入前，由 AIV1 先 Dispatch 第一个完整 Wave。
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() != 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() != 1U) {
             return dispatchPosition;
         }
         ExpertTokenRange firstDispatchRange{dispatchPosition, dispatchPosition};
@@ -164,7 +164,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
     const auto& workspace = params_.workspace.layout;
     const auto& buffer = params_.workspace.base;
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() != 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() != 1U) {
             return;
         }
         ExpertTokenRange nextExpertDispatchRange = PlanNextExpertTokenRangeInWave<GMM1_TILE_M>(
@@ -194,7 +194,7 @@ __aicore__ inline ExpertTokenRange MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFu
     uint32_t nextDispatchWaveMGroupCount = 0U;
     bool nextWaveNeedsDispatch = false;
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
             nextWaveNeedsDispatch = IsPositionWithinWave(dispatchPosition, nextDispatchWaveMGroupCount);
         }
     }
@@ -301,7 +301,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     } else if (IsCombineDedupOn(params_.tilingData->compute.dedupMode)) {
         // 非量化 combine 去重：专家粒度独立消费（基类 RunGmm2CombineForExpert 内接入）。
         if constexpr (g_coreType == AIV) {
-            if (GetSubBlockIdx() == 1U) {
+            if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
                 combineBufferConfig =
                     InitWaveCombineBuffersDedup(commonConfig_, waveCombineScratch_, waveCombineDedupScratch_);
             }
@@ -328,7 +328,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     if constexpr (g_coreType == AIC) {
         typename Config::BlockMmad blockMmad(params_.tilingData->a8w4L1Layout);
         RunMoeExpertLoop(gmm1AddrInfo, gmm2AddrInfo, dispatchPosition, combineBufferConfig, BlockContext{&blockMmad});
-    } else if (GetSubBlockIdx() == 0U) {
+    } else if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
         typename Config::BlockPrologue blockPrologue(params_.tilingData->a8w4L1Layout);
         RunMoeExpertLoop(gmm1AddrInfo, gmm2AddrInfo, dispatchPosition, combineBufferConfig,
                          BlockContext{&blockPrologue});

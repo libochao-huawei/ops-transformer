@@ -55,22 +55,22 @@ __aicore__ inline void WaitUntilGmFlagAtLeast(__gm__ int32_t* flagAddr, int32_t 
 
 __aicore__ inline void NotifyCube(uint16_t value = 0)
 {
-    NotifyIntra<PIPE_V>(AIV_SYNC_AIC_FLAG + value);
+    SyncIntraArrive<PIPE_V>(AIV_SYNC_AIC_FLAG + value);
 }
 
 __aicore__ inline void WaitForVector(uint16_t value = 0)
 {
-    WaitIntra<PIPE_FIX>(AIV_SYNC_AIC_FLAG + value);
+    SyncIntraWait<PIPE_FIX>(AIV_SYNC_AIC_FLAG + value);
 }
 
 __aicore__ inline void NotifyVector(uint16_t value = 0)
 {
-    NotifyIntra<PIPE_FIX>(AIC_SYNC_AIV_FLAG + value);
+    SyncIntraArrive<PIPE_FIX>(AIC_SYNC_AIV_FLAG + value);
 }
 
 __aicore__ inline void WaitForCube(uint16_t value = 0)
 {
-    WaitIntra<PIPE_V>(AIC_SYNC_AIV_FLAG + value);
+    SyncIntraWait<PIPE_V>(AIC_SYNC_AIV_FLAG + value);
 }
 
 // Non-owning view of the caller's UB state. State advances at the same notify
@@ -148,7 +148,7 @@ public:
     __aicore__ inline void WaitForActivation()
     {
         if (pendingTiles_ == GMM_MAX_PENDING_TILES) {
-            WaitIntra<PIPE_S>(activationFinishedFlag_ + aivFlagOffset_);
+            SyncIntraWait<PIPE_S>(activationFinishedFlag_ + aivFlagOffset_);
             --pendingTiles_;
         }
         ++pendingTiles_;
@@ -157,19 +157,19 @@ public:
     // AIC：整个交织 tile 的 Fixpipe 已提交，由 FIX 通知 Activation 读取 GM。
     __aicore__ inline void NotifyActivation()
     {
-        NotifyIntra<PIPE_FIX>(gmm1FinishedFlag_ + aivFlagOffset_);
+        SyncIntraArrive<PIPE_FIX>(gmm1FinishedFlag_ + aivFlagOffset_);
     }
 
     // AIV：在 MTE2 读取 GMM1 结果前等待。
     __aicore__ inline void WaitForGmm1()
     {
-        WaitIntra<PIPE_MTE2>(gmm1FinishedFlag_);
+        SyncIntraWait<PIPE_MTE2>(gmm1FinishedFlag_);
     }
 
     // AIV：整个逻辑 tile 的 Activation/量化输出写回后，归还一个额度。
     __aicore__ inline void NotifyGmm1()
     {
-        NotifyIntra<PIPE_MTE3>(activationFinishedFlag_);
+        SyncIntraArrive<PIPE_MTE3>(activationFinishedFlag_);
     }
 
     // MTE 主流程末尾统一排空；独立事件允许 ACK 跨过后续共享计算保留。
@@ -177,7 +177,7 @@ public:
     {
         if constexpr (g_coreType == AscendC::AIC) {
             while (pendingTiles_ != 0U) {
-                WaitIntra<PIPE_S>(activationFinishedFlag_ + aivFlagOffset_);
+                SyncIntraWait<PIPE_S>(activationFinishedFlag_ + aivFlagOffset_);
                 --pendingTiles_;
             }
         }
@@ -311,7 +311,7 @@ public:
     __aicore__ inline void WaitForCombine()
     {
         if (pendingTiles_ == GMM_MAX_PENDING_TILES) {
-            WaitIntra<PIPE_S>(COMBINE_FINISHED_FLAG + COMBINE_AIV_FLAG_OFFSET);
+            SyncIntraWait<PIPE_S>(COMBINE_FINISHED_FLAG + COMBINE_AIV_FLAG_OFFSET);
             --pendingTiles_;
         }
         ++pendingTiles_;
@@ -319,25 +319,25 @@ public:
 
     __aicore__ inline void NotifyCombine()
     {
-        NotifyIntra<PIPE_FIX>(GMM2_FINISHED_FLAG + COMBINE_AIV_FLAG_OFFSET);
+        SyncIntraArrive<PIPE_FIX>(GMM2_FINISHED_FLAG + COMBINE_AIV_FLAG_OFFSET);
     }
 
     __aicore__ inline void WaitForGmm2()
     {
-        WaitIntra<PIPE_MTE2>(GMM2_FINISHED_FLAG);
+        SyncIntraWait<PIPE_MTE2>(GMM2_FINISHED_FLAG);
     }
 
     // Combine AIV 输出写回后，归还一个额度。
     __aicore__ inline void NotifyGmm2()
     {
-        NotifyIntra<PIPE_MTE3>(COMBINE_FINISHED_FLAG);
+        SyncIntraArrive<PIPE_MTE3>(COMBINE_FINISHED_FLAG);
     }
 
     __aicore__ inline void EndSync()
     {
         if constexpr (g_coreType == AscendC::AIC) {
             while (pendingTiles_ != 0U) {
-                WaitIntra<PIPE_S>(COMBINE_FINISHED_FLAG + COMBINE_AIV_FLAG_OFFSET);
+                SyncIntraWait<PIPE_S>(COMBINE_FINISHED_FLAG + COMBINE_AIV_FLAG_OFFSET);
                 --pendingTiles_;
             }
         }

@@ -101,11 +101,15 @@ __aicore__ inline void PrefetchTopkWeights(GM_ADDR tokenTopkWeightsAddr, uint32_
         PipeNotify<PIPE_MTE2, PIPE_V>(event);
         PipeWait<PIPE_MTE2, PIPE_V>(event);
         __ubuf__ float* weightFp32Ub = reinterpret_cast<__ubuf__ float*>(xOutTensor + weightOffsetInUb);
+#if defined(MEGA_MOE_ARCH92_DEVICE)
         {
             LocalTensor<float> dst(TPosition::VECCALC, reinterpret_cast<uint64_t>(weightFp32Ub), topK);
             LocalTensor<bfloat16_t> src(TPosition::VECCALC, reinterpret_cast<uint64_t>(weightBf16Tmp), topK);
             Cast(dst, src, RoundMode::CAST_NONE, topK);
         }
+#else
+        CastBf16ToFp32VF(weightFp32Ub, weightBf16Tmp, topK);
+#endif
 
     } else {
         __ubuf__ TopkWeightsType* weightUb = reinterpret_cast<__ubuf__ TopkWeightsType*>(xOutTensor + weightOffsetInUb);
@@ -254,6 +258,7 @@ __aicore__ inline void PreQuantCopyOutRecords(__gm__ uint8_t* dst, __ubuf__ uint
     CopyUbToGm(dst, src, CopyRows{static_cast<uint16_t>(tokenCount), recordBytes, recordBytes, recordBytes});
 }
 
+#if defined(MEGA_MOE_ARCH92_DEVICE)
 __aicore__ inline void PreQuantCastBf16Weights(__ubuf__ uint8_t* stage, uint32_t tileCount, uint32_t topK,
                                                uint32_t weightSrcRowBytes, uint32_t weightSrcOffset,
                                                uint32_t recordBytes, uint32_t weightDstOffset)
@@ -270,6 +275,29 @@ __aicore__ inline void PreQuantCastBf16Weights(__ubuf__ uint8_t* stage, uint32_t
         }
     }
 }
+#else
+__simd_vf__ inline void PreQuantCastBf16Weights(__ubuf__ uint8_t* stage, uint32_t tileCount, uint32_t topK,
+                                                uint32_t weightSrcRowBytes, uint32_t weightSrcOffset,
+                                                uint32_t recordBytes, uint32_t weightDstOffset)
+{
+    auto* weightSrc = reinterpret_cast<__ubuf__ bfloat16_t*>(stage + weightSrcOffset);
+    vector_int32_t indexReg;
+    asc_arange(indexReg, 0);
+    uint32_t maskCount = topK;
+    vector_bool active = asc_update_mask_b32(maskCount);
+    vector_bfloat16_t inputReg;
+    vector_float outputReg;
+    // 源权重位于全部record之后，行间读写不重叠；整个tile只启动一次VF。
+    // Host限定TopK<=32，各行复用同一索引和掩码，只读取有效权重。
+    for (uint32_t row = 0U; row < tileCount; ++row) {
+        auto* weightDst = reinterpret_cast<__ubuf__ float*>(stage + row * recordBytes + weightDstOffset);
+        asc_gather(inputReg, weightSrc + row * (weightSrcRowBytes / sizeof(bfloat16_t)),
+                   reinterpret_cast<vector_uint32_t&>(indexReg), active);
+        asc_bfloat162float(outputReg, inputReg, active, ASC_POSITION_EVEN);
+        asc_storealign(weightDst, outputReg, active);
+    }
+}
+#endif
 
 template <typename TopkWeightsType, bool TopkWeightsPrefetch>
 __aicore__ inline void PreQuantWriteTile(__ubuf__ uint8_t* stage, TEventID event, uint32_t tileCount, uint32_t topK,

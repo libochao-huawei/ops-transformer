@@ -321,7 +321,7 @@ __aicore__ inline void Gmm1Aiv0PrefetchEpilogueTileGeneric(const Config& config,
             0,
             static_cast<int64_t>(metaInfoRow),
             0};
-        AscendC::SetCtrlSpr<60, 60>(0);
+        MegaMoeImpl::SetSaturationStrategy(SaturationStrategy::USE_API);
         activationQuantOp(epilogueShape, epilogueOffset, 0U);
         NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, subMLoc / L1_TILE_M_256);
         PipeNotify<PIPE_V, PIPE_MTE2>(0);
@@ -349,7 +349,7 @@ __aicore__ inline void Gmm1Aiv0EpilogueTileGeneric(const Config& config, Activat
         0,
         0,
         0};
-    AscendC::SetCtrlSpr<60, 60>(0);
+    MegaMoeImpl::SetSaturationStrategy(SaturationStrategy::USE_API);
     activationQuantOp(epilogueShape, epilogueOffset, pingpongIdx);
     NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, mLoc / L1_TILE_M_256);
 }
@@ -688,7 +688,8 @@ __aicore__ inline void RunGmm1Generic(BlockEpilogue& epilogueOp, const Params& p
                                       uint32_t activationOutputDivisor = ACTIVATION_N_HALF,
                                       void* blockMmadContext = nullptr, bool allowWeightL2Bypass = false)
 {
-    BlockJobContext blockJob{MegaMoeHardwarePolicy::GetAicBlockIdx(), static_cast<uint32_t>(GetBlockNum())};
+    BlockJobContext blockJob{MegaMoeHardwarePolicy::GetAicBlockIdx(),
+                             static_cast<uint32_t>(MegaMoeHardwarePolicy::GetBlockNum())};
     RunGmm1Generic<ElementA, EpilogueElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, IsWeightNZ,
                    Gmm1TileM, EpilogueTileM, TopkWeightsPrefetch, IsShared, IsWaveFlagGrained>(
         epilogueOp, params, problemShape, gmmAddrInfo, startBlockIdx, vecSetSyncCom, blockJob, expertBeforeCnt,
@@ -752,7 +753,8 @@ __aicore__ inline void RunGmm1A8W4(const BlockContext& pipeline, BlockEpilogue& 
                                    int32_t& gmm1TileReadySequence, uint32_t expertBeforeCnt, uint32_t expertIdx = 0,
                                    uint32_t activationOutputDivisor = ACTIVATION_N_HALF)
 {
-    BlockJobContext blockJob{MegaMoeHardwarePolicy::GetAicBlockIdx(), static_cast<uint32_t>(GetBlockNum())};
+    BlockJobContext blockJob{MegaMoeHardwarePolicy::GetAicBlockIdx(),
+                             static_cast<uint32_t>(MegaMoeHardwarePolicy::GetBlockNum())};
     RunGmm1A8W4<ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, Gmm1TileM, EpilogueTileM,
                 TopkWeightsPrefetch, IsShared, IsWaveFlagGrained>(
         pipeline, activationQuantOp, params, problemShape, gmmAddrInfo, startBlockIdx, gmm1TileReadySequence, blockJob,

@@ -156,10 +156,10 @@ protected:
     uint32_t k_ = 0;
     uint32_t rankId_ = 0;
     uint32_t worldSize_ = 0;
-    uint32_t blockNum_ = GetBlockNum();
-    uint32_t blockAivNum_ = GetBlockNum() * 2;
-    uint32_t blockIdx_ = GetBlockIdx() / GetTaskRation();
-    uint32_t aivCoreIdx_ = GetBlockIdx();
+    uint32_t blockNum_ = MegaMoeHardwarePolicy::GetBlockNum();
+    uint32_t blockAivNum_ = MegaMoeHardwarePolicy::GetAivBlockNum();
+    uint32_t blockIdx_ = MegaMoeHardwarePolicy::GetAicBlockIdx();
+    uint32_t aivCoreIdx_ = MegaMoeHardwarePolicy::GetAivBlockIdx();
     uint16_t gmm1PingPongIdx_ = 0;
     // 同一 AIC/AIV 对复用 gmmToEpilogueFlag；序号在单次 launch 的相关 GMM 阶段间保持单调递增。
     int32_t gmmTileSequence_ = 0;
@@ -352,7 +352,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
 template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::EnterSteadyDispatch()
 {
-    if (GetSubBlockIdx() == 1U) {
+    if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
         tokenDispatchConfig_.bufferConfig.bufferCount = MIN_DISPATCH_BUFFER_COUNT;
     }
 }
@@ -369,7 +369,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (GetSubBlockIdx() != 1U) {
+    if (MegaMoeHardwarePolicy::GetSubBlockIdx() != 1U) {
         return;
     }
 
@@ -433,14 +433,14 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareMoeExpertTokenCo
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (GetSubBlockIdx() != 1U) {
+    if (MegaMoeHardwarePolicy::GetSubBlockIdx() != 1U) {
         // AIV0 不读取 count，但 mode 0 需要全部 AIV 每轮各上报一次；参与去重建表的 AIV0
         // 经 PrepareDedupPrepassAiv0Local -> LoadAndComputeExpertCountTable 已上报，此处不得重复。
         // 条件必须与 PrepareDedupPrepassAiv0Local 的启用门严格互补（含 hiddenDim 档位），
         // 否则计算主导档的 AIV0 无人上报，ExportAndResetExpertCounts 等 read-done 挂死。
         if (params_.tilingData->compute.dedupMode == 0 ||
             params_.tilingData->compute.hiddenDim > DEDUP_AIV0_PREPASS_MAX_HIDDEN_DIM) {
-            ArriveAllAiv<PIPE_V>(COUNT_TABLE_READ_DONE_FLAG);
+            SyncInterArrive<PIPE_V>(COUNT_TABLE_READ_DONE_FLAG);
         }
         return;
     }
@@ -470,7 +470,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ReloadDispatchCumsumRan
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (GetSubBlockIdx() != 1U) {
+    if (MegaMoeHardwarePolicy::GetSubBlockIdx() != 1U) {
         return;
     }
 
@@ -584,12 +584,8 @@ __aicore__ inline uint32_t MegaMoe<TemplateMegaMoeTypeFunc>::InitQuantScratchTen
      * 每个 AIV 在每次 launch 初始化一次，临时 scale 的 padding 在两次量化中均不写入。
      */
     __ubuf__ int16_t* quantScratchSpan = reinterpret_cast<__ubuf__ int16_t*>(mxTempTensorAddr);
-    {
-        LocalTensor<int16_t> values(TPosition::VECCALC, reinterpret_cast<uint64_t>(quantScratchSpan),
-                                    static_cast<int32_t>((quantEndAddr - mxTempTensorAddr) / sizeof(int16_t)));
-        Duplicate<int16_t>(values, int16_t{0},
-                           static_cast<int32_t>((quantEndAddr - mxTempTensorAddr) / sizeof(int16_t)));
-    }
+    FillUbVF<int16_t>(quantScratchSpan, int16_t{0},
+                      static_cast<uint32_t>((quantEndAddr - mxTempTensorAddr) / sizeof(int16_t)));
     PipeFence<PIPE_V, PIPE_MTE2, SYNC_EVENT_ID2>();
     return quantEndAddr;
 }
@@ -636,11 +632,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SendAndQuantBuffInit()
 
     uint32_t resetAddrActual = topkIdsIndexTensorAddr + topkIdsIndexTensorSize;
     resetTensor_ = reinterpret_cast<__ubuf__ int32_t*>(resetAddrActual);
-    {
-        LocalTensor<int32_t> values(TPosition::VECCALC, reinterpret_cast<uint64_t>(resetTensor_),
-                                    (resetTensorSize / sizeof(int32_t)));
-        Duplicate<int32_t>(values, 0, (resetTensorSize / sizeof(int32_t)));
-    }
+    FillUbVF<int32_t>(resetTensor_, 0, resetTensorSize / sizeof(int32_t));
     resetBatchElementCount_ = resetBatchElementCount;
 
     uint32_t mxTempTensorAddr = resetAddrActual + resetTensorSize;
@@ -754,7 +746,7 @@ template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SyncBeforeSharedExpertGmm1()
 {
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 0U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
             if constexpr (SharedQuantConfig::AXW_MODE == AxWMode::A8W4) {
                 // AIV0 通过 MTE2 搬入待转换的权重，等待本核 quant/pack 搬出完成后复用 UB。
                 PipeFence<PIPE_MTE3, PIPE_MTE2, SYNC_EVENT_ID3>();
@@ -778,13 +770,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SyncBeforeMoeExpertStag
     Derived& derived, SharedGmmStartCondition sharedGmmStartCondition)
 {
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
             // AIV1 即将通过 MTE2 搬入 count 表；等待下标/count 发送或共享 A8W4 激活搬出完成。
             PipeFence<PIPE_MTE3, PIPE_MTE2, SYNC_EVENT_ID3>();
         } else {
             if (sharedGmmStartCondition == SharedGmmStartCondition::InputDirectly) {
                 // 共享直接读取输入时，AIV0 在进入 MoE 前等待全部 quant/pack 完成。
-                WaitAllAiv<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
+                SyncInterWait<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
             }
             if (params_.tilingData->compute.dedupMode != 0 &&
                 params_.tilingData->compute.hiddenDim <= DEDUP_AIV0_PREPASS_MAX_HIDDEN_DIM) {
@@ -799,7 +791,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SyncBeforeMoeExpertStag
         if (sharedExpertNum_ > 0U) {
             if (sharedGmmStartCondition == SharedGmmStartCondition::InputDirectly) {
                 // Scalar 直接等待全部 reset 完成，再读取 MoE 的 GM 状态。
-                WaitIntra<PIPE_S>(INPUT_PREPARE_DONE_FLAG);
+                SyncIntraWait<PIPE_S>(INPUT_PREPARE_DONE_FLAG);
             } else {
                 // 共享使用 quant/pack 结果：BF16 输入，或预量化输入的 H 仅满足 32 对齐。
                 // 输入准备通知已在共享 GMM 前由 MTE2 消费，此处将完成条件传递给 Scalar。
@@ -840,7 +832,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm1
     int32_t vecSetSyncCom = 0;
     GmmRuntimeState runtimeState{startBlockIdx_, vecSetSyncCom, gmm1PingPongIdx_};
     if constexpr (SharedQuantConfig::AXW_MODE == AxWMode::A8W4) {
-        if (g_coreType == AscendC::AIC || GetSubBlockIdx() == 0U) {
+        if (g_coreType == AscendC::AIC || MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
             typename SharedA8W4Config::BlockContext::Block block(params_.tilingData->a8w4L1Layout);
             sharedBlockContext_ = {&block};
             ProcessSharedExpertGmm1Loop(gmmAddrInfo, problemShape, sharedGmmConfig, runtimeState);
@@ -898,7 +890,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2
     Get<K_VALUE>(problemShape) = commonConfig_.tokenHiddenDim;
     GMMAddrInfo gmmAddrInfo{};
     if constexpr (SharedQuantConfig::AXW_MODE == AxWMode::A8W4 || SharedQuantConfig::AXW_MODE == AxWMode::A4W4) {
-        if (g_coreType == AscendC::AIC || GetSubBlockIdx() == 0U) {
+        if (g_coreType == AscendC::AIC || MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
             typename SharedA8W4Config::BlockContext::Block block(params_.tilingData->a8w4L1Layout);
             sharedBlockContext_ = {&block};
             ProcessSharedExpertGmm2Loop(gmmAddrInfo, problemShape);
@@ -944,7 +936,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
                 NotifyWaveGmm2Ready(waveCombineJob_, params_, state.expertIdx);
                 if (isFinalCombine) {
                     if constexpr (g_coreType == AIV) {
-                        if (GetSubBlockIdx() == 0U) {
+                        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
                             // W4 prologue 完成后，末轮 AIV0 才能通过 MTE2 复用同一 UB 区域。
                             PipeFence<PIPE_MTE3, PIPE_MTE2, SYNC_EVENT_ID0>();
                         }
@@ -975,7 +967,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
     UpdateMoeExpertCombineGlobalBuffer(workspace, buffer, gmmAddrInfo, state);
     if (isFinalCombine) {
         if constexpr (g_coreType == AIV) {
-            if (GetSubBlockIdx() == 0U) {
+            if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
                 // W4 prologue 完成后，末轮 AIV0 才能通过 MTE2 复用同一 UB 区域。
                 PipeFence<PIPE_MTE3, PIPE_MTE2, SYNC_EVENT_ID0>();
             }
@@ -1000,7 +992,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareGmmExpertState(E
     const auto& workspace = params_.workspace.layout;
     const auto& buffer = params_.workspace.base;
     if constexpr (WaitForTokenCountReady) {
-        if (GetSubBlockIdx() == 0U && !state.expertCountTableReady) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U && !state.expertCountTableReady) {
             WaitForMoeExpertTokenCountReady(workspace.sync.countsReady.get_ptr(buffer), countWorkspace_, 0U);
             state.expertCountTableReady = true;
         }
@@ -1037,22 +1029,19 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ExportAndResetExpertCou
     const auto& peermem = params_.communication.layout;
     const auto& commBuffer = params_.communication.base;
     WorkRange resetRange{};
-    if (GetSubBlockIdx() == 0U) {
+    if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
         resetRange = GetBalancedWorkRange(commonConfig_.worldSize * commonConfig_.moeExpertPerRank,
                                           {.jobIndex = blockIdx_, .totalJobs = blockNum_});
     } else if (blockIdx_ == 0U) {
         ExportExpertTokenCounts();
     }
     // 输出核先搬出再消费事件；清零核在写 GM 前等待全部读取完成，每个 AIV 每轮 wait 一次。
-    WaitAllAiv<PIPE_MTE3>(COUNT_TABLE_READ_DONE_FLAG);
+    SyncInterWait<PIPE_MTE3>(COUNT_TABLE_READ_DONE_FLAG);
     if (resetRange.count > 0U) {
         // AIV0 可能参与末尾的量化 Combine，填零前等待旧 MTE3 读完复用的 UB。
         PipeFence<PIPE_MTE3, PIPE_V, SYNC_EVENT_ID2>();
         const uint32_t resetElements = Ops::Base::CeilAlign(resetBatchElementCount_, int32_t{INT32_PER_256B});
-        {
-            LocalTensor<int32_t> values(TPosition::VECCALC, reinterpret_cast<uint64_t>(resetTensor_), resetElements);
-            Duplicate<int32_t>(values, 0, resetElements);
-        }
+        FillUbVF<int32_t>(resetTensor_, 0, resetElements);
         PipeFence<PIPE_V, PIPE_MTE3, SYNC_EVENT_ID2>();
         ResetWorkspaceRegionWithStride(resetRange, peermem.expertCountRecv.get_ptr(commBuffer), MTE_COUNT_SLOT_BYTES,
                                        resetTensor_, resetElements);
@@ -1073,7 +1062,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareLocalInput()
     SendAndQuantBuffInit();
     ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
     // 本核 reset 任务完成后发布通知；空任务核同样参与全 AIV 事件。
-    ArriveAllAiv<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
+    SyncInterArrive<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
     if (tokenRange.count > 0U) {
         if constexpr (Std::IsSame<XType, bfloat16_t>::value) {
             QuantizeInputTokens(tokenRange);
@@ -1089,7 +1078,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareLocalInput()
     IncrementSyncCount(peermem.rankSync.get_ptr(commBuffer), aivCoreIdx_);
     // MoE 及可选共享 token 数据和 scale 写回后，发布 token 数据就绪通知。
     // 空 token 核也必须报告，保证全 AIV 事件配对。
-    ArriveAllAiv<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
+    SyncInterArrive<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
 }
 
 // 仅由 AIV 调用：准备输入、发送下标，等待 token 数据就绪后发送 count。
@@ -1107,11 +1096,11 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
             SendTopkIdsIndexForExperts(ownedExpertRange, commonConfig_, g_winRankAddr_, sendMaskConfig_,
                                        sendMaskScratch_);
         }
-        WaitAllAiv<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
+        SyncInterWait<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
         PipeNotify<PIPE_MTE3, PIPE_S>(SYNC_EVENT_ID3);
-        WaitAllAiv<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
+        SyncInterWait<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
         if (notifyAicAfterQuantOrPack) {
-            NotifyIntra<PIPE_MTE3>(INPUT_PREPARE_DONE_FLAG);
+            SyncIntraArrive<PIPE_MTE3>(INPUT_PREPARE_DONE_FLAG);
         }
         if (ownedExpertRange.count > 0U) {
             PipeBarrier<PIPE_MTE3>();
@@ -1126,27 +1115,27 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     if (sharedGmmStartCondition == SharedGmmStartCondition::NoSharedExpert) {
         // 全部 AIV 分担发送；AIV0 在 count 发送前通知 AIC，reset 和 quant/pack 已完成。
         const WorkRange ownedExpertRange = GetBalancedWorkRange(totalExperts, aivJob_);
-        sendIndexAndCount(ownedExpertRange, GetSubBlockIdx() == 0U);
+        sendIndexAndCount(ownedExpertRange, MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U);
     } else {
-        if (GetSubBlockIdx() == 1U) {
+        if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 1U) {
             // AIV1 分担全部发送任务，等待 reset 和 quant/pack 完成后发布 count。
             const WorkRange ownedExpertRange =
                 GetBalancedWorkRange(totalExperts, {.jobIndex = blockIdx_, .totalJobs = blockNum_});
             sendIndexAndCount(ownedExpertRange, false);
         } else {
             // AIV0 等待 reset 及所需的 token 数据完成，再向 AIC 发布输入准备完成通知。
-            WaitAllAiv<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
+            SyncInterWait<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
             PipeNotify<PIPE_MTE3, PIPE_S>(SYNC_EVENT_ID3);
             if (sharedGmmStartCondition == SharedGmmStartCondition::QuantOrPackDone) {
-                WaitAllAiv<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
+                SyncInterWait<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
             }
-            NotifyIntra<PIPE_MTE3>(INPUT_PREPARE_DONE_FLAG);
+            SyncIntraArrive<PIPE_MTE3>(INPUT_PREPARE_DONE_FLAG);
         }
     }
 
-    if (GetSubBlockIdx() == 0U) {
+    if (MegaMoeHardwarePolicy::GetSubBlockIdx() == 0U) {
         // AIC 的 FIX 输出写入配对 AIV0 的 UB。
-        NotifyIntra<PIPE_MTE3>(INPUT_UB_FREE_FLAG);
+        SyncIntraArrive<PIPE_MTE3>(INPUT_UB_FREE_FLAG);
     }
     // 后继 Scalar 状态读取承接已记录的 reset 完成条件。
     PipeWait<PIPE_MTE3, PIPE_S>(SYNC_EVENT_ID3);
@@ -1159,14 +1148,14 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::WaitForInputPreparation
 {
     // 共享直接读取原始输入时，MTE2 可提前搬入；输入准备完成通知留到 MoE 前消费。
     if (sharedGmmStartCondition != SharedGmmStartCondition::InputDirectly) {
-        WaitIntra<PIPE_MTE2>(INPUT_PREPARE_DONE_FLAG);
+        SyncIntraWait<PIPE_MTE2>(INPUT_PREPARE_DONE_FLAG);
     }
     if (sharedGmmStartCondition == SharedGmmStartCondition::NoSharedExpert) {
         // 直接进入 MoE，Scalar 状态轮询需要等待全部 reset 完成。
         PipeFence<PIPE_MTE2, PIPE_S, SYNC_EVENT_ID3>();
     }
     // FIX 等待配对 AIV0 释放输入准备使用的 UB，再写入计算结果。
-    WaitIntra<PIPE_FIX>(INPUT_UB_FREE_FLAG);
+    SyncIntraWait<PIPE_FIX>(INPUT_UB_FREE_FLAG);
 }
 
 // 根据共享专家及其输入来源，确定共享 GMM 的启动条件。
@@ -1205,9 +1194,9 @@ template <TemplateMegaMoeTypeClass>
 template <typename Derived>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& derived)
 {
-    // 保存入口时的溢出模式，计算期间关闭溢出检查。
-    int64_t oriOverflowMode = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
-    SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
+    // 保存入口饱和策略，计算期间使用各 API 指定的饱和配置。
+    const auto originalSaturationStrategy = MegaMoeImpl::GetSaturationStrategy();
+    MegaMoeImpl::SetSaturationStrategy(SaturationStrategy::USE_API);
 
     // 阶段 1：AIV 准备输入，AIC 等待输入可读及 UB 释放。
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::INPUT_PREPARE);
@@ -1252,8 +1241,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     gmm1ActivationSync.EndSync();
     gmm2CombineSync.EndSync();
 
-    // 恢复入口时的溢出模式。
-    SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
+    // 恢复入口饱和策略，保留其他 CTRL 位的当前值。
+    MegaMoeImpl::SetSaturationStrategy(originalSaturationStrategy);
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::COMPLETE);
 }
 

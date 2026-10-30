@@ -702,7 +702,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SyncBeforeMoeExpertStag
         if (sharedExpertNum_ > 0U) {
             if (sharedGmmStartCondition == SharedGmmStartCondition::InputDirectly) {
                 // Scalar 直接等待全部 reset 完成，再读取 MoE 的 GM 状态。
-                WaitIntra<PIPE_S>(INPUT_PREPARE_DONE_FLAG);
+                SyncIntraWait<PIPE_S>(INPUT_PREPARE_DONE_FLAG);
             } else {
                 // 共享使用 quant/pack 结果：BF16 输入，或预量化输入的 H 仅满足 32 对齐。
                 // 输入准备通知已在共享 GMM 前由 MTE2 消费，此处将完成条件传递给 Scalar。
@@ -949,7 +949,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ExportAndResetExpertCou
         ExportExpertTokenCounts();
     }
     // 输出核先搬出再消费事件；清零核在写 GM 前等待全部读取完成，每个 AIV 每轮 wait 一次。
-    WaitAllAiv<PIPE_MTE3>(COUNT_TABLE_READ_DONE_FLAG);
+    SyncInterWait<PIPE_MTE3>(COUNT_TABLE_READ_DONE_FLAG);
     if (resetRange.count > 0U) {
         // AIV0 可能参与末尾的量化 Combine，填零前等待旧 MTE3 读完复用的 UB。
         PipeFence<PIPE_MTE3, PIPE_V, SYNC_EVENT_ID2>();
@@ -980,7 +980,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareLocalInput()
     SendAndQuantBuffInit();
     ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
     // 本核 reset 任务完成后发布通知；空任务核同样参与全 AIV 事件。
-    ArriveAllAiv<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
+    SyncInterArrive<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
     if (tokenRange.count > 0U) {
         if constexpr (Std::IsSame<XType, bfloat16_t>::value) {
             QuantizeInputTokens(tokenRange);
@@ -996,7 +996,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareLocalInput()
     IncrementSyncCount(peermem.rankSync.get_ptr(commBuffer), aivCoreIdx_);
     // MoE 及可选共享 token 数据和 scale 写回后，发布 token 数据就绪通知。
     // 空 token 核也必须报告，保证全 AIV 事件配对。
-    ArriveAllAiv<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
+    SyncInterArrive<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
 }
 
 // 仅由 AIV 调用：准备输入、发送下标，等待 token 数据就绪后发送 count。
@@ -1014,11 +1014,11 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
             SendTopkIdsIndexForExperts(ownedExpertRange, commonConfig_, g_winRankAddr_, sendMaskConfig_,
                                        sendMaskScratch_);
         }
-        WaitAllAiv<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
+        SyncInterWait<PIPE_MTE3>(INPUT_RESET_DONE_FLAG);
         PipeNotify<PIPE_MTE3, PIPE_S>(SYNC_EVENT_ID3);
-        WaitAllAiv<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
+        SyncInterWait<PIPE_MTE3>(TOKEN_DATA_READY_FLAG);
         if (notifyAicAfterQuantOrPack) {
-            NotifyIntra<PIPE_MTE3>(INPUT_PREPARE_DONE_FLAG);
+            SyncIntraArrive<PIPE_MTE3>(INPUT_PREPARE_DONE_FLAG);
         }
         if (ownedExpertRange.count > 0U) {
             PipeBarrier<PIPE_MTE3>();
@@ -1044,7 +1044,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     if constexpr (!SHARED_GMM1_USES_GM) {
         if (sharedExpertNum_ > 0U) {
             // 配对 AIC 向 UB 写入结果前，先释放输入及计数缓冲区。
-            NotifyIntra<PIPE_MTE3>(INPUT_UB_FREE_FLAG);
+            SyncIntraArrive<PIPE_MTE3>(INPUT_UB_FREE_FLAG);
         }
     }
     // 后继 Scalar 状态读取承接已记录的 reset 完成条件。
@@ -1058,7 +1058,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::WaitForInputPreparation
 {
     // 共享直接读取原始输入时，MTE2 可提前搬入；输入准备完成通知留到 MoE 前消费。
     if (sharedGmmStartCondition != SharedGmmStartCondition::InputDirectly) {
-        WaitIntra<PIPE_MTE2>(INPUT_PREPARE_DONE_FLAG);
+        SyncIntraWait<PIPE_MTE2>(INPUT_PREPARE_DONE_FLAG);
     }
     if (sharedGmmStartCondition == SharedGmmStartCondition::NoSharedExpert) {
         // 直接进入 MoE，Scalar 状态轮询需要等待全部 reset 完成。
@@ -1067,7 +1067,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::WaitForInputPreparation
     // FIX 写入结果前，等待配对计算侧 AIV 释放输入及计数使用的 UB。
     if constexpr (!SHARED_GMM1_USES_GM) {
         if (sharedExpertNum_ > 0U) {
-            WaitIntra<PIPE_FIX>(INPUT_UB_FREE_FLAG);
+            SyncIntraWait<PIPE_FIX>(INPUT_UB_FREE_FLAG);
         }
     }
 }

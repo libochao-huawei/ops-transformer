@@ -14,6 +14,9 @@
 #if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 9201) || (__NPU_ARCH__ == 9202))
 #include "../../../../../common/op_kernel/quantize_functions.h"
 #include "basic_api/reg_compute/kernel_reg_compute_intf.h"
+#if __NPU_ARCH__ == 3510
+#include "c_api/asc_simd.h"
+#endif
 
 namespace MegaMoeImpl {
 namespace GeluQuant {
@@ -35,6 +38,7 @@ struct TileContext {
     uint16_t scaleRowStrideBytes;
 };
 
+#if __NPU_ARCH__ != 3510
 // ReduceDataBlock 的八个结果分别是当前行八个 32 元素 MX 分组的最大值。
 template <typename OutputType>
 __simd_callee__ inline void ComputeRowScale(Reg::RegTensor<bfloat16_t>& firstHalf,
@@ -193,6 +197,153 @@ __simd_vf__ inline void RunGeluMxQuant(TileContext context)
         }
     }
 }
+
+#else
+__simd_callee__ inline void ComputeRowScale(vector_bfloat16_t& firstHalf, vector_bfloat16_t& secondHalf,
+                                            vector_uint8_t& scaleBytes, vector_uint16_t& inverseScale,
+                                            vector_uint16_t& exponentMask, vector_uint16_t& outputMax,
+                                            vector_uint16_t& bias, vector_bool all)
+{
+    vector_uint16_t inputExponent0;
+    vector_uint16_t inputExponent1;
+    vector_uint16_t maximumExponent;
+    vector_uint16_t sharedExponent;
+    vector_uint16_t scaleValue;
+    vector_bool nanMask;
+    vector_bool zeroMask;
+    vector_bool specialMask;
+
+    asc_and(inputExponent0, reinterpret_cast<vector_uint16_t&>(firstHalf), exponentMask, all);
+    asc_and(inputExponent1, reinterpret_cast<vector_uint16_t&>(secondHalf), exponentMask, all);
+    asc_max(maximumExponent, inputExponent0, inputExponent1, all);
+    asc_reduce_max_datablock(maximumExponent, maximumExponent, all);
+    // Preserve the original maximum for exceptional-value masks before clamping it.
+    asc_eq_scalar(nanMask, maximumExponent, static_cast<uint16_t>(Quant::MAX_EXP_FOR_BF16), all);
+    asc_eq_scalar(zeroMask, maximumExponent, static_cast<uint16_t>(0), all);
+    asc_max(maximumExponent, maximumExponent, outputMax, all);
+    asc_sub(sharedExponent, maximumExponent, outputMax, all);
+    asc_shiftright_scalar(scaleValue, sharedExponent, static_cast<int16_t>(Quant::SHR_NUM_FOR_BF16), all);
+    vdup(scaleValue, static_cast<uint16_t>(Quant::MAX_EXP_FOR_FP8), nanMask, MODE_MERGING);
+    vdup(scaleValue, static_cast<uint16_t>(0), zeroMask, MODE_MERGING);
+    asc_pack_to_low(scaleBytes, scaleValue);
+
+    asc_eq_scalar(specialMask, sharedExponent, static_cast<uint16_t>(Quant::BF16_EXP_BIAS), all);
+    asc_sub(inverseScale, bias, sharedExponent, all);
+    // Keep NaN, zero, then special-exponent repair in the same order as the Reg path.
+    vdup(inverseScale, static_cast<uint16_t>(Quant::BF16_NAN_CUSTOM), nanMask, MODE_MERGING);
+    vdup(inverseScale, static_cast<uint16_t>(0), zeroMask, MODE_MERGING);
+    vdup(inverseScale, static_cast<uint16_t>(Quant::BF16_SPECIAL_EXP_THRESHOLD), specialMask, MODE_MERGING);
+}
+
+template <typename OutputType, bool SecondHalf>
+__simd_callee__ inline void ConvertGeluFp8Half(vector_uint8_t& output, vector_bfloat16_t& input, vector_bool all)
+{
+    using EvenPosition = std::integral_constant<asc_position_quarter_mode,
+                                                SecondHalf ? asc_position_quarter_mode::DISPERSE_SECOND_QUARTER :
+                                                             asc_position_quarter_mode::DISPERSE_FIRST_QUARTER>;
+    using OddPosition = std::integral_constant<asc_position_quarter_mode,
+                                               SecondHalf ? asc_position_quarter_mode::DISPERSE_FOURTH_QUARTER :
+                                                            asc_position_quarter_mode::DISPERSE_THIRD_QUARTER>;
+    vector_float expanded;
+    vector_uint8_t odd;
+    asc_bfloat162float(expanded, input, all, ASC_POSITION_EVEN);
+    if constexpr (Std::IsSame<OutputType, fp8_e4m3fn_t>::value) {
+        asc_float2e4m3_rn_sat(reinterpret_cast<vector_fp8_e4m3fn_t&>(output), expanded, all, EvenPosition{});
+    } else {
+        asc_float2e5m2_rn_sat(reinterpret_cast<vector_fp8_e5m2_t&>(output), expanded, all, EvenPosition{});
+    }
+    asc_bfloat162float(expanded, input, all, ASC_POSITION_ODD);
+    if constexpr (Std::IsSame<OutputType, fp8_e4m3fn_t>::value) {
+        asc_float2e4m3_rn_sat(reinterpret_cast<vector_fp8_e4m3fn_t&>(odd), expanded, all, OddPosition{});
+    } else {
+        asc_float2e5m2_rn_sat(reinterpret_cast<vector_fp8_e5m2_t&>(odd), expanded, all, OddPosition{});
+    }
+    asc_add(output, output, odd, all);
+}
+
+template <typename OutputType, uint32_t TileN>
+__simd_vf__ inline void RunGeluMxQuant(TileContext context)
+{
+    static_assert(TileN == AscendC::VECTOR_REG_WIDTH / sizeof(bfloat16_t) * 2U,
+                  "Rowwise MX quantization requires two full BF16 registers per row");
+    constexpr uint16_t scaleBytesPerRow = TileN / MX_QUANT_GROUP_ELEMENTS;
+    constexpr uint16_t maxOutputExponent = Std::IsSame<OutputType, fp8_e4m3fn_t>::value ? Quant::FP8_E4M3_MAX_EXP :
+                                           Std::IsSame<OutputType, fp8_e5m2_t>::value   ? Quant::FP8_E5M2_MAX_EXP :
+                                           Std::IsSame<OutputType, fp4x2_e2m1_t>::value ? Quant::FP4_E2M1_BF16_MAX_EXP :
+                                                                                          Quant::FP4_E1M2_BF16_MAX_EXP;
+    vector_bool all = asc_create_mask_b8(PAT_ALL);
+    vector_uint16_t groupIndex;
+    vector_uint16_t exponentMask;
+    vector_uint16_t outputMax;
+    vector_uint16_t bias;
+    asc_arange(reinterpret_cast<vector_int16_t&>(groupIndex), static_cast<int16_t>(0));
+    asc_shiftright_scalar(groupIndex, groupIndex, MX_HALF_GROUP_INDEX_SHIFT, all);
+    asc_duplicate_scalar(exponentMask, static_cast<uint16_t>(Quant::MAX_EXP_FOR_BF16), all);
+    asc_duplicate_scalar(outputMax, maxOutputExponent, all);
+    asc_duplicate_scalar(bias, static_cast<uint16_t>(Quant::BF16_EXP_BIAS), all);
+    __ubuf__ bfloat16_t* source = context.activation;
+    __ubuf__ int8_t* quantOutput = context.quantOutput;
+    __ubuf__ uint32_t* fp4Output = reinterpret_cast<__ubuf__ uint32_t*>(context.quantOutput);
+    __ubuf__ uint8_t* scaleOutput = context.scaleOutput;
+
+    for (uint16_t row = 0; row < context.rowCount; ++row) {
+        vector_bfloat16_t firstHalf;
+        vector_bfloat16_t secondHalf;
+        vector_uint8_t scaleBytes;
+        vector_uint16_t inverseScale;
+        vector_uint16_t inverseScaleExpanded;
+        __ubuf__ bfloat16_t* rowStart = source;
+        asc_loadalign_deintlv_postupdate(firstHalf, secondHalf, source, context.activationRowStrideElements);
+        ComputeRowScale(firstHalf, secondHalf, scaleBytes, inverseScale, exponentMask, outputMax, bias, all);
+        asc_gather(inverseScaleExpanded, inverseScale, groupIndex);
+
+        if constexpr (Std::IsSame<OutputType, fp4x2_e2m1_t>::value || Std::IsSame<OutputType, fp4x2_e1m2_t>::value) {
+            // FP4 packing needs B32 order; reload this row before an in-place scale store can overwrite it.
+            asc_loadalign_deintlv(reinterpret_cast<vector_uint32_t&>(firstHalf),
+                                  reinterpret_cast<vector_uint32_t&>(secondHalf),
+                                  reinterpret_cast<__ubuf__ uint32_t*>(rowStart));
+        }
+
+        vector_store_unalign scaleStoreState;
+        asc_storeunalign_postupdate(scaleOutput, scaleStoreState, scaleBytes, scaleBytesPerRow);
+        asc_storeunalign_post_postupdate(scaleOutput, scaleStoreState, 0);
+        scaleOutput += context.scaleRowStrideBytes - scaleBytesPerRow;
+
+        asc_mul(firstHalf, firstHalf, reinterpret_cast<vector_bfloat16_t&>(inverseScaleExpanded), all);
+        asc_mul(secondHalf, secondHalf, reinterpret_cast<vector_bfloat16_t&>(inverseScaleExpanded), all);
+        if constexpr (Std::IsSame<OutputType, fp8_e4m3fn_t>::value || Std::IsSame<OutputType, fp8_e5m2_t>::value) {
+            vector_uint8_t firstPacked;
+            vector_uint8_t secondPacked;
+            ConvertGeluFp8Half<OutputType, false>(firstPacked, firstHalf, all);
+            ConvertGeluFp8Half<OutputType, true>(secondPacked, secondHalf, all);
+            asc_add(firstPacked, firstPacked, secondPacked, all);
+            asc_storealign_postupdate(quantOutput, reinterpret_cast<vector_int8_t&>(firstPacked),
+                                      context.quantRowStrideBytes, all);
+        } else {
+            using FirstPosition =
+                std::integral_constant<asc_position_quarter_mode, asc_position_quarter_mode::DISPERSE_FIRST_QUARTER>;
+            using SecondPosition =
+                std::integral_constant<asc_position_quarter_mode, asc_position_quarter_mode::DISPERSE_SECOND_QUARTER>;
+            vector_uint8_t firstPacked;
+            vector_uint8_t secondPacked;
+            if constexpr (Std::IsSame<OutputType, fp4x2_e2m1_t>::value) {
+                asc_bfloat162e2m1x2_rn(reinterpret_cast<vector_fp4x2_e2m1_t&>(firstPacked), firstHalf, all,
+                                       FirstPosition{});
+                asc_bfloat162e2m1x2_rn(reinterpret_cast<vector_fp4x2_e2m1_t&>(secondPacked), secondHalf, all,
+                                       SecondPosition{});
+            } else {
+                asc_bfloat162e1m2x2_rn(reinterpret_cast<vector_fp4x2_e1m2_t&>(firstPacked), firstHalf, all,
+                                       FirstPosition{});
+                asc_bfloat162e1m2x2_rn(reinterpret_cast<vector_fp4x2_e1m2_t&>(secondPacked), secondHalf, all,
+                                       SecondPosition{});
+            }
+            asc_add(firstPacked, firstPacked, secondPacked, all);
+            asc_storealign_pack_postupdate(fp4Output, reinterpret_cast<vector_uint32_t&>(firstPacked),
+                                           context.quantRowStrideBytes / sizeof(uint32_t), all);
+        }
+    }
+}
+#endif
 
 } // namespace GeluQuant
 } // namespace MegaMoeImpl

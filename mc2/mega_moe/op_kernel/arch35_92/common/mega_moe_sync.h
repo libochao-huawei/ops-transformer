@@ -47,6 +47,31 @@ __aicore__ inline void GmWrite(__gm__ T* address, V value)
 #endif
 }
 
+enum class SaturationStrategy : uint8_t {
+    USE_API = 0,
+    USE_GLOBAL = 1
+};
+
+__aicore__ inline SaturationStrategy GetSaturationStrategy()
+{
+#if defined(MEGA_MOE_ARCH92_DEVICE) || (defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1)
+    return static_cast<SaturationStrategy>(AscendC::GetCtrlSpr<60, 60>());
+#else
+    return static_cast<SaturationStrategy>((static_cast<uint64_t>(asc_get_ctrl()) >> 60U) & 1U);
+#endif
+}
+
+__aicore__ inline void SetSaturationStrategy(SaturationStrategy strategy)
+{
+#if defined(MEGA_MOE_ARCH92_DEVICE) || (defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1)
+    AscendC::SetCtrlSpr<60, 60>(static_cast<int64_t>(strategy));
+#else
+    constexpr uint64_t STRATEGY_MASK = uint64_t{1} << 60U;
+    const uint64_t currentCtrl = static_cast<uint64_t>(asc_get_ctrl());
+    asc_set_ctrl((currentCtrl & ~STRATEGY_MASK) | (static_cast<uint64_t>(strategy) << 60U));
+#endif
+}
+
 __aicore__ inline int64_t GetDeviceCycle()
 {
 #if defined(MEGA_MOE_ARCH92_DEVICE)
@@ -130,7 +155,7 @@ __aicore__ inline void PipeBarrier()
 // Mode 4: one AIC and one of its AIVs. AIC adds 16 to select AIV1.
 // Events are counted; GMM producers must retain their 15-tile credit limit.
 template <pipe_t Pipe>
-__aicore__ inline void NotifyIntra(uint16_t eventId)
+__aicore__ inline void SyncIntraArrive(uint16_t eventId)
 {
 #if defined(MEGA_MOE_ARCH92_DEVICE)
     AscendC::CrossCoreSetFlag<4, Pipe>(eventId);
@@ -140,7 +165,7 @@ __aicore__ inline void NotifyIntra(uint16_t eventId)
 }
 
 template <pipe_t Pipe>
-__aicore__ inline void WaitIntra(uint16_t eventId)
+__aicore__ inline void SyncIntraWait(uint16_t eventId)
 {
 #if defined(MEGA_MOE_ARCH92_DEVICE)
     AscendC::CrossCoreWaitFlag<4, Pipe>(eventId);
@@ -151,7 +176,7 @@ __aicore__ inline void WaitIntra(uint16_t eventId)
 
 // Mode 0: all cores of the caller's kind in this kernel launch.
 template <pipe_t Pipe>
-__aicore__ inline void ArriveAllAiv(uint16_t eventId)
+__aicore__ inline void SyncInterArrive(uint16_t eventId)
 {
 #if defined(MEGA_MOE_ARCH92_DEVICE)
     AscendC::CrossCoreSetFlag<0, Pipe>(eventId);
@@ -161,7 +186,7 @@ __aicore__ inline void ArriveAllAiv(uint16_t eventId)
 }
 
 template <pipe_t Pipe>
-__aicore__ inline void WaitAllAiv(uint16_t eventId)
+__aicore__ inline void SyncInterWait(uint16_t eventId)
 {
 #if defined(MEGA_MOE_ARCH92_DEVICE)
     AscendC::CrossCoreWaitFlag<0, Pipe>(eventId);
@@ -188,8 +213,8 @@ __aicore__ inline void AllVectorBarrier()
 #else
     if constexpr (g_coreType == AscendC::AIV) {
         PipeBarrier<PIPE_ALL>();
-        ArriveAllAiv<PIPE_MTE3>(ALL_AIV_BARRIER_EVENT);
-        WaitAllAiv<PIPE_S>(ALL_AIV_BARRIER_EVENT);
+        SyncInterArrive<PIPE_MTE3>(ALL_AIV_BARRIER_EVENT);
+        SyncInterWait<PIPE_S>(ALL_AIV_BARRIER_EVENT);
     }
 #endif
 }

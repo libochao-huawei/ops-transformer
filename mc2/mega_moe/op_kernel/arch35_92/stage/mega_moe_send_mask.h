@@ -72,11 +72,15 @@ __aicore__ inline void PrepareTopkIdsForCurrentBatch(SendMaskScratch<TopkIndexTy
     CopyGmToUb(scratch.topkIdsTensor, scratch.topkIdsGm + batchStart,
                static_cast<uint32_t>(validLen * sizeof(int32_t)));
     PipeFence<PIPE_MTE2, PIPE_V, SYNC_EVENT_ID1>();
+#if defined(MEGA_MOE_ARCH92_DEVICE)
     {
         LocalTensor<TopkIndexType> indices(TPosition::VECCALC, reinterpret_cast<uint64_t>(scratch.topkIdsIndexTensor),
                                            validLen);
         CreateVecIndex(indices, static_cast<TopkIndexType>(batchStart), validLen);
     }
+#else
+    CreateRouteIndicesVF<TopkIndexType>(scratch.topkIdsIndexTensor, batchStart, static_cast<uint32_t>(validLen));
+#endif
 }
 
 #if !defined(MEGA_MOE_ARCH92_DEVICE)
@@ -212,6 +216,7 @@ __aicore__ inline void SendSelectedTopkIdsIndex(const MoeStageCommonConfig& comm
 __simd_vf__ inline void PrepareCountForSendVF(__ubuf__ uint32_t* source, __ubuf__ uint32_t* destination,
                                               uint32_t sourceOffset, uint32_t count, uint32_t syncRoundTag)
 {
+#if defined(MEGA_MOE_ARCH92_DEVICE)
     constexpr uint32_t ELEMENTS_PER_VECTOR = AscendC::GetVecLen() / sizeof(uint32_t);
     AscendC::Reg::RegTensor<int32_t> laneIndexReg;
     AscendC::Reg::RegTensor<int32_t> sourceIndexReg;
@@ -229,6 +234,24 @@ __simd_vf__ inline void PrepareCountForSendVF(__ubuf__ uint32_t* source, __ubuf_
         AscendC::Reg::Or(countReg, countReg, tagReg, activeMask);
         AscendC::Reg::StoreAlign(destination + offset, countReg, activeMask);
     }
+#else
+    constexpr uint32_t ELEMENTS_PER_VECTOR = static_cast<uint32_t>(asc_get_vf_len()) / sizeof(uint32_t);
+    vector_int32_t laneIndexReg;
+    vector_int32_t sourceIndexReg;
+    vector_uint32_t countReg;
+    vector_uint32_t tagReg;
+    vector_bool fullMask = asc_create_mask_b32(PAT_ALL);
+    asc_arange(laneIndexReg, 0);
+    asc_duplicate_scalar(tagReg, syncRoundTag, fullMask);
+    for (uint32_t offset = 0U; offset < count; offset += ELEMENTS_PER_VECTOR) {
+        uint32_t remaining = count - offset;
+        vector_bool activeMask = asc_update_mask_b32(remaining);
+        asc_add_scalar(sourceIndexReg, laneIndexReg, static_cast<int32_t>(sourceOffset + offset), activeMask);
+        asc_gather(countReg, source, reinterpret_cast<vector_uint32_t&>(sourceIndexReg), activeMask);
+        asc_or(countReg, countReg, tagReg, activeMask);
+        asc_storealign(destination + offset, countReg, activeMask);
+    }
+#endif
 }
 
 // countTensorToSend 已由 VF 编码并完成 V_MTE3，起点 32B 对齐，段内 count 连续存放。
@@ -313,11 +336,15 @@ __aicore__ inline void SendTopkIdsIndexForExperts(const WorkRange& ownedExpertRa
     int32_t ownedExpertBegin = static_cast<int32_t>(ownedExpertRange.start);
     int32_t ownedExpertNum = static_cast<int32_t>(ownedExpertRange.count);
 
+#if defined(MEGA_MOE_ARCH92_DEVICE)
     {
         LocalTensor<int32_t> values(TPosition::VECCALC, reinterpret_cast<uint64_t>(scratch.sendCntAccTensor),
                                     ownedExpertNum);
         Duplicate<int32_t>(values, 0, ownedExpertNum);
     }
+#else
+    FillUbVF<int32_t>(scratch.sendCntAccTensor, 0, static_cast<uint32_t>(ownedExpertNum));
+#endif
     PipeFence<PIPE_V, PIPE_S, SYNC_EVENT_ID2>();
 
     for (int32_t bufferIdx = 0; bufferIdx < bufferConfig.bufferCount; ++bufferIdx) {

@@ -81,6 +81,7 @@
 
  */
 #pragma once
+#include "../../common/mega_moe_sync.h"
 #include "../gemm/tile/copy_gmm1_concat.h"
 
 #if ASC_DEVKIT_MAJOR >= 9
@@ -101,15 +102,14 @@ namespace Blaze {
 namespace Gemm {
 namespace Prologue {
 
-using AscendC::CrossCoreSetFlag;
-using AscendC::CrossCoreWaitFlag;
-using AscendC::HardEvent;
-using AscendC::SetFlag;
 using AscendC::TEventID;
-using AscendC::WaitFlag;
+using MegaMoeImpl::SyncIntraArrive;
+using MegaMoeImpl::PipeFence;
+using MegaMoeImpl::PipeNotify;
+using MegaMoeImpl::PipeWait;
+using MegaMoeImpl::SyncIntraWait;
 
 using Blaze::Gemm::DOUBLE_BUFFER;
-using Blaze::Gemm::SYNC_MODE4;
 
 static constexpr int32_t QUADRUPLE_BUFFER_NUM = 4;
 static constexpr uint64_t SERIAL_HALF_K_PARTS = 2;
@@ -246,11 +246,11 @@ __aicore__ inline BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::BlockPrologue(const M
     : layout_(layout)
 {
     for (uint16_t idx = 0; idx < kUbMte2BufferNum; idx++) {
-        SetFlag<HardEvent::V_MTE2>(vecEventIdVToMte2_ + idx);
+        PipeNotify<PIPE_V, PIPE_MTE2>(vecEventIdVToMte2_ + idx);
     }
 
     for (uint16_t idx = 0; idx < WEIGHT_8BIT_BUFFER_NUM; idx++) {
-        SetFlag<HardEvent::MTE3_V>(vecEventIdMte3ToV_ + idx);
+        PipeNotify<PIPE_MTE3, PIPE_V>(vecEventIdMte3ToV_ + idx);
     }
 }
 
@@ -279,9 +279,9 @@ __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::ComputeBasicBloc
             auto weight8BitTensor = MakeWeight8BitTensor(mte2RealK, param.nL1Size);
             auto l1Tensor = l1BaseTensor.slice(asc::te::make_coord(l1SplitOffset, 0),
                                                asc::te::make_shape(mte2RealK, param.nL1Size));
-            WaitFlag<HardEvent::MTE2_V>(EVENT_ID_MTE2_TO_V + slot);
+            PipeWait<PIPE_MTE2, PIPE_V>(EVENT_ID_MTE2_TO_V + slot);
             WeightAntiQuantComputeNzNk(weight4BitTensor, weight8BitTensor);
-            SetFlag<HardEvent::V_MTE2>(vecEventIdVToMte2_ + slot);
+            PipeNotify<PIPE_V, PIPE_MTE2>(vecEventIdVToMte2_ + slot);
             // Publish another independent GM load before the current MTE3 write.
             if (nextHalf < totalHalves) {
                 CopyWeightToUb(param, gmWeightTensor, nextHalf++);
@@ -328,25 +328,25 @@ __aicore__ inline BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::~BlockPrologue()
 BLOCK_PROLOGUE_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::SetAivToAic()
 {
-    CrossCoreSetFlag<SYNC_MODE4, PIPE_MTE3>(SYNC_AIC_AIV_FLAG);
+    SyncIntraArrive<PIPE_MTE3>(SYNC_AIC_AIV_FLAG);
 }
 
 BLOCK_PROLOGUE_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::WaitAicToAiv()
 {
-    CrossCoreWaitFlag<SYNC_MODE4, PIPE_MTE3>(SYNC_AIV_AIC_FLAG);
+    SyncIntraWait<PIPE_MTE3>(SYNC_AIV_AIC_FLAG);
 }
 
 BLOCK_PROLOGUE_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::WaitVectorToMTE2()
 {
-    WaitFlag<HardEvent::V_MTE2>(vecEventIdVToMte2_ + (ubMte2LoopIdx_ & (kUbMte2BufferNum - 1)));
+    PipeWait<PIPE_V, PIPE_MTE2>(vecEventIdVToMte2_ + (ubMte2LoopIdx_ & (kUbMte2BufferNum - 1)));
 }
 
 BLOCK_PROLOGUE_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::SetVectorToMTE2()
 {
-    SetFlag<HardEvent::V_MTE2>(vecEventIdVToMte2_ + (ubMte2LoopIdx_ & (kUbMte2BufferNum - 1)));
+    PipeNotify<PIPE_V, PIPE_MTE2>(vecEventIdVToMte2_ + (ubMte2LoopIdx_ & (kUbMte2BufferNum - 1)));
 }
 
 BLOCK_PROLOGUE_MX_FP8FP4_TEMPLATE_PARAMS
@@ -372,14 +372,13 @@ template <typename Weight4BitTensorType, typename Weight8BitTensorType>
 __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::WeightAntiQuantComputeNzNk(
     const Weight4BitTensorType& weight4BitTensor, const Weight8BitTensorType& weight8BitTensor)
 {
-    WaitFlag<HardEvent::MTE3_V>(vecEventIdMte3ToV_ + (ubComputeLoopIdx_ & (WEIGHT_8BIT_BUFFER_NUM - 1)));
+    PipeWait<PIPE_MTE3, PIPE_V>(vecEventIdMte3ToV_ + (ubComputeLoopIdx_ & (WEIGHT_8BIT_BUFFER_NUM - 1)));
 
     // Pure compute: anti-quantization using tile helper
     Blaze::Gemm::Tile::ShiftW4ToW8<OutType, InType>(weight4BitTensor, weight8BitTensor);
 
     // Set/Wait flags AFTER compute
-    SetFlag<HardEvent::V_MTE3>(0);
-    WaitFlag<HardEvent::V_MTE3>(0);
+    PipeFence<PIPE_V, PIPE_MTE3, 0>();
 }
 
 BLOCK_PROLOGUE_MX_FP8FP4_TEMPLATE_PARAMS
@@ -392,7 +391,7 @@ __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::CopyWeightToL1(
         auto copyUB2L1 = asc::te::make_copy(Blaze::Gemm::Tile::CopyUB2L1Weight8Bit{});
         asc::te::copy(copyUB2L1, l1Tensor, weight8BitTensor);
     }
-    SetFlag<HardEvent::MTE3_V>(vecEventIdMte3ToV_ + (ubComputeLoopIdx_ & (WEIGHT_8BIT_BUFFER_NUM - 1)));
+    PipeNotify<PIPE_MTE3, PIPE_V>(vecEventIdMte3ToV_ + (ubComputeLoopIdx_ & (WEIGHT_8BIT_BUFFER_NUM - 1)));
     ubComputeLoopIdx_++;
 }
 
@@ -400,11 +399,11 @@ BLOCK_PROLOGUE_MX_FP8FP4_TEMPLATE_PARAMS
 __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::FinalizeVectorCompute()
 {
     for (uint16_t idx = 0; idx < WEIGHT_8BIT_BUFFER_NUM; idx++) {
-        WaitFlag<HardEvent::MTE3_V>(vecEventIdMte3ToV_ + idx);
+        PipeWait<PIPE_MTE3, PIPE_V>(vecEventIdMte3ToV_ + idx);
     }
 
     for (uint16_t idx = 0; idx < kUbMte2BufferNum; idx++) {
-        WaitFlag<HardEvent::V_MTE2>(vecEventIdVToMte2_ + idx);
+        PipeWait<PIPE_V, PIPE_MTE2>(vecEventIdVToMte2_ + idx);
     }
 }
 
@@ -453,7 +452,7 @@ __aicore__ inline void BLOCK_PROLOGUE_MX_FP8FP4_SPECIALIZATION::CopyWeightToUb(c
     WaitVectorToMTE2();
     auto weight4BitTensor = MakeWeight4BitTensor(mte2RealK, param.nL1Size);
     CopyGmToUb(kOffset, mte2RealK, param, gmWeightTensor, weight4BitTensor);
-    SetFlag<HardEvent::MTE2_V>(EVENT_ID_MTE2_TO_V + slot);
+    PipeNotify<PIPE_MTE2, PIPE_V>(EVENT_ID_MTE2_TO_V + slot);
     ++ubMte2LoopIdx_;
 }
 

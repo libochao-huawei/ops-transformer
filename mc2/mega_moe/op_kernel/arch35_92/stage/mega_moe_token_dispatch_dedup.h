@@ -449,7 +449,7 @@ __aicore__ inline void WaitDedupPrepassPublishGate(const TokenDispatchConfig& co
     // 所以每个 AIV1 在发布任何 tile 之前，必须确认全体 AIV0 已经建完表（等 done 计数的
     // 高 16 位到齐）。AIV1 相互之间不等，流水交叠不受影响；首个 wave 之后这里瞬时通过。
     __gm__ int32_t* dedupDoneSlot = reinterpret_cast<__gm__ int32_t*>(context.dedup.prepassReadyPtr);
-    const int32_t expectAiv0Done = static_cast<int32_t>(GetBlockNum());
+    const int32_t expectAiv0Done = static_cast<int32_t>(MegaMoeHardwarePolicy::GetBlockNum());
     while ((GmRead(dedupDoneSlot) >> DEDUP_PREPASS_DONE_AIV0_SHIFT) != expectAiv0Done) {
         int64_t gateBackoffStart = GetDeviceCycle();
         while (GetDeviceCycle() - gateBackoffStart < GM_FLAG_POLL_BACKOFF_CYCLES) {
@@ -552,7 +552,8 @@ __aicore__ inline void PrepareDedupPrepassAiv0Local(const DedupConfig& dedup, co
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (MegaMoeHardwarePolicy::VECTOR_CORE_COUNT_PER_CUBE == 1U || dedup.dedupMode == 0 || GetSubBlockIdx() != 0U ||
+    if (MegaMoeHardwarePolicy::VECTOR_CORE_COUNT_PER_CUBE == 1U || dedup.dedupMode == 0 ||
+        MegaMoeHardwarePolicy::GetSubBlockIdx() != 0U ||
         params.tilingData->compute.hiddenDim > DEDUP_AIV0_PREPASS_MAX_HIDDEN_DIM) {
         return;
     }

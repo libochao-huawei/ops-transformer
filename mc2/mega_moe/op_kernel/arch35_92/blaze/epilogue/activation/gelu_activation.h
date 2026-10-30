@@ -31,6 +31,7 @@ struct GeluActivationTileContext {
 constexpr float GELU_NEG_SQRT_EIGHT_OVER_PI = -1.595769121 * 0.044715;
 constexpr float GELU_CUBIC_RECIPROCAL = 1 / 0.044715;
 
+#if (__NPU_ARCH__ != 3510) || !defined(__ASC_FTZ__)
 template <typename InputType, bool TopkWeightsPrefetch>
 __simd_vf__ inline void RunGeluActivation(GeluActivationTileContext<InputType> context)
 {
@@ -82,6 +83,70 @@ __simd_vf__ inline void RunGeluActivation(GeluActivationTileContext<InputType> c
         }
     }
 }
+
+#else
+// FTZ开启时原Reg Exp/Div直接使用指令；关闭FTZ的配置保留原VF及其补偿流程。
+template <typename InputType, bool TopkWeightsPrefetch>
+__simd_callee__ inline void ComputeGeluVector(__ubuf__ uint32_t*& output, __ubuf__ InputType*& input,
+                                              vector_float& weight, vector_bool active, vector_bool storeMask)
+{
+    vector_float x;
+    vector_float square;
+    vector_float cubic;
+    vector_float result;
+    LoadActivationInput<InputType>(x, input, active);
+    asc_mul(square, x, x, active);
+    asc_mul(cubic, square, x, active);
+    asc_axpy(cubic, x, GELU_CUBIC_RECIPROCAL, active);
+    asc_mul_scalar(cubic, cubic, GELU_NEG_SQRT_EIGHT_OVER_PI, active);
+    asc_exp(cubic, cubic, active);
+    asc_add_scalar(cubic, cubic, 1.0F, active);
+    asc_div(result, x, cubic, active);
+    if constexpr (TopkWeightsPrefetch) {
+        asc_mul(result, result, weight, active);
+    }
+    StoreActivationOutput(output, result, active, storeMask);
+}
+
+template <typename InputType, bool TopkWeightsPrefetch>
+__simd_vf__ inline void RunGeluActivation(GeluActivationTileContext<InputType> context)
+{
+    constexpr uint32_t OUTPUT_STEP = VECTOR_LENGTH_FP32 * sizeof(bfloat16_t) / sizeof(uint32_t);
+    const uint32_t fullVectorCount = context.validColumnCount / VECTOR_LENGTH_FP32;
+    const uint32_t tailElementCount = context.validColumnCount % VECTOR_LENGTH_FP32;
+    const uint32_t paddingVectorCount =
+        context.rowStrideElements / VECTOR_LENGTH_FP32 - fullVectorCount - (tailElementCount != 0U ? 1U : 0U);
+    vector_bool all = asc_create_mask_b32(PAT_ALL);
+    vector_bool tailMask;
+    if (tailElementCount != 0U) {
+        uint32_t remaining = tailElementCount;
+        tailMask = asc_update_mask_b32(remaining);
+    }
+    vector_float weight;
+
+    for (uint16_t row = 0; row < context.rowCount; ++row) {
+        if constexpr (TopkWeightsPrefetch) {
+            asc_loadalign_brc_elem(weight, context.topkWeights + row * INT32_PER_256B + WEIGHT_INDEX);
+        }
+        __ubuf__ InputType* input = context.input + row * context.rowStrideElements;
+        __ubuf__ uint32_t* output =
+            reinterpret_cast<__ubuf__ uint32_t*>(context.output + row * context.rowStrideElements);
+        for (uint32_t vectorIndex = 0; vectorIndex < fullVectorCount; ++vectorIndex) {
+            ComputeGeluVector<InputType, TopkWeightsPrefetch>(output, input, weight, all, all);
+        }
+        if (tailElementCount != 0U) {
+            ComputeGeluVector<InputType, TopkWeightsPrefetch>(output, input, weight, tailMask, all);
+        }
+        if (paddingVectorCount != 0U) {
+            vector_bfloat16_t outputReg;
+            asc_duplicate_scalar(outputReg, static_cast<bfloat16_t>(0), all);
+            for (uint32_t vectorIndex = 0; vectorIndex < paddingVectorCount; ++vectorIndex) {
+                asc_storealign_pack_postupdate(output, reinterpret_cast<vector_uint32_t&>(outputReg), OUTPUT_STEP, all);
+            }
+        }
+    }
+}
+#endif
 
 } // namespace Activation
 } // namespace MegaMoeImpl

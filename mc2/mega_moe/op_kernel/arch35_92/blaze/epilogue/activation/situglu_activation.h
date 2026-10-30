@@ -32,6 +32,7 @@ struct SituGluParams {
     float invAlpha;
 };
 
+#if (__NPU_ARCH__ != 3510) || !defined(__ASC_FTZ__)
 template <typename InputType>
 __simd_callee__ inline void LoadSituGluInputAsFp32(AscendC::Reg::RegTensor<float>& dstReg,
                                                    AscendC::Reg::RegTensor<InputType>& inputReg,
@@ -222,6 +223,150 @@ __simd_vf__ inline void RunSiTUGLU(GatedActivationTileContext<InputType> context
         }
     }
 }
+
+#else
+__simd_callee__ inline void ComputeSituGluTanhPiecewise(vector_float& resultReg, vector_float& zReg,
+                                                        vector_float& oneReg, vector_float& c1Reg, vector_float& c2Reg,
+                                                        vector_bool computeMask)
+{
+    vector_float polynomialReg;
+    {
+        vector_float squareReg;
+        asc_mul(squareReg, zReg, zReg, computeMask);
+        asc_mul_scalar(polynomialReg, squareReg, 0.0157396831F, computeMask);
+        asc_add_scalar(polynomialReg, polynomialReg, -0.0523039624F, computeMask);
+        asc_madd(polynomialReg, squareReg, c2Reg, computeMask);
+        asc_madd(polynomialReg, squareReg, c1Reg, computeMask);
+        asc_mul(polynomialReg, polynomialReg, squareReg, computeMask);
+        asc_madd(polynomialReg, zReg, zReg, computeMask);
+    }
+
+    vector_float temporaryReg;
+    asc_mul_scalar(temporaryReg, zReg, -2.0F, computeMask);
+    asc_exp(temporaryReg, temporaryReg, computeMask);
+    asc_add_scalar(temporaryReg, temporaryReg, 1.0F, computeMask);
+    asc_div(temporaryReg, oneReg, temporaryReg, computeMask);
+    asc_mul_scalar(temporaryReg, temporaryReg, 2.0F, computeMask);
+    asc_add_scalar(temporaryReg, temporaryReg, -1.0F, computeMask);
+
+    vector_float absReg;
+    vector_bool compareMask;
+    asc_abs(absReg, zReg, computeMask);
+    asc_ge_scalar(compareMask, absReg, 0.60000002384185791016F, computeMask);
+    asc_select(resultReg, temporaryReg, polynomialReg, compareMask);
+}
+
+template <bool IsLinear>
+__simd_callee__ inline void ComputeSituGlu(vector_float& outputFp32Reg, vector_float& gateFp32Reg,
+                                           vector_float& upFp32Reg, vector_float& betaReg, vector_float& oneReg,
+                                           vector_float& c1Reg, vector_float& c2Reg, vector_bool computeMask,
+                                           float clampLimit, float invBeta, float alpha, float invAlpha)
+{
+    asc_min_scalar(gateFp32Reg, gateFp32Reg, clampLimit, computeMask);
+    asc_min_scalar(upFp32Reg, upFp32Reg, clampLimit, computeMask);
+    asc_max_scalar(upFp32Reg, upFp32Reg, -clampLimit, computeMask);
+
+    vector_float zReg;
+    vector_float sigmoidReg;
+    asc_mul_scalar(zReg, gateFp32Reg, invBeta, computeMask);
+    ComputeSituGluTanhPiecewise(sigmoidReg, zReg, oneReg, c1Reg, c2Reg, computeMask);
+    {
+        vector_float expReg;
+        asc_mul_scalar(expReg, gateFp32Reg, -1.0F, computeMask);
+        asc_exp(expReg, expReg, computeMask);
+        asc_add_scalar(expReg, expReg, 1.0F, computeMask);
+        asc_div(expReg, betaReg, expReg, computeMask);
+        asc_mul(outputFp32Reg, sigmoidReg, expReg, computeMask);
+    }
+
+    if constexpr (IsLinear) {
+        asc_mul_scalar(gateFp32Reg, outputFp32Reg, 1.0F, computeMask);
+        asc_mul_scalar(zReg, upFp32Reg, invAlpha, computeMask);
+        ComputeSituGluTanhPiecewise(sigmoidReg, zReg, oneReg, c1Reg, c2Reg, computeMask);
+        asc_mul_scalar(sigmoidReg, sigmoidReg, alpha, computeMask);
+        asc_mul(outputFp32Reg, gateFp32Reg, sigmoidReg, computeMask);
+    } else {
+        asc_mul(outputFp32Reg, outputFp32Reg, upFp32Reg, computeMask);
+    }
+}
+
+// FTZ关闭时保留原Reg VF及其Exp/Div补偿流程。
+template <typename InputType, bool TopkWeightsPrefetch, bool IsLinear>
+__simd_vf__ inline void RunSiTUGLU(GatedActivationTileContext<InputType> context, SituGluParams params)
+{
+    vector_bool fullMask = asc_create_mask_b32(PAT_ALL);
+    vector_bool tailComputeMask;
+    vector_bool tailStoreMask;
+    if (context.needTailVectorCompute != 0U) {
+        uint32_t tailComputeCount = context.tailComputeMaskElementCount;
+        tailComputeMask = asc_update_mask_b32(tailComputeCount);
+        if (context.tailStoreMaskElementCount == VECTOR_LENGTH_FP32) {
+            tailStoreMask = fullMask;
+        } else {
+            uint32_t tailStoreCount = context.tailStoreMaskElementCount;
+            tailStoreMask = asc_update_mask_b32(tailStoreCount);
+        }
+    }
+    vector_bool paddingMask;
+    if (context.needAdditionalPaddingStore != 0U) {
+        uint32_t paddingCount = context.additionalPaddingStoreMaskElementCount;
+        paddingMask = asc_update_mask_b16(paddingCount);
+    }
+
+    vector_float betaReg;
+    vector_float oneReg;
+    vector_float c1Reg;
+    vector_float c2Reg;
+    asc_duplicate_scalar(betaReg, params.beta, fullMask);
+    asc_duplicate_scalar(oneReg, 1.0F, fullMask);
+    asc_duplicate_scalar(c1Reg, -0.333327681F, fullMask);
+    asc_duplicate_scalar(c2Reg, 0.133152977F, fullMask);
+
+    __ubuf__ float* topkWeights = context.topkWeights;
+    if constexpr (TopkWeightsPrefetch) {
+        topkWeights += WEIGHT_INDEX;
+    }
+    for (uint16_t rowIndex = 0U; rowIndex < context.rowLoopCount; ++rowIndex) {
+        vector_float weightReg;
+        if constexpr (TopkWeightsPrefetch) {
+            asc_loadalign_brc_elem_postupdate(weightReg, topkWeights, INT32_PER_256B);
+        }
+        const uint32_t inputRowOffset = static_cast<uint32_t>(rowIndex) * context.inputRowStrideElements;
+        const uint32_t outputRowOffset = static_cast<uint32_t>(rowIndex) * context.outputRowStrideElements;
+        __ubuf__ InputType* gate = context.gate + inputRowOffset;
+        __ubuf__ InputType* up = context.up + inputRowOffset;
+        __ubuf__ uint32_t* output = reinterpret_cast<__ubuf__ uint32_t*>(context.output + outputRowOffset);
+        vector_float gateFp32Reg;
+        vector_float upFp32Reg;
+        vector_float outputFp32Reg;
+        for (uint16_t vectorIndex = 0U; vectorIndex < context.fullVectorLoopCount; ++vectorIndex) {
+            LoadActivationInput<InputType>(gateFp32Reg, gate, fullMask);
+            LoadActivationInput<InputType>(upFp32Reg, up, fullMask);
+            ComputeSituGlu<IsLinear>(outputFp32Reg, gateFp32Reg, upFp32Reg, betaReg, oneReg, c1Reg, c2Reg, fullMask,
+                                     params.clampLimit, params.invBeta, params.alpha, params.invAlpha);
+            if constexpr (TopkWeightsPrefetch) {
+                asc_mul(outputFp32Reg, outputFp32Reg, weightReg, fullMask);
+            }
+            StoreActivationOutput(output, outputFp32Reg, fullMask, fullMask);
+        }
+        if (context.needTailVectorCompute != 0U) {
+            LoadActivationInput<InputType>(gateFp32Reg, gate, tailComputeMask);
+            LoadActivationInput<InputType>(upFp32Reg, up, tailComputeMask);
+            ComputeSituGlu<IsLinear>(outputFp32Reg, gateFp32Reg, upFp32Reg, betaReg, oneReg, c1Reg, c2Reg,
+                                     tailComputeMask, params.clampLimit, params.invBeta, params.alpha, params.invAlpha);
+            if constexpr (TopkWeightsPrefetch) {
+                asc_mul(outputFp32Reg, outputFp32Reg, weightReg, tailComputeMask);
+            }
+            StoreActivationOutput(output, outputFp32Reg, tailComputeMask, tailStoreMask);
+        }
+        if (context.needAdditionalPaddingStore != 0U) {
+            vector_bfloat16_t zeroReg;
+            asc_duplicate_scalar(zeroReg, static_cast<bfloat16_t>(0), paddingMask);
+            asc_storealign(reinterpret_cast<__ubuf__ bfloat16_t*>(output), zeroReg, paddingMask);
+        }
+    }
+}
+#endif
 
 } // namespace Activation
 } // namespace MegaMoeImpl

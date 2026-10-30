@@ -24,6 +24,10 @@
 #include "kernel_operator.h"
 #endif
 #include "../../../common/mega_moe_constants.h"
+#if (__NPU_ARCH__ == 3510) && defined(__ASC_FTZ__)
+#include <type_traits>
+#include "c_api/asc_simd.h"
+#endif
 
 namespace MegaMoeImpl {
 namespace Activation {
@@ -73,6 +77,32 @@ struct GatedActivationTileContext {
     uint32_t tailStoreMaskElementCount;
     uint32_t additionalPaddingStoreMaskElementCount;
 };
+
+#if (__NPU_ARCH__ == 3510) && defined(__ASC_FTZ__)
+template <typename InputType>
+__simd_callee__ inline void LoadActivationInput(vector_float& output, __ubuf__ InputType*& input,
+                                                vector_bool computeMask)
+{
+    static_assert(std::is_same_v<InputType, bfloat16_t> || std::is_same_v<InputType, half>);
+    using InputVector = std::conditional_t<std::is_same_v<InputType, bfloat16_t>, vector_bfloat16_t, vector_half>;
+    InputVector inputReg;
+    asc_loadalign_unpack_postupdate(inputReg, input, VECTOR_LENGTH_FP32);
+    if constexpr (std::is_same_v<InputType, bfloat16_t>) {
+        asc_bfloat162float(output, inputReg, computeMask, ASC_POSITION_EVEN);
+    } else {
+        asc_half2float(output, inputReg, computeMask, ASC_POSITION_EVEN);
+    }
+}
+
+__simd_callee__ inline void StoreActivationOutput(__ubuf__ uint32_t*& output, vector_float input,
+                                                  vector_bool computeMask, vector_bool storeMask)
+{
+    vector_bfloat16_t outputReg;
+    asc_float2bfloat16_rn(outputReg, input, computeMask, ASC_POSITION_EVEN);
+    constexpr uint32_t OUTPUT_STEP = VECTOR_LENGTH_FP32 * sizeof(bfloat16_t) / sizeof(uint32_t);
+    asc_storealign_pack_postupdate(output, reinterpret_cast<vector_uint32_t&>(outputReg), OUTPUT_STEP, storeMask);
+}
+#endif
 
 } // namespace Activation
 } // namespace MegaMoeImpl
