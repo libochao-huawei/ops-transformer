@@ -142,7 +142,7 @@ def _compressor_forward_fake(
     else:
         b_size = cu_seqlens.size(0) - 1
         t = x.size(0)
-        cmp_size = min(t, t // cmp_ratio + b_size)
+        cmp_size = torch.sym_min(t, t // cmp_ratio + b_size)
         cmp_kv_size = (cmp_size, d)
         softmax_score_size = (cmp_size, coff_cmp, d)
         kv_size = (cmp_size, coff_cmp, d)

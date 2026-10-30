@@ -80,7 +80,7 @@ class QuantCompressorOpBuilder(OpBuilder):
             else:
                 t = x.size(0)
                 b_size = cu_seqlens.size(0) - 1
-                sr = min(t, t // cmp_ratio + b_size)
+                sr = torch.sym_min(t, t // cmp_ratio + b_size)
                 cmp_kv_size = (sr, d)
 
             return torch.empty(cmp_kv_size, dtype=torch.bfloat16, device="meta")
