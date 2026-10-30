@@ -121,7 +121,7 @@ aclnnStatus aclnnMoeTokenPermuteGrad(
       <td>paddedMode</td>
       <td>输入</td>
       <td>是否开启paddedMode模式</td>
-      <td>true表示开启paddedMode，false表示关闭paddedMode，目前仅支持false</td>
+      <td>true表示开启paddedMode，false表示关闭paddedMode，默认为false，当前不生效</td>
       <td>bool</td>
       <td>-</td>
       <td>-</td>

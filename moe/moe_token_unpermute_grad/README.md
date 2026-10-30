@@ -88,7 +88,7 @@
     <tr>
       <td>paddedMode</td>
       <td>属性</td>
-      <td>目前仅支持false。</td>
+      <td>默认为false，当前不生效。</td>
       <td>BOOL</td>
       <td>-</td>
     </tr>

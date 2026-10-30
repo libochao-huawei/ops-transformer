@@ -165,7 +165,7 @@ aclnnStatus aclnnMoeTokenUnpermuteWithEpGrad(
       <td>paddedMode（bool）</td>
       <td>输入</td>
       <td>true表示开启paddedMode，false表示关闭paddedMode。paddedMode表示填充模式。</td>
-      <td>目前仅支持false。</td>
+      <td>默认为false，当前不生效。</td>
       <td>-</td>
       <td>-</td>
       <td>-</td>

@@ -114,7 +114,7 @@
   <tr>
    <td>paddedMode</td>
    <td>属性</td>
-   <td>true表示开启paddedMode，false表示关闭paddedMode，目前仅支持false。</td>
+   <td>true表示开启paddedMode，false表示关闭paddedMode，默认为false，当前不生效。</td>
    <td>BOOL</td>
    <td>-</td>
   </tr>
