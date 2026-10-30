@@ -31,6 +31,53 @@ constexpr int64_t GM_ALIGN = 512;
 constexpr uint32_t PING_PONG_BUFFER = 2;
 constexpr uint32_t SINGLE_M = 128;
 
+namespace {
+ge::graphStatus CheckAttentionInDtype(gert::TilingContext* context)
+{
+    auto query = context->GetInputDesc(static_cast<size_t>(InputIndex::QUERY));
+    auto attentionIn = context->GetInputDesc(static_cast<size_t>(InputIndex::ATTENTION_OUT));
+    OP_CHECK_IF(query == nullptr || attentionIn == nullptr,
+                OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(), "query or attentionIn is nullptr."),
+                return ge::GRAPH_FAILED);
+
+    auto queryType = static_cast<uint32_t>(query->GetDataType());
+    auto attentionInType = static_cast<uint32_t>(attentionIn->GetDataType());
+
+    OP_CHECK_IF(queryType != attentionInType,
+                OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(),
+                                            "invalid attentionIn dtype should be same with query's dtype"),
+                return ge::GRAPH_FAILED);
+
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CheckDtypeValid(gert::TilingContext* context)
+{
+    if (context == nullptr) {
+        OP_LOGE(context, "context is nullptr");
+        return ge::GRAPH_FAILED;
+    }
+
+    auto ret = CheckAttentionInDtype(context);
+    if (ret != ge::GRAPH_SUCCESS) {
+        return ret;
+    }
+
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CheckLseShape(gert::TilingContext* context)
+{
+    auto lseShape = context->GetInputShape(static_cast<size_t>(InputIndex::LSE));
+    if (lseShape == nullptr || lseShape->GetStorageShape().GetDimNum() == 0) {
+        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(context->GetNodeName(), "lse", "0",
+                                              "The shape of softmax_lse cannot be zero");
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace
+
 ge::graphStatus SparseFlashMlaGradBasicTiling::GetShapeAttrsInfo()
 {
     /*
@@ -607,6 +654,10 @@ ge::graphStatus SparseFlashMlaGradBasicTiling::GetBaseShapeInfo()
         }
     }
 
+    if (CheckLseShape(context_) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+
     OP_CHECK_IF(cmpRatioPtr == nullptr,
                 OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON("SparseFlashMlaGrad", "cmp_ratio", "cmpRatioPtr is null"),
                 return ge::GRAPH_FAILED);
@@ -780,6 +831,12 @@ ge::graphStatus SparseFlashMlaGradBasicTiling::GetBaseShapeInfo()
     tilingData.opInfo.set_hasUsedSeqCmpKV(tmpData.usedSeqCmpKV);
     tilingData.opInfo.set_isSink(static_cast<uint8_t>(tmpData.sinks));
     tilingData.opInfo.set_selectedBlockSize(1);
+
+    auto ret = CheckDtypeValid(context_);
+    if (ret != ge::GRAPH_SUCCESS) {
+        OP_LOGE(context_, "SparseFlashMlaGrad the dtype of input is invalid.");
+        return ge::GRAPH_FAILED;
+    }
 
     return ge::GRAPH_SUCCESS;
 }
