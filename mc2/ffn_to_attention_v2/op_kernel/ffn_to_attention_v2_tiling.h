@@ -31,7 +31,7 @@ struct FFNToAttentionV2Info {
     uint8_t windowType;
     uint64_t maxTokenNum;
     uint64_t cclBufferSize;
-    uint64_t addressTableWinOffset;
+    uint64_t addressTableWorkspaceOffset;
     uint64_t addressTableBytes;
 };
 

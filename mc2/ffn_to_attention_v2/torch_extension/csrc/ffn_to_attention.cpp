@@ -13,12 +13,101 @@
 #include <limits>
 #include <vector>
 #include <torch/extension.h>
+#include <acl/acl_rt.h>
 #include "aclnn_common.h"
 
 namespace op_api {
 using npu_utils = at_npu::native::NpuUtils;
 const int DIM_ONE = 1;
 const int DIM_TWO = 2;
+
+namespace {
+constexpr int64_t FFN_ATTN_STATUS_TABLE_SLOTS = 4; // 32B: [0]=completed round, [1..3] mirror
+
+#define ACL_RT_CHECK(expr) \
+    do { \
+        aclError _s = (expr); \
+        TORCH_CHECK(_s == ACL_SUCCESS, #expr " failed, ret=", static_cast<int64_t>(_s)); \
+    } while (0)
+} // namespace
+
+// Host-visible send-completion status table backing the async tensor keepalive of
+// ffn_to_attention: the kernel publishes the highest fully-completed round into slot 0 of
+// this registered (device-mapped) memory, and the Python side polls it without any device
+// synchronization to release keepalive tensor references late. Mirrors HostPinnedCounter in
+// elastic_buffer.cpp and AttentionToFfnHostStatusTable in attention_to_ffn_v2. Layout
+// contract with the kernel (ReportSendCompletion):
+//   slot 0 (int64): completed round id, monotonically non-decreasing, -1 until the second
+//                   kernel launch confirms the first round;
+//   slot 1..3     : mirror slot 0 (only slot 0 is defined to the reader).
+class FfnToAttentionHostStatusTable {
+public:
+    FfnToAttentionHostStatusTable()
+    {
+        constexpr int64_t bytes = FFN_ATTN_STATUS_TABLE_SLOTS * static_cast<int64_t>(sizeof(int64_t));
+        ACL_RT_CHECK(aclrtMallocHost(&hostPtr_, bytes));
+        // The destructor does not run when the constructor throws (pybind11 surfaces the error to
+        // Python and a retry would accumulate leaks), so each step rolls back everything the
+        // previous steps acquired before re-raising.
+        aclError ret = aclrtHostRegisterV2(hostPtr_, bytes, ACL_HOST_REG_MAPPED);
+        if (ret != ACL_SUCCESS) {
+            (void)aclrtFreeHost(hostPtr_);
+            hostPtr_ = nullptr;
+            TORCH_CHECK(false, "aclrtHostRegisterV2 failed, ret=", static_cast<int64_t>(ret));
+        }
+        ret = aclrtHostGetDevicePointer(hostPtr_, &devPtr_, 0);
+        if (ret != ACL_SUCCESS) {
+            (void)aclrtHostUnregister(hostPtr_);
+            (void)aclrtFreeHost(hostPtr_);
+            hostPtr_ = nullptr;
+            devPtr_ = nullptr;
+            TORCH_CHECK(false, "aclrtHostGetDevicePointer failed, ret=", static_cast<int64_t>(ret));
+        }
+        Reset();
+    }
+
+    ~FfnToAttentionHostStatusTable()
+    {
+        if (hostPtr_ == nullptr) {
+            return;
+        }
+        try {
+            ACL_RT_CHECK(aclrtSynchronizeDevice());
+            ACL_RT_CHECK(aclrtHostUnregister(hostPtr_));
+            ACL_RT_CHECK(aclrtFreeHost(hostPtr_));
+        } catch (const std::exception& e) {
+            ASCEND_LOGE("FfnToAttentionHostStatusTable destroy failed: %s", e.what());
+        }
+        hostPtr_ = nullptr;
+        devPtr_ = nullptr;
+    }
+
+    FfnToAttentionHostStatusTable(const FfnToAttentionHostStatusTable&) = delete;
+    FfnToAttentionHostStatusTable& operator=(const FfnToAttentionHostStatusTable&) = delete;
+
+    void Reset()
+    {
+        auto* slots = reinterpret_cast<volatile int64_t*>(hostPtr_);
+        slots[0] = -1; // no completed round yet
+        for (int64_t i = 1; i < FFN_ATTN_STATUS_TABLE_SLOTS; ++i) {
+            slots[i] = 0;
+        }
+    }
+
+    int64_t CompletedRound() const
+    {
+        return *reinterpret_cast<volatile int64_t*>(hostPtr_);
+    }
+
+    uintptr_t DevicePtr() const
+    {
+        return reinterpret_cast<uintptr_t>(devPtr_);
+    }
+
+private:
+    void* hostPtr_ = nullptr;
+    void* devPtr_ = nullptr;
+};
 
 /**
  * @brief Wrapper for ffn_to_attention. The op has no host-visible output tensors;
@@ -67,13 +156,8 @@ namespace {
 constexpr int64_t MB_ALIGN = 2LL * 1024LL * 1024LL; // 2MB
 constexpr int64_t BYTES_PER_FP16 = 2;
 constexpr int64_t BYTES_PER_INT32 = 4;
-constexpr int64_t WIN_REGION_ALIGN = 512;          // window region start alignment (matches kernel WIN_ALIGN)
-constexpr int64_t FLAG_SLOT_BYTES = 32;            // URMA flag staging slot (matches kernel URMA_FLAG_SLOT_SIZE)
-constexpr int64_t REMOTE_ADDRESS_ENTRY_BYTES = 16; // address table entry: slot id + source token index
 constexpr int64_t WORLD_SIZE_UPPER_BOUND = 1024;
-// Reserve for up to 1024 AIVs; host tiling uses the actual core count.
-constexpr int64_t AIV_RESERVE_COUNT = 1024LL;
-constexpr int64_t FLAG_SOURCE_RESERVE_BYTES = AIV_RESERVE_COUNT * FLAG_SLOT_BYTES;
+constexpr int64_t WIN_REGION_ALIGN = 512; // window region start alignment (matches kernel WIN_ALIGN)
 
 int64_t CeilAlign(int64_t val, int64_t align)
 {
@@ -121,14 +205,7 @@ int64_t GetFFNToAttentionCclBufferSize(const std::vector<int64_t>& tokenInfoTabl
                   WIN_REGION_ALIGN);
     int64_t recvDataSize =
         CeilAlign(CheckedMul(CheckedMul(CheckedMul(maxWorkerNum, tokenSlots), hs), BYTES_PER_FP16), WIN_REGION_ALIGN);
-    int64_t rawSize =
-        CeilAlign(CheckedAdd(CheckedAdd(recvInfoSize, recvDataSize), FLAG_SOURCE_RESERVE_BYTES), WIN_REGION_ALIGN);
-    const int64_t tokenCapacity = CheckedMul(worldSize, tokenSlots);
-    const int64_t rankTableStride = CeilAlign(CheckedMul(tokenCapacity, REMOTE_ADDRESS_ENTRY_BYTES), WIN_REGION_ALIGN);
-    const int64_t countRowStride = CeilAlign(CheckedMul(worldSize, BYTES_PER_INT32), WIN_REGION_ALIGN);
-    const int64_t tableBytes =
-        CheckedAdd(CheckedMul(worldSize, rankTableStride), CheckedMul(AIV_RESERVE_COUNT + 1, countRowStride));
-    rawSize = CheckedAdd(rawSize, tableBytes);
+    int64_t rawSize = CeilAlign(CheckedAdd(recvInfoSize, recvDataSize), WIN_REGION_ALIGN);
     return CeilAlign(rawSize, MB_ALIGN);
 }
 
@@ -138,7 +215,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("npu_ffn_to_attention", &NpuFFNToAttention, "npu_ffn_to_attention");
     m.def("get_ffn_to_attention_ccl_buffer_size", &GetFFNToAttentionCclBufferSize,
           pybind11::arg("token_info_table_shape"), pybind11::arg("token_data_shape"), pybind11::arg("world_size"),
-          "URMA window size hosting the attention_to_ffn receiving area, flag sources, rank address tables and "
-          "count rows");
+          "URMA window size hosting the attention_to_ffn receiving area");
+    pybind11::class_<FfnToAttentionHostStatusTable>(m, "FfnToAttentionHostStatusTable")
+        .def(pybind11::init<>())
+        .def("reset", &FfnToAttentionHostStatusTable::Reset)
+        .def("completed_round", &FfnToAttentionHostStatusTable::CompletedRound)
+        .def("device_ptr", &FfnToAttentionHostStatusTable::DevicePtr);
 }
 } // namespace op_api

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <vector>
 #include <torch/extension.h>
+#include <acl/acl_rt.h>
 #include "aclnn_common.h"
 
 namespace op_api {
@@ -19,6 +20,93 @@ using npu_utils = at_npu::native::NpuUtils;
 const int DIM_ONE = 1;
 const int DIM_TWO = 2;
 const int DIM_THREE = 3;
+
+namespace {
+constexpr int64_t ATTN_FFN_STATUS_TABLE_SLOTS = 4; // 32B: [0]=completed round, [1..3] reserved
+
+#define ACL_RT_CHECK(expr) \
+    do { \
+        aclError _s = (expr); \
+        TORCH_CHECK(_s == ACL_SUCCESS, #expr " failed, ret=", static_cast<int64_t>(_s)); \
+    } while (0)
+} // namespace
+
+// Host-visible send-completion status table backing the async tensor keepalive of
+// attention_to_ffn: the kernel publishes the highest fully-completed round into slot 0 of this
+// registered (device-mapped) memory, and the Python side polls it without any device
+// synchronization to release keepalive tensor references late. Mirrors HostPinnedCounter in
+// elastic_buffer.cpp. Layout contract with the kernel (ReportSendCompletion):
+//   slot 0 (int64): completed round id, monotonically non-decreasing, -1 until the second
+//                   kernel launch confirms the first round;
+//   slot 1..3     : mirror slot 0 (only slot 0 is defined to the reader).
+class AttentionToFfnHostStatusTable {
+public:
+    AttentionToFfnHostStatusTable()
+    {
+        constexpr int64_t bytes = ATTN_FFN_STATUS_TABLE_SLOTS * static_cast<int64_t>(sizeof(int64_t));
+        ACL_RT_CHECK(aclrtMallocHost(&hostPtr_, bytes));
+        // The destructor does not run when the constructor throws (pybind11 surfaces the error to
+        // Python and a retry would accumulate leaks), so each step rolls back everything the
+        // previous steps acquired before re-raising.
+        aclError ret = aclrtHostRegisterV2(hostPtr_, bytes, ACL_HOST_REG_MAPPED);
+        if (ret != ACL_SUCCESS) {
+            (void)aclrtFreeHost(hostPtr_);
+            hostPtr_ = nullptr;
+            TORCH_CHECK(false, "aclrtHostRegisterV2 failed, ret=", static_cast<int64_t>(ret));
+        }
+        ret = aclrtHostGetDevicePointer(hostPtr_, &devPtr_, 0);
+        if (ret != ACL_SUCCESS) {
+            (void)aclrtHostUnregister(hostPtr_);
+            (void)aclrtFreeHost(hostPtr_);
+            hostPtr_ = nullptr;
+            devPtr_ = nullptr;
+            TORCH_CHECK(false, "aclrtHostGetDevicePointer failed, ret=", static_cast<int64_t>(ret));
+        }
+        Reset();
+    }
+
+    ~AttentionToFfnHostStatusTable()
+    {
+        if (hostPtr_ == nullptr) {
+            return;
+        }
+        try {
+            ACL_RT_CHECK(aclrtSynchronizeDevice());
+            ACL_RT_CHECK(aclrtHostUnregister(hostPtr_));
+            ACL_RT_CHECK(aclrtFreeHost(hostPtr_));
+        } catch (const std::exception& e) {
+            ASCEND_LOGE("AttentionToFfnHostStatusTable destroy failed: %s", e.what());
+        }
+        hostPtr_ = nullptr;
+        devPtr_ = nullptr;
+    }
+
+    AttentionToFfnHostStatusTable(const AttentionToFfnHostStatusTable&) = delete;
+    AttentionToFfnHostStatusTable& operator=(const AttentionToFfnHostStatusTable&) = delete;
+
+    void Reset()
+    {
+        auto* slots = reinterpret_cast<volatile int64_t*>(hostPtr_);
+        slots[0] = -1; // no completed round yet
+        for (int64_t i = 1; i < ATTN_FFN_STATUS_TABLE_SLOTS; ++i) {
+            slots[i] = 0;
+        }
+    }
+
+    int64_t CompletedRound() const
+    {
+        return *reinterpret_cast<volatile int64_t*>(hostPtr_);
+    }
+
+    uintptr_t DevicePtr() const
+    {
+        return reinterpret_cast<uintptr_t>(devPtr_);
+    }
+
+private:
+    void* hostPtr_ = nullptr;
+    void* devPtr_ = nullptr;
+};
 
 /**
  * @brief Wrapper for attention_to_ffn. The op has no host-visible output tensors;
@@ -80,7 +168,6 @@ constexpr int64_t BYTES_PER_FP16 = 2;
 constexpr int64_t BYTES_PER_INT32 = 4;
 constexpr int64_t BYTES_PER_QUANT_ELEM = 1; // INT8/FP8 = 1 byte, FP4-packed HS already accounts for packing
 constexpr int64_t WIN_REGION_ALIGN = 512;   // window region start alignment (matches kernel WIN_ALIGN)
-constexpr int64_t FLAG_SLOT_BYTES = 32;     // URMA flag staging slot (matches kernel URMA_FLAG_SLOT_SIZE)
 
 int64_t CeilAlign(int64_t val, int64_t align)
 {
@@ -106,16 +193,7 @@ int64_t GetAttentionToFfnCclBufferSize(const std::vector<int64_t>& ffnTokenInfoT
     int64_t tokenInfoSize = attentionWorkerNum * microBatchNum * infoTableLastDim * BYTES_PER_INT32;
     int64_t bytesPerElem = (quantMode == NO_QUANT_MODE) ? BYTES_PER_FP16 : BYTES_PER_QUANT_ELEM;
     int64_t tokenDataSize = attentionWorkerNum * microBatchNum * bs * kPlusShared * hs * bytesPerElem;
-    // Compact contiguous staging area appended after the token-data region: one slot per token
-    // (stride = ceil(hs * elemSize, 32B)), physically separated from the session-slot receiving
-    // area to avoid HBM bank conflicts between local URMA reads and remote URMA writes.
-    int64_t stagingStride = CeilAlign(hs * bytesPerElem, FLAG_SLOT_BYTES);
-    int64_t maxTotalSendNum = bs * kPlusShared; // X is always 1
-    int64_t stagingSize = maxTotalSendNum * stagingStride;
-    // Persistent URMA flag staging area: one 32B flag slot per token plus one layer-flag slot.
-    int64_t flagStagingSize = (bs * kPlusShared + 1) * FLAG_SLOT_BYTES;
-    int64_t needed = CeilAlign(tokenInfoSize, WIN_REGION_ALIGN) + CeilAlign(tokenDataSize, WIN_REGION_ALIGN) +
-                     CeilAlign(stagingSize, WIN_REGION_ALIGN) + flagStagingSize;
+    int64_t needed = CeilAlign(tokenInfoSize, WIN_REGION_ALIGN) + CeilAlign(tokenDataSize, WIN_REGION_ALIGN);
     return CeilAlign(needed, MB_ALIGN);
 }
 
@@ -125,5 +203,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("npu_attention_to_ffn", &NpuAttentionToFfn, "npu_attention_to_ffn");
     m.def("get_attention_to_ffn_ccl_buffer_size", &GetAttentionToFfnCclBufferSize,
           "get_attention_to_ffn_ccl_buffer_size");
+    pybind11::class_<AttentionToFfnHostStatusTable>(m, "AttentionToFfnHostStatusTable")
+        .def(pybind11::init<>())
+        .def("reset", &AttentionToFfnHostStatusTable::Reset)
+        .def("completed_round", &AttentionToFfnHostStatusTable::CompletedRound)
+        .def("device_ptr", &AttentionToFfnHostStatusTable::DevicePtr);
 }
 } // namespace op_api

@@ -119,7 +119,7 @@
     <tr>
     <td>cclBufferSize</td>
     <td>属性</td>
-    <td>CCL通信缓冲区总大小（Bytes），由 <code>get_ffn_to_attention_ccl_buffer_size</code> 接口计算得到。需覆盖全部 attention worker 的下发接收区、flag source 区与地址表区（按2MB向上对齐）。</td>
+    <td>CCL通信缓冲区总大小（Bytes），需 >= 本算子写入attention侧窗口的落地区（per-token flag区 + 单会话FP16/BF16回写数据区，按2MB向上对齐）；<code>get_ffn_to_attention_ccl_buffer_size</code> 接口返回覆盖attention_to_ffn下发接收区的保守容量，恒满足该下限。</td>
     <td>INT64</td>
     <td>-</td>
     </tr>
@@ -130,7 +130,7 @@
 ## 约束说明
 
 - 所有rank使用的`group`、`worldSize`、`tokenInfoTableShape`、`tokenDataShape`和`cclBufferSize`必须保持一致。
-- 本算子与`attention_to_ffn`共用同一rank通信窗口（注册tag相同），本算子的flag source区与地址表/count行区布局在全部N个会话的下发接收区之后，与对侧会话数据区互不重叠。会话数`N`（即对侧`attentionWorkerNum`/`ffn_token_data_shape[0]`）的确定方式：传入`attnRankTable`时`N`为其dim0（须满足`0 < N < worldSize`），tiling按N精确校验`cclBufferSize`并精确布局；未传入时按`cclBufferSize`所能容纳的最大会话数推导布局，此时`cclBufferSize`须按保守容量（`worldSize - 1`个会话，即`get_ffn_to_attention_ccl_buffer_size`的默认计算结果）分配，以保证推导出的会话数不小于真实值。
+- 本算子与`attention_to_ffn`共用同一rank通信窗口（注册tag相同）。本算子仅回写各attention worker自身窗口槽位：per-token flag区 + 单会话紧凑FP16/BF16回写数据区，写入偏移与attention worker数量无关；attention侧窗口须容纳该落地区（attention侧窗口大小由`get_buffer_for_attention_to_ffn`计算，其tiling已校验）。`attention_to_ffn`下发的N会话接收区布局在FFN侧窗口，其大小依赖对侧`quant_mode`（量化按1B、非量化按2B），由`attention_to_ffn_v2`的tiling自行校验，本算子不再按非量化宽度保守镜像。传入`attnRankTable`时其dim0（attention worker数`N`）须满足`0 < N < worldSize`。
 - 所有rank必须先完成MC2 context初始化。FFN Worker执行算子期间，Attention Worker必须保持context、通信window和通信域有效。
 - 通信内存的销毁必须晚于接收算子执行完成，否则URMA写的源地址与目标地址失效，将导致数据丢失、写入异常或业务挂死。本算子通过URMA单向写将token数据与flag异步写入Attention侧窗口，发送侧算子返回不代表对侧已完成数据消费。
 - shape取值需满足以下约束：
@@ -145,19 +145,22 @@
 
 - `cclBufferSize`为HBM上分配的通信window总大小，单位为Byte，必须大于0并满足：
 
-$$cclBufferSize \ge \mathrm{CeilAlign}\big(\mathrm{CeilAlign}(\mathrm{recvInfoSize} + \mathrm{recvDataSize} + 32\,\mathrm{KiB},\,512) + \mathrm{tableBytes},\ 2\,\mathrm{MB}\big)$$
+$$cclBufferSize \ge \mathrm{CeilAlign}\big(\mathrm{CeilAlign}(\mathrm{flagSize},\,512) + \mathrm{CeilAlign}(\mathrm{returnDataSize},\,512),\ 2\,\mathrm{MB}\big)$$
 
-其中（`sessionNum`为布局会话数：传入`attnRankTable`时为其dim0，未传入时为保守上界`worldSize - 1`；`get_ffn_to_attention_ccl_buffer_size`接口默认按`worldSize - 1`计算）：
+其中：
 
-  - `recvInfoSize = CeilAlign(sessionNum × microBatchNum × (2 + BS × expertNumPerToken) × 4B, 512)`（`attention_to_ffn` 下发的 N 会话 token 信息表区，镜像其对侧布局公式）
-  - `recvDataSize = CeilAlign(sessionNum × microBatchNum × BS × expertNumPerToken × HS × 2B, 512)`（`attention_to_ffn` 下发的 N 会话 token 数据区；2B 为对侧非量化元素宽度，量化模式下按 1B 下发，此处为保守上界）
-  - `tableBytes = worldSize × rankTableStride + 1025 × countRowStride`（各rank地址表与AIV计数行；1025 = 1条总计数行 + 1024条AIV预留计数行）
-  - `rankTableStride = CeilAlign(worldSize × microBatchNum × BS × expertNumPerToken × 16B, 512)`
-  - `countRowStride = CeilAlign(worldSize × 4B, 512)`
+  - `flagSize = microBatchNum × BS × expertNumPerToken × 4B`（本算子写入attention侧窗口的per-token flag区）
+  - `returnDataSize = microBatchNum × BS × expertNumPerToken × HS × 2B`（本算子写入attention侧窗口的单会话紧凑FP16/BF16回写数据区，写入偏移与attention worker数量无关）
 
-本算子的 flag source 区与地址表/count 行区布局在上述 N 会话接收区之后，与 `attention_to_ffn` 的会话数据区互不重叠。
+原窗口尾部的本算子 flag source 区与地址表/count 行区已改为从算子 workspace 申请，大小由 tiling 自动计算，用户无需感知。
 
-可通过`get_ffn_to_attention_ccl_buffer_size`接口计算所需最小值（保守容量）。
+`attention_to_ffn`下发的N会话接收区布局在FFN侧窗口，其大小依赖对侧`quant_mode`（量化按1B、非量化按2B下发），由`attention_to_ffn_v2`的tiling按实际元素宽度校验，本算子不按非量化宽度保守镜像。`get_ffn_to_attention_ccl_buffer_size`接口返回按`worldSize - 1`个会话、非量化宽度计算的保守容量，作为FFN侧窗口（承接对侧下发数据）的推荐分配值仍然适用。
+
+- 异步发送与Tensor保活延迟释放：
+  - kernel退出时在途WQE可能尚未完成（通信引擎可能仍在读取`x`的GM行；有序flag WQE读取的本rank workspace flag槽位每轮重写值恒为同一常量，其生命周期由下一轮kernel开头的在途WQE回收与destroy的device级同步保证）。算子通过"设备完成通知驱动CPU延迟释放"机制保证源内存生命周期：torch_extension侧按轮次持有输入`x`的引用（仅引用，不拷贝）；下一轮kernel开头先回收前几轮的在途WQE（空闲channel立即返回，不引入每轮同步等待），随后由AIV0把已完成轮次写入注册的Host状态表；CPU侧在下一次调用时非阻塞轮询该状态表并释放已完成轮次的引用。
+  - 因此同一buffer上的调用需满足：全部经由torch_extension的`ffn_to_attention`接口发起（保证轮次编号与kernel启动序号一致），且使用同一条stream。
+  - 最后若干轮的引用在`FFNToAttentionBuffer.destroy()`中通过device级同步统一等待并释放；直接丢弃buffer对象同样安全（状态表析构会执行相同的device同步）。
+  - 该机制依赖通信域内无其他算子共享channel（见下述通信域使用约束），drain只回收本算子发出的WQE。
 
 - 通信域使用约束：
     - FFNToAttentionV2算子的通信域中不允许有其他算子。

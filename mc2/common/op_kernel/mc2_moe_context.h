@@ -31,6 +31,8 @@ struct Mc2MoeContext {
     bool enableGroupSend;
     uint64_t roceHcclBuffer_[HCCL_MAX_RANK_SIZE];
     uint64_t roceBufferSize; // 本地与各对端注册窗容量一致。
+    uint64_t hostStatusTableAddr;
+    uint64_t completedRounds;
 };
 
 struct MoeCommContext {

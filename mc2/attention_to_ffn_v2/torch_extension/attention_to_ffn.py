@@ -184,6 +184,12 @@ class AttentionToFfnBuffer:
     buffer size is always computed internally from the FFN-side token shapes
     and exposed as ``ccl_buffer_size`` (the size of the remote FFN windows the
     attention_to_ffn op writes to).
+
+    The buffer also owns the async tensor keepalive state: a registered
+    (device-writable) host status table that kernels use to publish completed
+    send rounds, and the per-round references of in-flight input tensors.
+    Call ``destroy()`` (or drop the last reference) to wait for the final
+    round's in-flight sends and release everything.
     """
 
     def __init__(
@@ -237,6 +243,23 @@ class AttentionToFfnBuffer:
             window_size if window_size is not None else self.ccl_buffer_size
         )
 
+        # Async send-completion status table: registered (device-writable) host memory. The
+        # kernel publishes the highest fully-completed send round into slot 0, and the Python
+        # side polls it without any device synchronization to release keepalive references.
+        op_module = _attention_to_ffn_op_builder.load()
+        self._status_table = op_module.AttentionToFfnHostStatusTable()
+        host_status_table_addr = self._status_table.device_ptr()
+        # 0 would silently disable the kernel-side completion report, so the keepalive
+        # references would never be released; fail loudly instead.
+        torch._check(
+            host_status_table_addr > 0,
+            lambda: (
+                f"hostStatusTableAddr should be a positive device address "
+                f"(status table device_ptr()), but got {host_status_table_addr}, "
+                f"{ops_error(ErrCode.VALUE)}."
+            ),
+        )
+
         self._ctx_manager = CommContextManager(
             self.group_name,
             self.ep_world_size,
@@ -250,11 +273,38 @@ class AttentionToFfnBuffer:
             customCclBufferSize=self.window_size,
             customDeviceBufferAddr=window_addr if window_addr is not None else 0,
             multiChannel=True,
+            hostStatusTableAddr=host_status_table_addr,
         )
         self.context = self._ctx_manager.create_context()
+        self._device = self.context.device
+
+        # Tensor keepalive for async sends: round_id -> tensors still read by in-flight WQEs.
+        # Only references are held (no copy); entries are dropped once the device confirms the
+        # round completed. Round ids match the kernel launch ordinal on this buffer's context
+        # (both start at 0 and advance once per call, launches are stream-ordered), so all
+        # sends of one buffer must go through the attention_to_ffn wrapper of this buffer.
+        self._keepalive = {}
+        self._next_round_id = 0
+        self._launch_stream = None
 
     def destroy(self):
+        """Release the buffer and every retained resource.
+
+        This is the explicit end-of-life wait of the async tensor keepalive: a device-wide
+        synchronization retires all kernels and every in-flight WQE first, after which the
+        keepalive references are dropped and the registered status-table host memory is
+        unregistered. Skipping ``destroy`` and dropping the last reference also works (the
+        status table's destructor performs the same device drain), but the explicit call
+        makes the wait observable and deterministic.
+        """
+        if self.context is None:
+            return
+        torch.npu.synchronize(self._device)
+        self._keepalive.clear()
+        self._status_table = None
         self._ctx_manager.destroy()
+        self.context = None
+        self._launch_stream = None
 
     def get_window_addr(self) -> int:
         """Get the local window memory device address from the context."""
@@ -335,6 +385,44 @@ def get_buffer_for_attention_to_ffn(
     )
 
 
+def _release_completed_rounds(buffer: AttentionToFfnBuffer) -> None:
+    """Drop keepalive references of rounds the device already confirmed complete.
+
+    Non-blocking: reads slot 0 of the registered host status table (a volatile host-memory
+    read, no device synchronization). The kernel maintains the invariant that every WQE
+    posted before the launch of round N is retired once the table reports N - 1, so
+    releasing rounds <= completed is safe even though the current round is still in flight.
+    """
+    status_table = buffer._status_table
+    if status_table is None:
+        return
+    completed = status_table.completed_round()
+    if completed < 0 or not buffer._keepalive:
+        return
+    for round_id in [r for r in buffer._keepalive if r <= completed]:
+        del buffer._keepalive[round_id]
+
+
+def _check_launch_stream(buffer: AttentionToFfnBuffer) -> None:
+    """All launches on one buffer must share the launch stream.
+
+    The keepalive round ids mirror the kernel launch ordinal on the buffer's context, which
+    only holds while launches are stream-ordered; the operator itself (shared workspace and
+    cross-AIV SyncAll) already assumes sequential same-stream execution.
+    """
+    stream = torch.npu.current_stream(buffer._device)
+    if buffer._launch_stream is None:
+        buffer._launch_stream = stream
+    else:
+        torch._check(
+            stream == buffer._launch_stream,
+            lambda: (
+                "attention_to_ffn must use the stream of its first launch on this buffer "
+                f"while async sends are in flight, {ops_error(ErrCode.VALUE)}."
+            ),
+        )
+
+
 def attention_to_ffn(
     buffer: AttentionToFfnBuffer,
     x: torch.Tensor,
@@ -379,7 +467,38 @@ def attention_to_ffn(
 
     Returns:
         None. Data is sent to peer ranks via the HCCL window; no host-visible output.
+
+    Note:
+        The send is asynchronous: the kernel may return while the communication engine is
+        still reading ``x`` (non-quant direct send reads the x GM rows through the relay
+        WQEs). This wrapper therefore keeps ``x`` alive per round and releases it only after
+        the device confirms the round's sends completed (polled lazily on the next call, or
+        on ``AttentionToFfnBuffer.destroy()`` for the final round). Launches on one buffer
+        must stay on the launch stream, and every launch must go through this wrapper so the
+        round bookkeeping matches the kernel.
     """
+    torch._check(
+        buffer.context is not None,
+        lambda: (
+            "attention_to_ffn cannot be called after the buffer has been destroyed, "
+            f"{ops_error(ErrCode.VALUE)}."
+        ),
+    )
+    torch._check(
+        x.device == buffer._device,
+        lambda: (
+            "attention_to_ffn requires x and buffer to be on the same device, "
+            f"but got x.device={x.device}, buffer.device={buffer._device}, "
+            f"{ops_error(ErrCode.VALUE)}."
+        ),
+    )
+    _check_launch_stream(buffer)
+    round_id = buffer._next_round_id
+    buffer._next_round_id += 1
+    # Keepalive: hold the reference only (no copy); the in-flight WQEs of this round may
+    # still read x's storage after the kernel returns.
+    buffer._keepalive[round_id] = x
+
     torch.ops.cann_ops_transformer.npu_attention_to_ffn(
         buffer.context,
         x,
@@ -401,3 +520,7 @@ def attention_to_ffn(
         scales=scales,
         active_mask=active_mask,
     )
+
+    # Lazy release: the kernel (when it already ran) published the completed round to the
+    # host status table; finished rounds' references are dropped here without blocking.
+    _release_completed_rounds(buffer)

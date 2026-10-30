@@ -75,6 +75,10 @@ struct CommContext {
     ChannelHandle hcommHandle_[HCCL_MAX_RANK_SIZE] = {}; // ROCE或者URMA通信所需句柄
     uint32_t channelsPerRank = 0; // 每个rank的channel数量，0表示未启用多channel（紧凑布局）
     bool enableGroupSend = false;
+    uint64_t roceHcclBuffer_[HCCL_MAX_RANK_SIZE] = {};
+    uint64_t roceBufferSize = 0; // 本地与各对端注册窗容量一致。
+    uint64_t hostStatusTableAddr = 0;
+    uint64_t completedRounds = static_cast<uint64_t>(-2);
 };
 
 // ======================== Common Types and Utilities ========================
@@ -237,7 +241,8 @@ public:
     void Build(const std::string& group, int64_t worldSize, int64_t& cclBufferSize, at::Tensor& contextTensor,
                const std::string& commAlg, const std::string& opName, int64_t customCclBufferSize = 0,
                const py::object& customCclBufferSizeResolver = py::none(), void* userDeviceBuffer = nullptr,
-               void** customDeviceBuffer = nullptr, HcclMemHandle* customMemHandle = nullptr, bool multiChannel = false)
+               void** customDeviceBuffer = nullptr, HcclMemHandle* customMemHandle = nullptr, bool multiChannel = false,
+               int64_t hostStatusTableAddr = 0)
     {
         ASCEND_LOGI("Start to get CommContext Tensor, group: %s", group.c_str());
         InitHcclEngineCtxFunctions();
@@ -259,6 +264,7 @@ public:
         GetCommProtocol(hcclHandle, protocol);
         rankNumPerServer_ = rankNumPerUbDomain_;
         ResolveCustomCclBufferSize(worldSize, customCclBufferSizeResolver);
+
         if (commAlg == "urma" && multiChannel_) {
             CheckIsMixLayered(hcclHandle);
         }
@@ -266,6 +272,12 @@ public:
         CommContext commContextStruct;
         BuildContext(hcclHandle, group, opName, protocol, commContextStruct, cclBufferSize);
         commContextStruct.rankSizePerServer = rankNumPerServer_;
+        TORCH_CHECK(hostStatusTableAddr >= 0, "hostStatusTableAddr must be a non-negative device address, got ",
+                    hostStatusTableAddr);
+        TORCH_CHECK(hostStatusTableAddr == 0 || hostStatusTableAddr % static_cast<int64_t>(sizeof(uint64_t)) == 0,
+                    "hostStatusTableAddr must be aligned to ", sizeof(uint64_t),
+                    " bytes when enabled (kernel writes int64 slots), got ", hostStatusTableAddr);
+        commContextStruct.hostStatusTableAddr = static_cast<uint64_t>(hostStatusTableAddr);
 
         CopyContextToTensor(commContextStruct, contextTensor);
         ASCEND_LOGI("Get CommContext Tensor Success, group: %s, ccl_buffer_size: %ld", group.c_str(), cclBufferSize);
@@ -571,7 +583,6 @@ public:
             linkEndpoint.commAddr.type != instanceEndpoint.commAddr.type) {
             return false;
         }
-
         const auto& lhs = linkEndpoint.commAddr;
         const auto& rhs = instanceEndpoint.commAddr;
         switch (lhs.type) {
@@ -791,7 +802,6 @@ public:
         std::vector<uint32_t> layerIds(layerList, layerList + layerNum);
         std::vector<uint32_t> customLayers;
         std::array<bool, MIX_LAYERED> found = {};
-
         SelectExplicitMixLayers(commHandle, layerIds, srcRankId, rankSize, customLayers, found);
         SelectCustomMixLayers(commHandle, customLayers, srcRankId, rankSize, found);
         mixLayeredInfo_.isUseMixLayered = found[MIX_CLOS_SLOT] && found[MIX_MESH_SLOT];
@@ -1173,7 +1183,7 @@ public:
     CommContextManager(const std::string& group, int64_t worldSize, const py::object& backend = py::str("kfc"),
                        const std::string& commAlg = "ub-mem", const std::string& opName = "moe_dispatch_ffn_combine",
                        int64_t customCclBufferSize = 0, const py::object& customCclBufferSizeResolver = py::none(),
-                       int64_t customDeviceBufferAddr = 0, bool multiChannel = false)
+                       int64_t customDeviceBufferAddr = 0, bool multiChannel = false, int64_t hostStatusTableAddr = 0)
         : group_(group),
           commAlg_(commAlg),
           opName_(opName),
@@ -1186,7 +1196,8 @@ public:
           customCclBufferSize_(customCclBufferSize),
           customCclBufferSizeResolver_(customCclBufferSizeResolver),
           customDeviceBufferAddr_(customDeviceBufferAddr),
-          multiChannel_(multiChannel)
+          multiChannel_(multiChannel),
+          hostStatusTableAddr_(hostStatusTableAddr)
     {}
 
     ~CommContextManager()
@@ -1303,7 +1314,7 @@ private:
                 HcclChannelContextBuilder builder;
                 builder.Build(group_, worldSize_, cclBufferSize_, tensor, commAlg_, opName_, customCclBufferSize_,
                               customCclBufferSizeResolver_, userDeviceBuffer, &customDeviceBuffer_, &customMemHandle_,
-                              multiChannel_);
+                              multiChannel_, hostStatusTableAddr_);
                 if (userDeviceBuffer != nullptr) {
                     TORCH_CHECK(customDeviceBuffer_ == userDeviceBuffer,
                                 "customDeviceBuffer was not adopted: a context for this group/opName already "
@@ -1341,6 +1352,7 @@ private:
     int64_t customDeviceBufferAddr_ = 0;
     bool ownsDeviceBuffer_ = true;
     bool multiChannel_ = false;
+    int64_t hostStatusTableAddr_ = 0;
     void* customDeviceBuffer_ = nullptr;
     void* localDeviceBuffer_ = nullptr;
     HcclMemHandle customMemHandle_ = nullptr;
@@ -1351,11 +1363,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     py::class_<CommContextManager>(m, "CommContextManager")
         .def(py::init<const std::string&, int64_t, const py::object&, const std::string&, const std::string&, int64_t,
-                      const py::object&, int64_t, bool>(),
+                      const py::object&, int64_t, bool, int64_t>(),
              py::arg("group"), py::arg("worldSize"), py::arg("backend") = std::string("kfc"),
              py::arg("commAlg") = std::string("ub-mem"), py::arg("opName") = std::string("moe_dispatch_ffn_combine"),
              py::arg("customCclBufferSize") = 0, py::arg("customCclBufferSizeResolver") = py::none(),
-             py::arg("customDeviceBufferAddr") = 0, py::arg("multiChannel") = false)
+             py::arg("customDeviceBufferAddr") = 0, py::arg("multiChannel") = false, py::arg("hostStatusTableAddr") = 0)
         .def("create_context", &CommContextManager::CreateContext)
         .def("update_group", &CommContextManager::UpdateGroup, py::arg("group"), py::arg("contextTensor").noconvert())
         .def("destroy", &CommContextManager::Destroy)

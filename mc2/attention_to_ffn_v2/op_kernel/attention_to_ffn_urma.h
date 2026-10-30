@@ -57,7 +57,6 @@ namespace AttentionToFFNImpl {
 #define ATTN_FFN_URMA_SHARED_CONSTANTS
 constexpr uint8_t BUFFER_NUM = 2;
 constexpr uint32_t UB_ALIGN = 32;
-constexpr uint8_t WIN_OFFSET_CNT = 2;
 constexpr uint32_t SCALE_PARAM_PAD_SIZE = 128;
 constexpr uint32_t WIN_ALIGN = 512;
 constexpr uint32_t REP_STRIDE = 8;
@@ -66,6 +65,7 @@ constexpr uint32_t DYNAMIC_QUANT = 2;
 constexpr uint32_t MX_QUANT = 3;
 constexpr uint32_t MX_CLIP_QUANT = 4;
 constexpr uint32_t RANK_OFFSET_STRIDE = 2;
+// (toRankId, localExpId) pair stride, in int32 elements, inside expertRankResolveTensor_.
 constexpr uint32_t RANK_RESOLVE_STRIDE = 2;
 constexpr uint32_t TOKEN_INFO_TABLE_RS = 2;
 constexpr uint32_t TOKEN_INFO_TABLE_COPY_BLOCK_CNT = 2;
@@ -89,17 +89,15 @@ __aicore__ constexpr bool IsMxOrMxClipQuant(uint32_t qm)
 #endif // ATTN_FFN_URMA_SHARED_CONSTANTS
 
 constexpr uint32_t URMA_HCOMM_INIT_SIZE = 512U;
-constexpr uint32_t URMA_FLAG_SLOT_SIZE = 32U;
 constexpr int32_t URMA_FLAG_VALUE = 1;
 
 constexpr uint32_t HCOMM_BATCH_WQE_BYTES = 64U;
-constexpr uint32_t HCOMM_CQE_SCRATCH_BYTES = 64U;
 constexpr uint32_t URMA_BATCH_WQE_CAPACITY = 16U * 1024U / HCOMM_BATCH_WQE_BYTES;
-constexpr uint32_t ATTN_FFN_HCOMM_BATCH_UB_BYTES =
-    URMA_BATCH_WQE_CAPACITY * HCOMM_BATCH_WQE_BYTES + HCOMM_CQE_SCRATCH_BYTES;
+// Exactly capacity WQEBBs: the hcomm runtime writes no CQE scratch beyond the WQEs themselves
+// (same sizing as moe_ep_combine's cqe=1 batches and ffn_to_attention_v2's batch buffer).
+constexpr uint32_t ATTN_FFN_HCOMM_BATCH_UB_BYTES = URMA_BATCH_WQE_CAPACITY * HCOMM_BATCH_WQE_BYTES;
 
-// Compact per-rank token tables (counting-sort layout) for the relay phase. rankInfoBuf_ layout:
-// [bucket fill counts | running write prefix | per-rank totals | table start], one row each.
+constexpr uint32_t ATTN_FFN_STATUS_TABLE_SLOTS = 4U;
 constexpr uint32_t RANK_INFO_SEGMENT_NUM = 4U;
 constexpr uint32_t RANK_INFO_COUNT_SEG_IDX = 0U;
 constexpr uint32_t RANK_INFO_PREFIX_SEG_IDX = 1U;
@@ -110,7 +108,9 @@ constexpr uint32_t BUCKET_GROUP_TOKEN_MAX = 256U;
 
 static constexpr AscendC::UrmaWqeEntry REMOTE_DATA_WQE_CONFIG = {.odr = 5, .fence = 1, .se = 0, .inlineEn = 0};
 static constexpr AscendC::UrmaWqeEntry REMOTE_ORDERED_FLAG_WQE_CONFIG = {.odr = 6, .fence = 1, .se = 1, .inlineEn = 0};
-constexpr uint32_t FLAG_ELEM_STRIDE = URMA_FLAG_SLOT_SIZE / sizeof(int32_t);
+static constexpr AscendC::UrmaWqeEntry REMOTE_ORDERED_FLAG_CQE_WQE_CONFIG = {
+    .odr = 6, .fence = 1, .se = 1, .cqe = 1, .inlineEn = 0};
+constexpr uint64_t RELAY_MERGE_MAX_BYTES = 2U * 1024U * 1024U;
 using HcommBatchHandle = AscendC::BatchHandle<AscendC::ChannelHandle>;
 
 struct AttentionToFfnTokenMetaData {
@@ -119,8 +119,6 @@ struct AttentionToFfnTokenMetaData {
     int32_t dstExpertId;
     int32_t toRankId;
     int32_t localExpId;
-    GM_ADDR remoteDataAddr;
-    GM_ADDR remoteFlagAddr;
     GM_ADDR localDataAddr;
 };
 
@@ -146,17 +144,24 @@ public:
 
 private:
     __aicore__ inline void HcommInit();
-    __aicore__ inline void ReadTokenMetaData(AttentionToFfnTokenMetaData& metaData, uint32_t tokenOffset);
+    __aicore__ inline void ReadTokenMetaData(AttentionToFfnTokenMetaData& metaData, uint32_t tokenOffset,
+                                             uint32_t tokenId, uint32_t topkId);
     __aicore__ inline GM_ADDR GetWindowAddr(int32_t rankId);
     __aicore__ inline uint64_t GetUrmaCommHandle(uint32_t dstRank, uint32_t channelIndex = 0U);
-    __aicore__ inline void CopyTokenDataToGM(const AttentionToFfnTokenMetaData& metaData, GM_ADDR targetAddr,
-                                             const DataCopyExtParams& xCopyParams);
-    __aicore__ inline void StageRemoteData(const AttentionToFfnTokenMetaData& metaData,
-                                           const DataCopyExtParams& xCopyParams);
+    __aicore__ inline void LoadXRow(uint32_t tokenId, const DataCopyExtParams& xCopyParams);
+    __aicore__ inline void StageRowEntry(const AttentionToFfnTokenMetaData& metaData,
+                                         const DataCopyExtParams& xCopyParams,
+                                         const DataCopyExtParams& hCommuCopyParams, bool rowQuantShared,
+                                         bool& rowPayloadReady);
+    __aicore__ inline void ReleaseRowPayload(bool rowQuantShared);
     __aicore__ inline void AppendRemoteDataWrite(HcommBatchHandle& batchHandle, GM_ADDR remoteDataAddr,
-                                                 GM_ADDR sourceDataAddr);
+                                                 GM_ADDR sourceDataAddr, uint64_t byteLen);
     __aicore__ inline void AppendRemoteFlagWrite(HcommBatchHandle& batchHandle, GM_ADDR remoteFlagAddr,
-                                                 uint32_t sourceTokenOffset);
+                                                 uint32_t sourceTokenOffset, uint32_t tokenCount);
+    __aicore__ inline void RelayRunDataWrites(HcommBatchHandle& batchHandle, GM_ADDR toRankAddr,
+                                              uint32_t runTokenOffset, uint32_t runLen, uint32_t& preparedWqeCount);
+    __aicore__ inline void RelayRunFlagWrites(HcommBatchHandle& batchHandle, GM_ADDR toRankAddr,
+                                              uint32_t runTokenOffset, uint32_t runLen, uint32_t& preparedWqeCount);
     __aicore__ inline void BuildRankTableOffsets();
     __aicore__ inline void ScatterTokensToRankTables();
     __aicore__ inline void RelayRemoteTokens(uint32_t dstRank, uint32_t channelIdx);
@@ -165,12 +170,15 @@ private:
     __aicore__ inline void QuantInit(GM_ADDR scales);
     __aicore__ inline void QuantProcess(uint32_t expertIndex);
     __aicore__ inline void ReduceMaxInplace(const LocalTensor<float>& srcLocal, uint32_t count);
+    __aicore__ inline float ComputeDynamicScale(const LocalTensor<float>& srcLocal);
     __aicore__ inline void SplitToCore(uint32_t curSendCnt, uint32_t curUseAivNum, uint32_t& startTokenId,
-                                       uint32_t& endTokenId, uint32_t& sendTokenNum);
+                                       uint32_t& sendTokenNum);
     __aicore__ inline void SetFlagToFFN();
     __aicore__ inline void SetFlagInAttn();
     __aicore__ inline void ClearAttnActiveFlags();
     __aicore__ inline void ActiveMaskCalCnt();
+    __aicore__ inline bool CheckPreviousSends();
+    __aicore__ inline void ReportSendCompletion();
 
     TPipe* tpipe_{nullptr};
     Hcomm<COMM_PROTOCOL_UBC_CTP> hcomm_;
@@ -187,6 +195,8 @@ private:
     uint32_t countRowStride_{0};
     uint32_t entriesPerRank_{0};
     uint32_t groupTokenMax_{0};
+    uint32_t relayDataSegTokenMax_{1};
+    uint32_t relayFlagSegTokenMax_{1};
 
     GlobalTensor<XType> xGMTensor_;
     GlobalTensor<int32_t> sessionIdGMTensor_;
@@ -203,6 +213,7 @@ private:
     LocalTensor<int32_t> statusTensor_;
     LocalTensor<StorageXOutType> xOutTensor_;
     LocalTensor<int32_t> ffnStatusTensor_;
+    LocalTensor<int32_t> syncStatusWorkspaceTensor_;
     LocalTensor<float> smoothScalesTensor_;
     LocalTensor<int32_t> expertIdsTensor_;
     LocalTensor<int32_t> expertRankResolveTensor_;
@@ -220,18 +231,22 @@ private:
     TBuf<> activeMaskBuf_;
     TBuf<> castTempBuf_;
     TBuf<> ffnStatusBuf_;
+    TBuf<> syncStatusWorkspaceBuf_;
     TBuf<> hcommBuf_;
     TBuf<> hcommBatchBuf_;
     TBuf<> flagValueBuf_;
     TBuf<> tokenRankScratchBuf_;
     TBuf<> bucketBuf_;
     TBuf<> rankInfoBuf_;
+    // Per-rank URMA window base addresses cached in UB by Init (epHcclBuffer_ is GM-resident and
+    // stable for the whole kernel), so the relay/flag lookups read UB instead of GM.
+    TBuf<> rankWinBaseBuf_;
+    LocalTensor<uint64_t> rankWinBaseTensor_;
     LocalTensor<uint8_t> hcommBatchWqeTensor_;
     TQueBind<QuePosition::VECIN, QuePosition::VECOUT, 1> xQueue_;
     TQue<QuePosition::VECIN, 1> xInQueue_;
     TQue<QuePosition::VECOUT, 1> xOutQueue_;
 
-    int32_t dstExpertId_{0};
     int32_t toRankId_{0};
     int32_t localExpId_{0};
 
@@ -261,6 +276,10 @@ private:
     uint32_t expertIdsCnt_{0};
     uint32_t totalSendNum_{0};
     uint32_t remoteFlagCnt_{0};
+    uint32_t sendStartTokenId_{0};
+    uint32_t sendTokenNum_{0};
+    // First token row of this AIV's expert_ids slice; expert_ids reads subtract it.
+    uint32_t expertIdsBaseTokenId_{0};
     uint32_t quantMode_{0};
     uint32_t hOutSizeAlign_{0};
     uint32_t curBsCnt_{0};
@@ -273,8 +292,16 @@ private:
     uint64_t layIdsExpRankTableOffset_{0};
     uint64_t winTokenDataOffset_{0};
     uint64_t winInfoTableOffset_{0};
-    uint64_t winOffset_[WIN_OFFSET_CNT]{0, 0};
+    uint64_t winDataBaseByte_{0};
+    uint64_t winFlagBaseByte_{0};
+    uint64_t remoteSlotBytes_{0};
     bool isScales_{false};
+    // ---- Tensor保活延迟释放（异步发送完成状态表）----
+    // statusTableGM_为context下发的已注册（设备可写）Host状态表设备地址，nullptr表示未启用；
+    // completedRounds_为上一个kernel发布的"已完成轮次"P（本kernel检查完前序WQE后发布P+1；
+    // 首个kernel读到host初始化的-2，发布-1）。
+    GM_ADDR statusTableGM_{nullptr};
+    uint64_t completedRounds_{0};
 };
 
 template <TemplateAttentionToFfnUrmaTypeClass>
@@ -341,23 +368,35 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::I
     aivWorkspaceOffset_ = Ceil(ffnNum_ * sizeof(int32_t), WORKSPACE_ELEMENT_OFFSET) * WORKSPACE_ELEMENT_OFFSET;
     axisBsAlignSize_ = Ceil(axisBS_ * sizeof(bool), UB_ALIGN) * UB_ALIGN;
 
-    uint32_t expertIdsAlign = Ceil(expertIdsCnt_ * sizeof(int32_t), UB_ALIGN) * UB_ALIGN;
+    uint32_t maxTotalSendNum = expertIdsCnt_;
+    uint32_t maxTokensPerAiv = Ceil(maxTotalSendNum, aivNum_);
+    uint32_t maxRowsPerAiv = Ceil(maxTokensPerAiv, axisK_ + sharedExpertNum_) + 1U;
+    uint32_t expertIdsSliceElems = maxRowsPerAiv * axisK_;
+    uint32_t expertIdsElems = (expertIdsSliceElems > maxTokensPerAiv) ? expertIdsSliceElems : maxTokensPerAiv;
+    uint32_t expertIdsAlign = Ceil(expertIdsElems * sizeof(int32_t), UB_ALIGN) * UB_ALIGN;
     tpipe_->InitBuffer(expertIdsBuf_, expertIdsAlign);
     expertIdsTensor_ = expertIdsBuf_.Get<int32_t>();
     tpipe_->InitBuffer(statusBuf_, UB_ALIGN);
     statusTensor_ = statusBuf_.Get<int32_t>();
+    {
+        GlobalTensor<uint64_t> ctxTailGM;
+        ctxTailGM.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(&mc2Context_->hostStatusTableAddr));
+        DataCopyExtParams tailCopyParams{1U, sizeof(uint64_t) * 2U, 0U, 0U, 0U};
+        DataCopyPadExtParams<uint64_t> tailPadParams{false, 0U, 0U, 0U};
+        LocalTensor<uint64_t> tailTensor = statusTensor_.ReinterpretCast<uint64_t>();
+        DataCopyPad(tailTensor, ctxTailGM, tailCopyParams, tailPadParams);
+        SyncFunc<HardEvent::MTE2_S>();
+        statusTableGM_ = reinterpret_cast<GM_ADDR>(tailTensor.GetValue(0));
+        completedRounds_ = tailTensor.GetValue(1);
+    }
     uint32_t expertRankResolveBytes = Ceil(RANK_RESOLVE_STRIDE * expertNum_ * sizeof(int32_t), UB_ALIGN) * UB_ALIGN;
     tpipe_->InitBuffer(expertRankResolveBuf_, expertRankResolveBytes);
     expertRankResolveTensor_ = expertRankResolveBuf_.Get<int32_t>();
 
-    uint32_t maxTotalSendNum = axisX_ * axisBS_ * (axisK_ + sharedExpertNum_);
-    uint32_t maxTokensPerAiv = Ceil(maxTotalSendNum, aivNum_);
-    uint32_t flagValueBufSize = Ceil(maxTokensPerAiv * URMA_FLAG_SLOT_SIZE, UB_ALIGN) * UB_ALIGN;
+    uint32_t flagValueBufSize = Ceil(maxTokensPerAiv * sizeof(int32_t), UB_ALIGN) * UB_ALIGN;
     tpipe_->InitBuffer(flagValueBuf_, flagValueBufSize);
     flagValueTensor_ = flagValueBuf_.Get<int32_t>();
 
-    // The rank stash only feeds this AIV's scatter pass; the relay phase reads the compact
-    // per-rank token tables in GM instead of the full cross-AIV scratch.
     uint32_t tokenRankStashBytes = Ceil(maxTokensPerAiv * sizeof(int32_t), UB_ALIGN) * UB_ALIGN;
     tpipe_->InitBuffer(tokenRankScratchBuf_, tokenRankStashBytes);
     tokenRankScratchTensor_ = tokenRankScratchBuf_.Get<int32_t>();
@@ -366,6 +405,17 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::I
     rankCountElements_ =
         static_cast<uint32_t>(Ceil(worldSize_ * sizeof(int32_t), UB_ALIGN) * UB_ALIGN / sizeof(int32_t));
     tpipe_->InitBuffer(rankInfoBuf_, RANK_INFO_SEGMENT_NUM * rankCountElements_ * sizeof(int32_t));
+    const uint32_t winBaseRankNum = (worldSize_ == 0U) ? 1U : worldSize_;
+    tpipe_->InitBuffer(rankWinBaseBuf_, Ceil(winBaseRankNum * sizeof(uint64_t), UB_ALIGN) * UB_ALIGN);
+    rankWinBaseTensor_ = rankWinBaseBuf_.Get<uint64_t>();
+    if (worldSize_ > 0U) {
+        GlobalTensor<uint64_t> winBaseGM;
+        winBaseGM.SetGlobalBuffer((__gm__ uint64_t*)&mc2Context_->epHcclBuffer_[0]);
+        DataCopyExtParams winBaseCopyParams{1U, worldSize_ * static_cast<uint32_t>(sizeof(uint64_t)), 0U, 0U, 0U};
+        DataCopyPadExtParams<uint64_t> winBasePadParams{false, 0U, 0U, 0U};
+        DataCopyPad(rankWinBaseTensor_, winBaseGM, winBaseCopyParams, winBasePadParams);
+        SyncFunc<HardEvent::MTE2_S>();
+    }
 
     if constexpr (QuantMode != 0) {
         QuantInit(scales);
@@ -379,6 +429,8 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::I
     if constexpr (isSync) {
         tpipe_->InitBuffer(ffnStatusBuf_, ffnNumAlignSize_);
         ffnStatusTensor_ = ffnStatusBuf_.Get<int32_t>();
+        tpipe_->InitBuffer(syncStatusWorkspaceBuf_, aivNum_ * ffnNumAlignSize_);
+        syncStatusWorkspaceTensor_ = syncStatusWorkspaceBuf_.Get<int32_t>();
         syncStatusWorkspaceGM_ = workspaceGM;
     }
     if constexpr (isActiveMask) {
@@ -390,8 +442,7 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::I
         }
     }
 
-    winOffset_[0] = 0;
-    winOffset_[1] =
+    const uint64_t winTokenDataRegionBytes =
         Ceil(attentionWorkerNum_ * microBatchNum_ * infoTableLastDimNum_ * sizeof(int32_t), WIN_ALIGN) * WIN_ALIGN;
     winInfoTableOffset_ =
         (sessionId_ * microBatchNum_ * infoTableLastDimNum_ + microBatchId_ * infoTableLastDimNum_) * sizeof(int32_t);
@@ -400,16 +451,16 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::I
         (static_cast<uint64_t>(microBatchId_) * axisBS_ * (axisK_ + sharedExpertNum_) * axisHS_);
 
     const uint64_t elementSize = (QuantMode != 0) ? sizeof(XOutType) : sizeof(XType);
-    const uint64_t dataRegionSize = static_cast<uint64_t>(attentionWorkerNum_) * microBatchNum_ * axisBS_ *
-                                    (axisK_ + sharedExpertNum_) * axisHS_ * elementSize;
-    GM_ADDR selfWinAddr = GetWindowAddr(static_cast<int32_t>(rankId_));
-    const uint64_t dataRegionAlignSize = Ceil(dataRegionSize, static_cast<uint64_t>(WIN_ALIGN)) * WIN_ALIGN;
     stagingStride_ = Ceil(hCommuSize_, static_cast<uint64_t>(UB_ALIGN)) * UB_ALIGN;
-    const uint64_t stagingRegionSize = static_cast<uint64_t>(maxTotalSendNum) * stagingStride_;
-    const uint64_t stagingRegionAlignSize = Ceil(stagingRegionSize, static_cast<uint64_t>(WIN_ALIGN)) * WIN_ALIGN;
-    stagingBaseAddr_ = selfWinAddr + winOffset_[1] + dataRegionAlignSize;
-    localFlagAddr_ = stagingBaseAddr_ + stagingRegionAlignSize;
-    layerFlagAddr_ = localFlagAddr_ + static_cast<uint64_t>(expertIdsCnt_) * URMA_FLAG_SLOT_SIZE;
+
+    remoteSlotBytes_ = static_cast<uint64_t>(axisHS_) * elementSize;
+    winDataBaseByte_ = winTokenDataRegionBytes + winTokenDataOffset_ * elementSize;
+    winFlagBaseByte_ = winInfoTableOffset_ + TOKEN_INFO_TABLE_RS * sizeof(int32_t);
+    const bool relayDataMergeEligible = (stagingStride_ == remoteSlotBytes_);
+    const uint64_t dataSegByBytes = RELAY_MERGE_MAX_BYTES / remoteSlotBytes_;
+    relayDataSegTokenMax_ =
+        relayDataMergeEligible ? static_cast<uint32_t>(dataSegByBytes == 0U ? 1U : dataSegByBytes) : 1U;
+    relayFlagSegTokenMax_ = static_cast<uint32_t>(RELAY_MERGE_MAX_BYTES / sizeof(int32_t));
 
     const uint64_t countMatrixOffset = static_cast<uint64_t>(aivNum_) * aivWorkspaceOffset_;
     countMatrixBase_ = workspaceGM + countMatrixOffset;
@@ -422,6 +473,17 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::I
     const uint32_t bucketBytes = BUCKET_BUFFER_SIZE / bucketRankNum / UB_ALIGN * UB_ALIGN;
     entriesPerRank_ = (bucketBytes / sizeof(int32_t) == 0U) ? 1U : bucketBytes / sizeof(int32_t);
     groupTokenMax_ = (entriesPerRank_ < BUCKET_GROUP_TOKEN_MAX) ? entriesPerRank_ : BUCKET_GROUP_TOKEN_MAX;
+
+    const uint64_t bucketTableBytes =
+        Ceil(static_cast<uint64_t>(maxTotalSendNum) * sizeof(int32_t), WORKSPACE_ELEMENT_OFFSET) *
+        WORKSPACE_ELEMENT_OFFSET;
+    stagingBaseAddr_ = bucketTablesBase_ + bucketTableBytes;
+    const uint64_t stagingRegionSize = static_cast<uint64_t>(maxTotalSendNum) * stagingStride_;
+    const uint64_t stagingRegionAlignSize = Ceil(stagingRegionSize, static_cast<uint64_t>(WIN_ALIGN)) * WIN_ALIGN;
+    const uint64_t flagEntryRegionBytes =
+        Ceil(static_cast<uint64_t>(expertIdsCnt_) * sizeof(int32_t), static_cast<uint64_t>(UB_ALIGN)) * UB_ALIGN;
+    localFlagAddr_ = stagingBaseAddr_ + stagingRegionAlignSize;
+    layerFlagAddr_ = localFlagAddr_ + flagEntryRegionBytes;
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
@@ -484,16 +546,29 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::R
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
+__aicore__ inline float AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::ComputeDynamicScale(
+    const LocalTensor<float>& srcLocal)
+{
+    LocalTensor<float> floatLocalAbsTemp = smoothScalesBuf_.Get<float>();
+    Abs(floatLocalAbsTemp, srcLocal, axisH_);
+    PipeBarrier<PIPE_V>();
+    ReduceMaxInplace(floatLocalAbsTemp, axisH_);
+    SyncFunc<AscendC::HardEvent::V_S>();
+    const float maxAbs = floatLocalAbsTemp.GetValue(0);
+    const float dynamicScale = (maxAbs == 0.0f) ? 1.0f : float(INT8_MAX_VALUE) / maxAbs;
+    SyncFunc<AscendC::HardEvent::S_V>();
+    return dynamicScale;
+}
+
+template <TemplateAttentionToFfnUrmaTypeClass>
 __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::QuantProcess(uint32_t expertIndex)
 {
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
     if constexpr (QuantMode == DYNAMIC_QUANT) {
-        float dynamicScale = 0.0;
         LocalTensor<float> floatLocalTemp;
         floatLocalTemp = receiveDataCastFloatBuf_.Get<float>();
         Cast(floatLocalTemp, xInTensor_, RoundMode::CAST_NONE, axisH_);
         PipeBarrier<PIPE_V>();
-        xInQueue_.FreeTensor<XType>(xInTensor_);
 
         if (isScales_) {
             smoothScalesTensor_ = smoothScalesBuf_.Get<float>();
@@ -507,13 +582,7 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::Q
             PipeBarrier<PIPE_V>();
         }
 
-        LocalTensor<float> floatLocalAbsTemp = smoothScalesBuf_.Get<float>();
-        Abs(floatLocalAbsTemp, floatLocalTemp, axisH_);
-        PipeBarrier<PIPE_V>();
-        ReduceMaxInplace(floatLocalAbsTemp, axisH_);
-        SyncFunc<AscendC::HardEvent::V_S>();
-        dynamicScale = float(INT8_MAX_VALUE) / floatLocalAbsTemp.GetValue(0);
-        SyncFunc<AscendC::HardEvent::S_V>();
+        float dynamicScale = ComputeDynamicScale(floatLocalTemp);
         Muls(floatLocalTemp, floatLocalTemp, dynamicScale, axisH_);
         PipeBarrier<PIPE_V>();
 
@@ -553,7 +622,6 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::Q
                                   AscendC::RoundMode::CAST_RINT>(srcAddr, halfScaleLocalAddr, outLocalAddr, axisH_);
         }
         PipeBarrier<PIPE_V>();
-        xInQueue_.FreeTensor<XType>(xInTensor_);
     } else if constexpr (IsMxClipQuant(QuantMode)) {
         uint32_t mxScaleNum = Ceil(Ceil(axisH_, MX_BLOCK_SIZE), 2U) * 2U;
         LocalTensor<float> receiveDataCastFloat = receiveDataCastFloatBuf_.Get<float>();
@@ -568,7 +636,6 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::Q
         Quant::ComputeFp8Data<StorageXInType, XOutType, AscendC::RoundMode::CAST_TRUNC, AscendC::RoundMode::CAST_RINT>(
             srcAddr, halfScaleLocalAddr, outLocalAddr, axisH_);
         PipeBarrier<PIPE_V>();
-        xInQueue_.FreeTensor<XType>(xInTensor_);
     }
 #else
     float dynamicScale = 0.0;
@@ -577,7 +644,6 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::Q
     floatLocalTemp = receiveDataCastFloatBuf_.Get<float>();
     Cast(floatLocalTemp, xInTensor_, RoundMode::CAST_NONE, axisH_);
     PipeBarrier<PIPE_V>();
-    xInQueue_.FreeTensor<XType>(xInTensor_);
 
     if (isScales_) {
         smoothScalesTensor_ = smoothScalesBuf_.Get<float>();
@@ -592,14 +658,7 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::Q
     }
 
     if (quantMode_ == DYNAMIC_QUANT) {
-        LocalTensor<float> floatLocalAbsTemp = smoothScalesBuf_.Get<float>();
-        Abs(floatLocalAbsTemp, floatLocalTemp, axisH_);
-        PipeBarrier<PIPE_V>();
-        ReduceMaxInplace(floatLocalAbsTemp, axisH_);
-        SyncFunc<AscendC::HardEvent::V_S>();
-        float maxAbs = floatLocalAbsTemp.GetValue(0);
-        dynamicScale = (maxAbs == 0.0f) ? 1.0f : float(INT8_MAX_VALUE) / maxAbs;
-        SyncFunc<AscendC::HardEvent::S_V>();
+        dynamicScale = ComputeDynamicScale(floatLocalTemp);
         Muls(floatLocalTemp, floatLocalTemp, dynamicScale, axisH_);
         PipeBarrier<PIPE_V>();
     }
@@ -660,7 +719,8 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::F
 {
     ascendc_assert(expertId >= 0 && static_cast<uint32_t>(expertId) < expertNum_,
                    "expertId %d must be in [0, expertNum %u)", expertId, expertNum_);
-
+    // The (toRankId, localExpId) pair was resolved into UB by ResolveExpertRankTable; -1 marks an
+    // expert without a rank placement, which keeps the previous mapping exactly like the GM path.
     const int32_t toRankId = expertRankResolveTensor_.GetValue(static_cast<uint32_t>(expertId) * RANK_RESOLVE_STRIDE);
     if (toRankId < 0) {
         return;
@@ -670,8 +730,10 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::F
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
-__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::SplitToCore(
-    uint32_t curSendCnt, uint32_t curUseAivNum, uint32_t& startTokenId, uint32_t& endTokenId, uint32_t& sendTokenNum)
+__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::SplitToCore(uint32_t curSendCnt,
+                                                                                           uint32_t curUseAivNum,
+                                                                                           uint32_t& startTokenId,
+                                                                                           uint32_t& sendTokenNum)
 {
     sendTokenNum = curSendCnt / curUseAivNum;
     uint32_t remainderTokenNum = curSendCnt % curUseAivNum;
@@ -682,7 +744,6 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::S
     } else {
         startTokenId += remainderTokenNum;
     }
-    endTokenId = startTokenId + sendTokenNum;
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
@@ -700,7 +761,7 @@ __aicore__ inline GM_ADDR AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>
 {
     ascendc_assert(rankId >= 0 && static_cast<uint32_t>(rankId) < worldSize_, "rankId %d must be in [0, worldSize %u)",
                    rankId, worldSize_);
-    return (GM_ADDR)mc2Context_->epHcclBuffer_[rankId];
+    return (GM_ADDR)rankWinBaseTensor_(static_cast<uint32_t>(rankId));
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
@@ -712,89 +773,104 @@ __aicore__ inline uint64_t AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc
 
 template <TemplateAttentionToFfnUrmaTypeClass>
 __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::ReadTokenMetaData(
-    AttentionToFfnTokenMetaData& metaData, uint32_t tokenOffset)
+    AttentionToFfnTokenMetaData& metaData, uint32_t tokenOffset, uint32_t tokenId, uint32_t topkId)
 {
-    metaData.tokenId = tokenOffset / (axisK_ + sharedExpertNum_);
-    metaData.topkId = tokenOffset % (axisK_ + sharedExpertNum_);
+    metaData.tokenId = tokenId;
+    metaData.topkId = topkId;
 
     if (metaData.topkId < axisK_) {
-        metaData.dstExpertId = expertIdsTensor_.GetValue(metaData.tokenId * axisK_ + metaData.topkId);
+        // expert_ids is staged as this AIV's row slice [expertIdsBaseTokenId_, ...], so the
+        // read subtracts the slice base; the covered GM offsets are unchanged.
+        metaData.dstExpertId =
+            expertIdsTensor_.GetValue((metaData.tokenId - expertIdsBaseTokenId_) * axisK_ + metaData.topkId);
     } else {
         metaData.dstExpertId = static_cast<int32_t>(moeExpertNum_ + (metaData.topkId - axisK_));
     }
 
-    dstExpertId_ = metaData.dstExpertId;
     FindExpertRank(metaData.dstExpertId);
     metaData.toRankId = toRankId_;
     metaData.localExpId = localExpId_;
 
-    GM_ADDR toRankAddr = GetWindowAddr(metaData.toRankId);
-    uint64_t elementSize = (QuantMode != 0) ? sizeof(XOutType) : sizeof(XType);
-    uint64_t tokenDataOffset = winTokenDataOffset_ +
-                               (static_cast<uint64_t>(metaData.tokenId) * (axisK_ + sharedExpertNum_) * axisHS_) +
-                               (static_cast<uint64_t>(metaData.topkId) * axisHS_);
-    metaData.remoteDataAddr = toRankAddr + winOffset_[1] + tokenDataOffset * elementSize;
-    metaData.remoteFlagAddr = toRankAddr + winInfoTableOffset_ + (TOKEN_INFO_TABLE_RS + tokenOffset) * sizeof(int32_t);
+    ascendc_assert(metaData.toRankId >= 0 && static_cast<uint32_t>(metaData.toRankId) < worldSize_,
+                   "toRankId %d must be in [0, worldSize %u)", metaData.toRankId, worldSize_);
     metaData.localDataAddr = stagingBaseAddr_ + static_cast<uint64_t>(tokenOffset) * stagingStride_;
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
-__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::CopyTokenDataToGM(
-    const AttentionToFfnTokenMetaData& metaData, GM_ADDR targetAddr, const DataCopyExtParams& xCopyParams)
+__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::LoadXRow(
+    uint32_t tokenId, const DataCopyExtParams& xCopyParams)
 {
     DataCopyPadExtParams<XType> copyPadExtParams{false, 0U, 0U, 0U};
-    DataCopyExtParams hCommuCopyParams = {1U, static_cast<uint32_t>(hCommuSize_), 0U, 0U, 0U};
-
     if constexpr (QuantMode == 0) {
         xTmpTensor_ = xQueue_.AllocTensor<XType>();
-        DataCopyPad(xTmpTensor_, xGMTensor_[metaData.tokenId * axisH_], xCopyParams, copyPadExtParams);
+        DataCopyPad(xTmpTensor_, xGMTensor_[static_cast<uint64_t>(tokenId) * axisH_], xCopyParams, copyPadExtParams);
         xQueue_.EnQue(xTmpTensor_);
         xTmpTensor_ = xQueue_.DeQue<XType>();
-        GlobalTensor<XType> targetGMTensor;
-        targetGMTensor.SetGlobalBuffer(reinterpret_cast<__gm__ XType*>(targetAddr));
-        DataCopyPad(targetGMTensor, xTmpTensor_, xCopyParams);
-        xQueue_.FreeTensor<XType>(xTmpTensor_);
     } else {
         xInTensor_ = xInQueue_.AllocTensor<XType>();
-        DataCopyPad(xInTensor_, xGMTensor_[metaData.tokenId * axisH_], xCopyParams, copyPadExtParams);
+        DataCopyPad(xInTensor_, xGMTensor_[static_cast<uint64_t>(tokenId) * axisH_], xCopyParams, copyPadExtParams);
         xInQueue_.EnQue(xInTensor_);
         xInTensor_ = xInQueue_.DeQue<XType>();
-        xOutTensor_ = xOutQueue_.AllocTensor<StorageXOutType>();
-        QuantProcess(dstExpertId_);
-        GlobalTensor<uint8_t> targetGMTensor;
-        targetGMTensor.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(targetAddr));
-        xOutQueue_.EnQue(xOutTensor_);
-        xOutTensor_ = xOutQueue_.DeQue<StorageXOutType>();
-        auto xOutBytesTensor = xOutTensor_.template ReinterpretCast<uint8_t>();
-        DataCopyPad(targetGMTensor, xOutBytesTensor, hCommuCopyParams);
-        xOutQueue_.FreeTensor<StorageXOutType>(xOutTensor_);
+    }
+}
+
+// Return the row payload buffers once the row's entries are all staged.
+template <TemplateAttentionToFfnUrmaTypeClass>
+__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::ReleaseRowPayload(bool rowQuantShared)
+{
+    if constexpr (QuantMode == 0) {
+        xQueue_.FreeTensor<XType>(xTmpTensor_);
+    } else {
+        if (rowQuantShared) {
+            xOutQueue_.FreeTensor<StorageXOutType>(xOutTensor_);
+        }
+        xInQueue_.FreeTensor<XType>(xInTensor_);
     }
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
-__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::StageRemoteData(
-    const AttentionToFfnTokenMetaData& metaData, const DataCopyExtParams& xCopyParams)
+__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::StageRowEntry(
+    const AttentionToFfnTokenMetaData& metaData, const DataCopyExtParams& xCopyParams,
+    const DataCopyExtParams& hCommuCopyParams, bool rowQuantShared, bool& rowPayloadReady)
 {
-    CopyTokenDataToGM(metaData, metaData.localDataAddr, xCopyParams);
-    flagValueTensor_.SetValue(remoteFlagCnt_ * FLAG_ELEM_STRIDE, metaData.localExpId);
-    ++remoteFlagCnt_;
+    if constexpr (QuantMode == 0) {
+        GlobalTensor<XType> targetGMTensor;
+        targetGMTensor.SetGlobalBuffer(reinterpret_cast<__gm__ XType*>(metaData.localDataAddr));
+        DataCopyPad(targetGMTensor, xTmpTensor_, xCopyParams);
+    } else {
+        if (!rowQuantShared || !rowPayloadReady) {
+            xOutTensor_ = xOutQueue_.AllocTensor<StorageXOutType>();
+            QuantProcess(metaData.dstExpertId);
+            xOutQueue_.EnQue(xOutTensor_);
+            xOutTensor_ = xOutQueue_.DeQue<StorageXOutType>();
+            rowPayloadReady = true;
+        }
+        GlobalTensor<uint8_t> targetGMTensor;
+        targetGMTensor.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(metaData.localDataAddr));
+        auto xOutBytesTensor = xOutTensor_.template ReinterpretCast<uint8_t>();
+        DataCopyPad(targetGMTensor, xOutBytesTensor, hCommuCopyParams);
+        if (!rowQuantShared) {
+            xOutQueue_.FreeTensor<StorageXOutType>(xOutTensor_);
+        }
+    }
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
 __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::AppendRemoteDataWrite(
-    HcommBatchHandle& batchHandle, GM_ADDR remoteDataAddr, GM_ADDR sourceDataAddr)
+    HcommBatchHandle& batchHandle, GM_ADDR remoteDataAddr, GM_ADDR sourceDataAddr, uint64_t byteLen)
 {
-    hcomm_.WriteNbi<REMOTE_DATA_WQE_CONFIG>(batchHandle, remoteDataAddr, sourceDataAddr,
-                                            static_cast<int64_t>(hCommuSize_));
+    hcomm_.WriteNbi<REMOTE_DATA_WQE_CONFIG>(batchHandle, remoteDataAddr, sourceDataAddr, static_cast<int64_t>(byteLen));
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
 __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::AppendRemoteFlagWrite(
-    HcommBatchHandle& batchHandle, GM_ADDR remoteFlagAddr, uint32_t sourceTokenOffset)
+    HcommBatchHandle& batchHandle, GM_ADDR remoteFlagAddr, uint32_t sourceTokenOffset, uint32_t tokenCount)
 {
-    GM_ADDR sourceFlagAddr = localFlagAddr_ + static_cast<uint64_t>(sourceTokenOffset) * URMA_FLAG_SLOT_SIZE;
+    // The local flag region holds one compact 4B entry per tokenOffset, mirroring the remote info
+    // table layout, so a whole consecutive run is one contiguous span on both sides.
+    GM_ADDR sourceFlagAddr = localFlagAddr_ + static_cast<uint64_t>(sourceTokenOffset) * sizeof(int32_t);
     hcomm_.WriteNbi<REMOTE_ORDERED_FLAG_WQE_CONFIG>(batchHandle, remoteFlagAddr, sourceFlagAddr,
-                                                    static_cast<int64_t>(sizeof(int32_t)));
+                                                    static_cast<int64_t>(tokenCount) * sizeof(int32_t));
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
@@ -817,34 +893,26 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::B
     const uint32_t rowsPerBatch = BUCKET_BUFFER_SIZE / rowBytes;
     const DataCopyPadExtParams<int32_t> padParams{false, 0U, 0U, 0U};
 
-    // Exclusive prefix over the preceding AIV rows: where this AIV's bucket flushes land.
-    for (uint32_t rowStart = 0U; rowStart < aivId_; rowStart += rowsPerBatch) {
-        uint32_t copyRows = (rowStart + rowsPerBatch > aivId_) ? aivId_ - rowStart : rowsPerBatch;
-        DataCopyExtParams copyParams{static_cast<uint16_t>(copyRows), rowBytes,
-                                     static_cast<uint32_t>(countRowStride_ - rowBytes), 0U, 0U};
-        DataCopyPad(prefixRows, countMatrixGM[static_cast<uint64_t>(rowStart) * countRowStride_ / sizeof(int32_t)],
-                    copyParams, padParams);
-        SyncFunc<HardEvent::MTE2_V>();
-        const uint32_t prefixShape[] = {copyRows, rankCountElements_};
-        ReduceSum<int32_t, AscendC::Pattern::Reduce::RA, true>(reduceSums, prefixRows, prefixShape, false);
-        Add(writePrefix, writePrefix, reduceSums, rankCountElements_);
-        if (rowStart + copyRows < aivId_) {
-            SyncFunc<HardEvent::V_MTE2>();
+    for (uint32_t rowStart = 0U; rowStart < aivNum_;) {
+        uint32_t maxRows = aivNum_ - rowStart;
+        if (rowStart < aivId_) {
+            const uint32_t prefixRowsLeft = aivId_ - rowStart;
+            maxRows = (maxRows < prefixRowsLeft) ? maxRows : prefixRowsLeft;
         }
-    }
-    SyncFunc<HardEvent::V_MTE2>();
-    // Every AIV also sums all rows so it locally knows each rank's total entry count.
-    for (uint32_t rowStart = 0U; rowStart < aivNum_; rowStart += rowsPerBatch) {
-        uint32_t copyRows = (rowStart + rowsPerBatch > aivNum_) ? aivNum_ - rowStart : rowsPerBatch;
+        const uint32_t copyRows = (rowsPerBatch < maxRows) ? rowsPerBatch : maxRows;
         DataCopyExtParams copyParams{static_cast<uint16_t>(copyRows), rowBytes,
                                      static_cast<uint32_t>(countRowStride_ - rowBytes), 0U, 0U};
         DataCopyPad(prefixRows, countMatrixGM[static_cast<uint64_t>(rowStart) * countRowStride_ / sizeof(int32_t)],
                     copyParams, padParams);
         SyncFunc<HardEvent::MTE2_V>();
-        const uint32_t totalShape[] = {copyRows, rankCountElements_};
-        ReduceSum<int32_t, AscendC::Pattern::Reduce::RA, true>(reduceSums, prefixRows, totalShape, false);
+        const uint32_t batchShape[] = {copyRows, rankCountElements_};
+        ReduceSum<int32_t, AscendC::Pattern::Reduce::RA, true>(reduceSums, prefixRows, batchShape, false);
         Add(totalCounts, totalCounts, reduceSums, rankCountElements_);
-        if (rowStart + copyRows < aivNum_) {
+        if (rowStart + copyRows <= aivId_) {
+            Add(writePrefix, writePrefix, reduceSums, rankCountElements_);
+        }
+        rowStart += copyRows;
+        if (rowStart < aivNum_) {
             SyncFunc<HardEvent::V_MTE2>();
         }
     }
@@ -867,18 +935,17 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::S
     LocalTensor<int32_t> bucketEntries = bucketTensor_;
     GlobalTensor<int32_t> bucketTablesGM;
     bucketTablesGM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(bucketTablesBase_));
-    const uint64_t roundNum = Ceil(static_cast<uint64_t>(totalSendNum_), static_cast<uint64_t>(aivNum_));
+    // This AIV's contiguous token range only: the rank stash is indexed by the token's offset
+    // inside [sendStartTokenId_, sendStartTokenId_ + sendTokenNum_).
+    const uint64_t scatterCnt = sendTokenNum_;
 
-    for (uint64_t roundStart = 0U; roundStart < roundNum; roundStart += groupTokenMax_) {
-        uint64_t roundEnd = (roundStart + groupTokenMax_ > roundNum) ? roundNum : roundStart + groupTokenMax_;
+    for (uint64_t groupStart = 0U; groupStart < scatterCnt; groupStart += groupTokenMax_) {
+        uint64_t groupEnd = (groupStart + groupTokenMax_ > scatterCnt) ? scatterCnt : groupStart + groupTokenMax_;
         Duplicate<int32_t>(rankCounts, 0, rankCountElements_);
         SyncFunc<HardEvent::V_S>();
-        for (uint64_t round = roundStart; round < roundEnd; ++round) {
-            uint32_t tokenOffset = static_cast<uint32_t>(static_cast<uint64_t>(aivId_) + round * aivNum_);
-            if (tokenOffset >= totalSendNum_) {
-                continue;
-            }
-            int32_t dstRank = tokenRankScratchTensor_.GetValue(static_cast<int32_t>(round));
+        for (uint64_t idx = groupStart; idx < groupEnd; ++idx) {
+            uint32_t tokenOffset = sendStartTokenId_ + static_cast<uint32_t>(idx);
+            int32_t dstRank = tokenRankScratchTensor_.GetValue(static_cast<int32_t>(idx));
             uint32_t localIndex = static_cast<uint32_t>(rankCounts.GetValue(dstRank));
             bucketEntries.SetValue(static_cast<uint32_t>(dstRank) * entriesPerRank_ + localIndex,
                                    static_cast<int32_t>(tokenOffset));
@@ -902,76 +969,106 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::S
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
+__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::RelayRunDataWrites(
+    HcommBatchHandle& batchHandle, GM_ADDR toRankAddr, uint32_t runTokenOffset, uint32_t runLen,
+    uint32_t& preparedWqeCount)
+{
+    uint32_t segStart = runTokenOffset;
+    uint32_t remaining = runLen;
+    while (remaining > 0U) {
+        uint32_t segLen = (remaining > relayDataSegTokenMax_) ? relayDataSegTokenMax_ : remaining;
+        GM_ADDR remoteDataAddr = toRankAddr + winDataBaseByte_ + static_cast<uint64_t>(segStart) * remoteSlotBytes_;
+        GM_ADDR localDataAddr = stagingBaseAddr_ + static_cast<uint64_t>(segStart) * stagingStride_;
+        uint64_t byteLen = (segLen == 1U) ? hCommuSize_ : static_cast<uint64_t>(segLen) * stagingStride_;
+        AppendRemoteDataWrite(batchHandle, remoteDataAddr, localDataAddr, byteLen);
+        ++preparedWqeCount;
+        if (preparedWqeCount == URMA_BATCH_WQE_CAPACITY) {
+            hcomm_.BatchCommit(batchHandle);
+            preparedWqeCount = 0U;
+        }
+        segStart += segLen;
+        remaining -= segLen;
+    }
+}
+
+// Emit the flag WQEs of one run: the local flag region and the remote info table both hold one
+// compact 4B entry per tokenOffset, so each segment is a single contiguous WQE.
+template <TemplateAttentionToFfnUrmaTypeClass>
+__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::RelayRunFlagWrites(
+    HcommBatchHandle& batchHandle, GM_ADDR toRankAddr, uint32_t runTokenOffset, uint32_t runLen,
+    uint32_t& preparedWqeCount)
+{
+    uint32_t segStart = runTokenOffset;
+    uint32_t remaining = runLen;
+    while (remaining > 0U) {
+        uint32_t segLen = (remaining > relayFlagSegTokenMax_) ? relayFlagSegTokenMax_ : remaining;
+        GM_ADDR remoteFlagAddr = toRankAddr + winFlagBaseByte_ + static_cast<uint64_t>(segStart) * sizeof(int32_t);
+        AppendRemoteFlagWrite(batchHandle, remoteFlagAddr, segStart, segLen);
+        ++preparedWqeCount;
+        if (preparedWqeCount == URMA_BATCH_WQE_CAPACITY) {
+            hcomm_.BatchCommit(batchHandle);
+            preparedWqeCount = 0U;
+        }
+        segStart += segLen;
+        remaining -= segLen;
+    }
+}
+
+template <TemplateAttentionToFfnUrmaTypeClass>
 __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::RelayRemoteTokens(uint32_t dstRank,
                                                                                                  uint32_t channelIdx)
 {
     LocalTensor<int32_t> rankInfo = rankInfoBuf_.Get<int32_t>();
     LocalTensor<int32_t> totalCounts = rankInfo[RANK_INFO_TOTAL_SEG_IDX * rankCountElements_];
     LocalTensor<int32_t> tableStart = rankInfo[RANK_INFO_START_SEG_IDX * rankCountElements_];
-    uint32_t entryCount = static_cast<uint32_t>(totalCounts.GetValue(dstRank));
+    const uint32_t entryCount = static_cast<uint32_t>(totalCounts.GetValue(dstRank));
     if (entryCount == 0U) {
         return;
     }
-    uint32_t baseEntry = static_cast<uint32_t>(tableStart.GetValue(dstRank));
+
+    const uint32_t blockStart =
+        static_cast<uint32_t>(static_cast<uint64_t>(channelIdx) * entryCount / channelsPerRank_);
+    const uint32_t blockEnd =
+        static_cast<uint32_t>(static_cast<uint64_t>(channelIdx + 1U) * entryCount / channelsPerRank_);
+    if (blockStart >= blockEnd) {
+        return;
+    }
+    const uint32_t blockEntries = blockEnd - blockStart;
+    uint32_t baseEntry = static_cast<uint32_t>(tableStart.GetValue(dstRank)) + blockStart;
 
     GM_ADDR toRankAddr = GetWindowAddr(static_cast<int32_t>(dstRank));
     uint64_t channel = GetUrmaCommHandle(dstRank, channelIdx);
     HcommBatchHandle batchHandle =
         hcomm_.MakeBatchHandle(channel, hcommBatchWqeTensor_, ATTN_FFN_HCOMM_BATCH_UB_BYTES, toRankAddr);
     uint32_t preparedWqeCount = 0U;
-    const uint64_t elementSize = (QuantMode != 0) ? sizeof(XOutType) : sizeof(XType);
     LocalTensor<int32_t> entriesLocal = bucketTensor_;
     constexpr uint32_t entryChunkMax = BUCKET_BUFFER_SIZE / sizeof(int32_t);
     const DataCopyPadExtParams<int32_t> padParams{false, 0U, 0U, 0U};
     GlobalTensor<int32_t> bucketTablesGM;
     bucketTablesGM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(bucketTablesBase_));
 
-    for (uint32_t chunkStart = 0U; chunkStart < entryCount; chunkStart += entryChunkMax) {
-        uint32_t curEntries = (chunkStart + entryChunkMax > entryCount) ? entryCount - chunkStart : entryChunkMax;
+    // Ordering: every flag WQE keeps REMOTE_ORDERED_FLAG_WQE_CONFIG (fence=1, odr=6), i.e. it
+    // lands only after every earlier WQE on the channel - in particular its run's data WQE(s).
+    for (uint32_t chunkStart = 0U; chunkStart < blockEntries; chunkStart += entryChunkMax) {
+        uint32_t curEntries = (chunkStart + entryChunkMax > blockEntries) ? blockEntries - chunkStart : entryChunkMax;
         DataCopyExtParams copyParams{1U, static_cast<uint32_t>(curEntries * sizeof(int32_t)), 0U, 0U, 0U};
         SyncFunc<HardEvent::S_MTE2>();
         DataCopyPad(entriesLocal, bucketTablesGM[baseEntry + chunkStart], copyParams, padParams);
         SyncFunc<HardEvent::MTE2_S>();
-        for (uint32_t i = 0U; i < curEntries; ++i) {
-            if ((chunkStart + i) % channelsPerRank_ != channelIdx) {
-                continue;
+        uint32_t i = 0U;
+        while (i < curEntries) {
+            const uint32_t runFirstPos = i;
+            const uint32_t runTokenOffset = static_cast<uint32_t>(entriesLocal.GetValue(i));
+            ++i;
+            // Extend across position-adjacent entries with consecutive tokenOffsets; the whole
+            // chunk lies inside this channel's block, so no channel filter is needed here.
+            while (i < curEntries &&
+                   static_cast<uint32_t>(entriesLocal.GetValue(i)) == runTokenOffset + (i - runFirstPos)) {
+                ++i;
             }
-            uint32_t tokenOffset = static_cast<uint32_t>(entriesLocal.GetValue(i));
-            uint32_t tokenId = tokenOffset / (axisK_ + sharedExpertNum_);
-            uint32_t topkId = tokenOffset % (axisK_ + sharedExpertNum_);
-            uint64_t tokenDataOffset = winTokenDataOffset_ +
-                                       (static_cast<uint64_t>(tokenId) * (axisK_ + sharedExpertNum_) * axisHS_) +
-                                       (static_cast<uint64_t>(topkId) * axisHS_);
-            GM_ADDR remoteDataAddr = toRankAddr + winOffset_[1] + tokenDataOffset * elementSize;
-            GM_ADDR localDataAddr = stagingBaseAddr_ + static_cast<uint64_t>(tokenOffset) * stagingStride_;
-            AppendRemoteDataWrite(batchHandle, remoteDataAddr, localDataAddr);
-            ++preparedWqeCount;
-            if (preparedWqeCount == URMA_BATCH_WQE_CAPACITY) {
-                hcomm_.BatchCommit(batchHandle);
-                preparedWqeCount = 0U;
-            }
-        }
-    }
-
-    for (uint32_t chunkStart = 0U; chunkStart < entryCount; chunkStart += entryChunkMax) {
-        uint32_t curEntries = (chunkStart + entryChunkMax > entryCount) ? entryCount - chunkStart : entryChunkMax;
-        DataCopyExtParams copyParams{1U, static_cast<uint32_t>(curEntries * sizeof(int32_t)), 0U, 0U, 0U};
-        SyncFunc<HardEvent::S_MTE2>();
-        DataCopyPad(entriesLocal, bucketTablesGM[baseEntry + chunkStart], copyParams, padParams);
-        SyncFunc<HardEvent::MTE2_S>();
-        for (uint32_t i = 0U; i < curEntries; ++i) {
-            if ((chunkStart + i) % channelsPerRank_ != channelIdx) {
-                continue;
-            }
-            uint32_t tokenOffset = static_cast<uint32_t>(entriesLocal.GetValue(i));
-            GM_ADDR remoteFlagAddr =
-                toRankAddr + winInfoTableOffset_ + (TOKEN_INFO_TABLE_RS + tokenOffset) * sizeof(int32_t);
-            AppendRemoteFlagWrite(batchHandle, remoteFlagAddr, tokenOffset);
-            ++preparedWqeCount;
-            if (preparedWqeCount == URMA_BATCH_WQE_CAPACITY) {
-                hcomm_.BatchCommit(batchHandle);
-                preparedWqeCount = 0U;
-            }
+            const uint32_t runLen = i - runFirstPos;
+            RelayRunDataWrites(batchHandle, toRankAddr, runTokenOffset, runLen, preparedWqeCount);
+            RelayRunFlagWrites(batchHandle, toRankAddr, runTokenOffset, runLen, preparedWqeCount);
         }
     }
     if (preparedWqeCount != 0U) {
@@ -1002,13 +1099,12 @@ template <TemplateAttentionToFfnUrmaTypeClass>
 __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::SetFlagInAttn()
 {
     uint32_t startId = 0;
-    uint32_t endId = 0;
     uint32_t sendNum = 0;
     uint32_t totalNum = axisX_ * (axisBS_ - curBsCnt_) * (axisK_ + sharedExpertNum_);
     if (totalNum == 0) {
         return;
     }
-    SplitToCore(totalNum, aivNum_, startId, endId, sendNum);
+    SplitToCore(totalNum, aivNum_, startId, sendNum);
     if (startId >= totalNum) {
         return;
     }
@@ -1032,13 +1128,12 @@ template <TemplateAttentionToFfnUrmaTypeClass>
 __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::ClearAttnActiveFlags()
 {
     uint32_t startId = 0;
-    uint32_t endId = 0;
     uint32_t clearNum = 0;
     uint32_t clearTotal = axisX_ * curBsCnt_ * (axisK_ + sharedExpertNum_);
     if (clearTotal == 0) {
         return;
     }
-    SplitToCore(clearTotal, aivNum_, startId, endId, clearNum);
+    SplitToCore(clearTotal, aivNum_, startId, clearNum);
     if (startId >= clearTotal) {
         return;
     }
@@ -1059,7 +1154,14 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::C
 template <TemplateAttentionToFfnUrmaTypeClass>
 __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::SetFlagToFFN()
 {
-    if (aivId_ != 0U) {
+    bool ownsFfnRank = false;
+    for (uint32_t ffnIdx = ffnStartRankId_; ffnIdx < ffnStartRankId_ + ffnNum_; ++ffnIdx) {
+        if ((ffnIdx * channelsPerRank_) % aivNum_ == aivId_) {
+            ownsFfnRank = true;
+            break;
+        }
+    }
+    if (!ownsFfnRank) {
         return;
     }
 
@@ -1070,19 +1172,15 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::S
                                       0U, 0U};
 
     if constexpr (isSync) {
-        uint32_t sentFFNNumAlignSize = Ceil(ffnNum_ * sizeof(int32_t), UB_ALIGN) * UB_ALIGN;
         DataCopyExtParams syncStatusParams = {
             static_cast<uint16_t>(aivNum_), static_cast<uint32_t>(ffnNum_ * sizeof(int32_t)),
             static_cast<uint32_t>(aivWorkspaceOffset_ - ffnNum_ * sizeof(int32_t)), 0U, 0U};
         DataCopyPadExtParams<int32_t> copyPadParams{false, 0U, 0U, 0U};
-        TBuf<> syncStatusWorkspaceBuf;
-        tpipe_->InitBuffer(syncStatusWorkspaceBuf, aivNum_ * sentFFNNumAlignSize);
-        LocalTensor<int32_t> syncStatusWorkspaceTensor = syncStatusWorkspaceBuf.Get<int32_t>();
-        DataCopyPad(syncStatusWorkspaceTensor, syncStatusGMTensor_[0], syncStatusParams, copyPadParams);
+        DataCopyPad(syncStatusWorkspaceTensor_, syncStatusGMTensor_[0], syncStatusParams, copyPadParams);
         SyncFunc<AscendC::HardEvent::MTE2_V>();
-        LocalTensor<float> syncStatusWorkspaceTensorFloat = syncStatusWorkspaceTensor.ReinterpretCast<float>();
+        LocalTensor<float> syncStatusWorkspaceTensorFloat = syncStatusWorkspaceTensor_.ReinterpretCast<float>();
         LocalTensor<float> ffnStatusTensorFloat = ffnStatusTensor_.ReinterpretCast<float>();
-        const uint32_t shape[] = {aivNum_, static_cast<uint32_t>(sentFFNNumAlignSize / sizeof(float))};
+        const uint32_t shape[] = {aivNum_, ffnNumAlignCnt_};
         AscendC::ReduceSum<float, AscendC::Pattern::Reduce::RA, true>(ffnStatusTensorFloat,
                                                                       syncStatusWorkspaceTensorFloat, shape, true);
         SyncFunc<AscendC::HardEvent::V_S>();
@@ -1094,6 +1192,9 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::S
     SyncFunc<HardEvent::MTE3_S>();
 
     for (uint32_t ffnIdx = ffnStartRankId_; ffnIdx < ffnStartRankId_ + ffnNum_; ++ffnIdx) {
+        if ((ffnIdx * channelsPerRank_) % aivNum_ != aivId_) {
+            continue;
+        }
         if constexpr (isSync) {
             if (ffnStatusTensor_.GetValue(ffnIdx - ffnStartRankId_) == 0) {
                 continue;
@@ -1114,14 +1215,92 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::S
             }
             uint64_t channel = GetUrmaCommHandle(ffnIdx);
             HcommBatchHandle batchHandle =
-                hcomm_.MakeBatchHandle(channel, hcommBatchWqeTensor_, ATTN_FFN_HCOMM_BATCH_UB_BYTES,
-                                       GetWindowAddr(static_cast<int32_t>(ffnIdx)));
-            hcomm_.WriteNbi<REMOTE_ORDERED_FLAG_WQE_CONFIG>(
-                batchHandle, tableFlagGM, layerFlagAddr_,
-                static_cast<int64_t>(sizeof(int32_t) * TOKEN_INFO_TABLE_COPY_BLOCK_CNT));
+                hcomm_.MakeBatchHandle(channel, hcommBatchWqeTensor_, ATTN_FFN_HCOMM_BATCH_UB_BYTES, toRankAddr);
+            // The layer flag is the channel's last WQE. Request a CQE on it only when the keepalive
+            // mechanism is enabled (statusTableGM_ set): the next launch's CheckPreviousSends Drain
+            // consumes that CQE and retires the whole posted set. Without the status table there is
+            // no consumer, and a CQ nobody drains could fill up and stall the channel, so the flag
+            // keeps the plain ordered config - behavior identical to the mechanism being absent.
+            if (statusTableGM_ != nullptr) {
+                hcomm_.WriteNbi<REMOTE_ORDERED_FLAG_CQE_WQE_CONFIG>(
+                    batchHandle, tableFlagGM, layerFlagAddr_,
+                    static_cast<int64_t>(sizeof(int32_t) * TOKEN_INFO_TABLE_COPY_BLOCK_CNT));
+            } else {
+                hcomm_.WriteNbi<REMOTE_ORDERED_FLAG_WQE_CONFIG>(
+                    batchHandle, tableFlagGM, layerFlagAddr_,
+                    static_cast<int64_t>(sizeof(int32_t) * TOKEN_INFO_TABLE_COPY_BLOCK_CNT));
+            }
             hcomm_.BatchCommit(batchHandle);
         }
     }
+}
+
+template <TemplateAttentionToFfnUrmaTypeClass>
+__aicore__ inline bool AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::CheckPreviousSends()
+{
+    bool localDrainFailed = false;
+    const uint32_t totalSlots = worldSize_ * channelsPerRank_;
+    for (uint32_t slot = aivId_; slot < totalSlots; slot += aivNum_) {
+        const uint32_t dstRank = slot / channelsPerRank_;
+        const uint32_t channelIdx = slot % channelsPerRank_;
+        if (dstRank == rankId_) {
+            continue;
+        }
+
+        const int32_t drainRet = hcomm_.Drain(GetUrmaCommHandle(dstRank, channelIdx));
+        localDrainFailed = localDrainFailed || (drainRet != 0);
+    }
+
+    constexpr uint32_t statusBlockElements = UB_ALIGN / sizeof(int32_t);
+    const uint32_t countRowStrideElements = countRowStride_ / sizeof(int32_t);
+    Duplicate<int32_t>(statusTensor_, localDrainFailed ? 1 : 0, statusBlockElements);
+    SyncFunc<HardEvent::V_MTE3>();
+
+    // The count matrix is not populated until later in Process, so its per-AIV rows can carry
+    // the drain result temporarily. Each AIV owns one aligned row and writes its first 32B block.
+    GlobalTensor<int32_t> drainStatusGM;
+    drainStatusGM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(countMatrixBase_));
+    DataCopy(drainStatusGM[aivId_ * countRowStrideElements], statusTensor_, statusBlockElements);
+    SyncFunc<HardEvent::MTE3_S>();
+    SyncAll<true>();
+
+    if (aivId_ != 0U) {
+        return false;
+    }
+
+    DataCopyExtParams statusCopyParams{static_cast<uint16_t>(aivNum_), UB_ALIGN, countRowStride_ - UB_ALIGN, 0U, 0U};
+    DataCopyPadExtParams<int32_t> statusPadParams{false, 0U, 0U, 0U};
+    DataCopyPad(bucketTensor_, drainStatusGM, statusCopyParams, statusPadParams);
+    SyncFunc<HardEvent::MTE2_S>();
+
+    for (uint32_t coreIdx = 0U; coreIdx < aivNum_; ++coreIdx) {
+        if (bucketTensor_.GetValue(coreIdx * statusBlockElements) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <TemplateAttentionToFfnUrmaTypeClass>
+__aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::ReportSendCompletion()
+{
+    if (aivId_ != 0U) {
+        return;
+    }
+    const uint64_t publishedRounds = completedRounds_ + 1U;
+    LocalTensor<uint64_t> statusU64 = statusTensor_.ReinterpretCast<uint64_t>();
+    Duplicate<uint64_t>(statusU64, publishedRounds, ATTN_FFN_STATUS_TABLE_SLOTS);
+    SyncFunc<HardEvent::V_MTE3>();
+    DataCopyExtParams qwordParams{1U, sizeof(uint64_t), 0U, 0U, 0U};
+    // Context round counter := publishedRounds for the next kernel.
+    GlobalTensor<uint64_t> ctxTailGM;
+    ctxTailGM.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(&mc2Context_->completedRounds));
+    DataCopyPad(ctxTailGM, statusU64, qwordParams);
+    // Host status table slot 0 := publishedRounds (the whole 32B block carries the same value).
+    GlobalTensor<uint64_t> tableGM;
+    tableGM.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(statusTableGM_));
+    DataCopy(tableGM, statusU64, ATTN_FFN_STATUS_TABLE_SLOTS);
+    SyncFunc<HardEvent::MTE3_S>();
 }
 
 template <TemplateAttentionToFfnUrmaTypeClass>
@@ -1130,14 +1309,37 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::P
     if ASCEND_IS_AIV {
         HcommInit();
 
+        if (statusTableGM_ != nullptr) {
+            const bool previousSendsCompleted = CheckPreviousSends();
+            if (previousSendsCompleted) {
+                ReportSendCompletion();
+            }
+            // AIV0 must finish reading the temporary drain-status rows before other AIVs can
+            // repurpose the count matrix below.
+            SyncAll<true>();
+        }
+
         if constexpr (isActiveMask) {
             ActiveMaskCalCnt();
         }
 
         totalSendNum_ = axisX_ * curBsCnt_ * (axisK_ + sharedExpertNum_);
-        DataCopyExtParams expertIdsCntParams = {1U, static_cast<uint32_t>(expertIdsCnt_ * sizeof(int32_t)), 0U, 0U, 0U};
+        uint32_t startTokenId = 0;
+        uint32_t sendTokenNum = 0;
+        SplitToCore(totalSendNum_, aivNum_, startTokenId, sendTokenNum);
+        const uint32_t endTokenId = startTokenId + sendTokenNum;
+        sendStartTokenId_ = startTokenId;
+        sendTokenNum_ = sendTokenNum;
         DataCopyPadExtParams<int32_t> expertIdsCopyPadParams{false, 0U, 0U, 0U};
-        DataCopyPad(expertIdsTensor_, expertIdsGMTensor_, expertIdsCntParams, expertIdsCopyPadParams);
+        if (sendTokenNum > 0U && axisK_ > 0U) {
+            expertIdsBaseTokenId_ = startTokenId / (axisK_ + sharedExpertNum_);
+            const uint32_t lastTokenId = (endTokenId - 1U) / (axisK_ + sharedExpertNum_);
+            const uint32_t sliceElemCnt = (lastTokenId - expertIdsBaseTokenId_ + 1U) * axisK_;
+            DataCopyExtParams expertIdsSliceParams = {1U, static_cast<uint32_t>(sliceElemCnt * sizeof(int32_t)), 0U, 0U,
+                                                      0U};
+            DataCopyPad(expertIdsTensor_, expertIdsGMTensor_[expertIdsBaseTokenId_ * axisK_], expertIdsSliceParams,
+                        expertIdsCopyPadParams);
+        }
         SyncFunc<AscendC::HardEvent::MTE2_S>();
         ResolveExpertRankTable();
 
@@ -1149,18 +1351,33 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::P
         Duplicate<int32_t>(rankCounts, 0, rankCountElements_);
         SyncFunc<AscendC::HardEvent::V_S>();
 
-        const uint64_t roundNum = Ceil(static_cast<uint64_t>(totalSendNum_), static_cast<uint64_t>(aivNum_));
         DataCopyExtParams xCopyParams = {1U, static_cast<uint32_t>(hSize_), 0U, 0U, 0U};
+        DataCopyExtParams hCommuCopyParams = {1U, static_cast<uint32_t>(hCommuSize_), 0U, 0U, 0U};
         remoteFlagCnt_ = 0;
-
-        // Phase 1: metadata + staging. Each AIV also counts its remote records per rank and
-        // keeps its own toRankId stash in UB for the scatter pass.
-        for (uint64_t round = 0; round < roundNum; ++round) {
-            const uint32_t tokenOffset = static_cast<uint32_t>(static_cast<uint64_t>(aivId_) + round * aivNum_);
-            if (tokenOffset < totalSendNum_) {
+        const uint32_t tokensPerRow = axisK_ + sharedExpertNum_;
+        uint32_t tokenOffset = startTokenId;
+        uint32_t tokenId = 0U;
+        uint32_t topkId = 0U;
+        if (tokensPerRow > 0U) {
+            tokenId = startTokenId / tokensPerRow;
+            topkId = startTokenId % tokensPerRow;
+        }
+        // Dynamic quant + per-expert smooth scales is the only expert-dependent payload; every
+        // other mode reuses one quantized row across the whole token row.
+        bool rowQuantShared = true;
+        if constexpr (QuantMode == DYNAMIC_QUANT) {
+            rowQuantShared = !isScales_;
+        }
+        while (tokenOffset < endTokenId) {
+            const uint32_t rowRemain = tokensPerRow - topkId;
+            const uint32_t rangeRemain = endTokenId - tokenOffset;
+            const uint32_t rowSegLen = (rowRemain < rangeRemain) ? rowRemain : rangeRemain;
+            LoadXRow(tokenId, xCopyParams);
+            bool rowPayloadReady = false;
+            for (uint32_t j = 0U; j < rowSegLen; ++j) {
                 AttentionToFfnTokenMetaData metaData;
-                ReadTokenMetaData(metaData, tokenOffset);
-                tokenRankScratchTensor_.SetValue(round, metaData.toRankId);
+                ReadTokenMetaData(metaData, tokenOffset, tokenId, topkId);
+                tokenRankScratchTensor_.SetValue(tokenOffset - startTokenId, metaData.toRankId);
 
                 if constexpr (isSync) {
                     int32_t ffnIdx = metaData.toRankId - static_cast<int32_t>(ffnStartRankId_);
@@ -1168,8 +1385,19 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::P
                         ffnStatusTensor_.SetValue(ffnIdx, 1);
                     }
                 }
-                StageRemoteData(metaData, xCopyParams);
+                StageRowEntry(metaData, xCopyParams, hCommuCopyParams, rowQuantShared, rowPayloadReady);
+                // Compact 4B flag entry (the local expert id) per staged token, flushed as one
+                // contiguous block after the loop.
+                flagValueTensor_.SetValue(remoteFlagCnt_, metaData.localExpId);
+                ++remoteFlagCnt_;
                 rankCounts.SetValue(metaData.toRankId, rankCounts.GetValue(metaData.toRankId) + 1);
+                ++tokenOffset;
+                ++topkId;
+            }
+            ReleaseRowPayload(rowQuantShared);
+            if (topkId == tokensPerRow) {
+                topkId = 0U;
+                ++tokenId;
             }
         }
 
@@ -1182,29 +1410,17 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::P
 
         SyncFunc<HardEvent::S_MTE3>();
         if (remoteFlagCnt_ > 0U) {
-            constexpr uint32_t FLAG_COPY_BLOCK_MAX = 65535U;
-            const uint16_t dstSlotStride = static_cast<uint16_t>(aivNum_ - 1U);
-            uint32_t sentFlags = 0U;
-            while (sentFlags < remoteFlagCnt_) {
-                uint32_t blockCnt = remoteFlagCnt_ - sentFlags;
-                if (blockCnt > FLAG_COPY_BLOCK_MAX) {
-                    blockCnt = FLAG_COPY_BLOCK_MAX;
-                }
-                const uint64_t chunkSlotOffset =
-                    (static_cast<uint64_t>(aivId_) + static_cast<uint64_t>(sentFlags) * aivNum_) * URMA_FLAG_SLOT_SIZE;
-                GlobalTensor<int32_t> localFlagGMTensor;
-                localFlagGMTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(localFlagAddr_ + chunkSlotOffset));
-                DataCopyParams flagCopyParams = {static_cast<uint16_t>(blockCnt), 1U, 0U, dstSlotStride};
-                DataCopy(localFlagGMTensor, flagValueTensor_[sentFlags * FLAG_ELEM_STRIDE], flagCopyParams);
-                sentFlags += blockCnt;
-            }
+            GlobalTensor<int32_t> localFlagGMTensor;
+            localFlagGMTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
+                localFlagAddr_ + static_cast<uint64_t>(sendStartTokenId_) * sizeof(int32_t)));
+            DataCopyExtParams flagCopyParams{1U, static_cast<uint32_t>(remoteFlagCnt_ * sizeof(int32_t)), 0U, 0U, 0U};
+            DataCopyPad(localFlagGMTensor, flagValueTensor_, flagCopyParams);
         }
 
         {
             GlobalTensor<int32_t> countRowGM;
             GM_ADDR countRowAddr = countMatrixBase_ + static_cast<uint64_t>(aivId_) * countRowStride_;
             countRowGM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(countRowAddr));
-            SyncFunc<HardEvent::S_MTE3>();
             DataCopy(countRowGM, rankCounts, rankCountElements_);
             SyncFunc<HardEvent::MTE3_S>();
         }
@@ -1214,17 +1430,12 @@ __aicore__ inline void AttentionToFfnUrma<TemplateAttentionToFfnUrmaTypeFunc>::P
         ScatterTokensToRankTables();
         SyncAll<true>();
 
-        for (uint32_t dstRank = 0U; dstRank < worldSize_; ++dstRank) {
-            for (uint32_t channelIdx = 0U; channelIdx < channelsPerRank_; ++channelIdx) {
-                uint32_t slot = dstRank * channelsPerRank_ + channelIdx;
-                if (slot % aivNum_ != aivId_) {
-                    continue;
-                }
-                RelayRemoteTokens(dstRank, channelIdx);
-            }
+        const uint32_t totalSlots = worldSize_ * channelsPerRank_;
+        for (uint32_t slot = aivId_; slot < totalSlots; slot += aivNum_) {
+            uint32_t dstRank = slot / channelsPerRank_;
+            uint32_t channelIdx = slot % channelsPerRank_;
+            RelayRemoteTokens(dstRank, channelIdx);
         }
-
-        SyncAll<true>();
         ClearAttnActiveFlags();
         SyncAll<true>();
         SetFlagToFFN();

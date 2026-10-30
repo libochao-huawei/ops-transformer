@@ -128,12 +128,12 @@ ffn_to_attention(buffer, x, session_ids, micro_batch_ids, token_ids, expert_offs
         <td>window_size</td>
         <td>int</td>
         <td>可选</td>
-        <td>本卡通信窗口内存大小（Bytes），即ffn侧内存大小，同时作为算子<code>ccl_buffer_size</code>（等于实际注册的窗口大小）。需不小于FFN侧窗口所需大小（<code>attention_to_ffn</code>全部attention worker的下发接收区 + 本算子flag source区与地址表区）；算子tiling会按会话布局校验该值（调用<code>ffn_to_attention</code>传入<code>attn_rank_table</code>时按其dim0精确校验，否则按保守最大会话数校验），不满足时算子执行报错。默认值为None，表示由框架按保守容量（覆盖<code>world_size - 1</code>个会话）内部分配。</td>
+        <td>本卡通信窗口内存大小（Bytes），即ffn侧内存大小，同时作为算子<code>ccl_buffer_size</code>（等于实际注册的窗口大小）。需不小于FFN侧窗口所需大小（承接<code>attention_to_ffn</code>的下发接收区，按对侧实际quant_mode；无法感知量化时可按保守容量<code>world_size - 1</code>个会话、非量化宽度估算）。算子tiling仅校验本算子attention侧落地区（单会话FP16/BF16回写数据区+flag区），不满足时算子执行报错。默认值为None，表示由框架按保守容量（覆盖<code>world_size - 1</code>个会话）内部分配。</td>
     </tr>
 </tbody>
 </table>
 
-该接口返回<code>FFNToAttentionBuffer</code>对象，内部自动计算FFN侧CCL通信缓冲区大小（覆盖<code>attention_to_ffn</code>的下发接收区及本算子scratch区，作为算子<code>ccl_buffer_size</code>属性，等于实际注册的窗口大小），并创建通信上下文，供<code>ffn_to_attention</code>使用；传入<code>window_addr</code>/<code>window_size</code>时，本卡通信窗口以该地址和大小注册。本接口与<code>attention_to_ffn</code>共用注册tag以便对端rank查询本卡窗口。
+该接口返回<code>FFNToAttentionBuffer</code>对象，内部自动计算FFN侧CCL通信缓冲区大小（覆盖<code>attention_to_ffn</code>的下发接收区，作为算子<code>ccl_buffer_size</code>属性，等于实际注册的窗口大小；本算子flag source区与地址表区由算子workspace申请，不占用窗口），并创建通信上下文，供<code>ffn_to_attention</code>使用；传入<code>window_addr</code>/<code>window_size</code>时，本卡通信窗口以该地址和大小注册。本接口与<code>attention_to_ffn</code>共用注册tag以便对端rank查询本卡窗口。
 
 ### ffn_to_attention
 
@@ -240,25 +240,29 @@ ffn_to_attention(buffer, x, session_ids, micro_batch_ids, token_ids, expert_offs
 ## 约束说明
 
 - 调用算子过程中使用的`group`、`world_size`、`token_info_table_shape`、`token_data_shape`参数及`ccl_buffer_size`取值所有卡需保持一致，网络中不同层中也需保持一致。其中`group`、`world_size`、`token_info_table_shape`、`token_data_shape`及`ccl_buffer_size`由`get_buffer_for_ffn_to_attention`创建的buffer封装，调用`ffn_to_attention`时无需单独传入。
-
-- 本算子与`attention_to_ffn`共用同一rank通信窗口（注册tag相同），本算子的flag source区与地址表/count行区布局在全部N个会话的下发接收区之后，与对侧会话数据区互不重叠。会话数`N`（即对侧`attentionWorkerNum`/`ffn_token_data_shape[0]`）在算子侧的确定方式：调用`ffn_to_attention`传入`attn_rank_table`时`N`为其dim0（精确布局，须满足`0 < N < world_size`且与对侧一致）；未传入时按`ccl_buffer_size`（即实际注册的窗口大小）所能容纳的最大会话数推导布局，此时窗口须按保守容量（`world_size - 1`个会话）分配，保证推导值不小于真实值。
+- 本算子与`attention_to_ffn`共用同一rank通信窗口（注册tag相同）。本算子仅回写各attention worker自身窗口槽位：per-token flag区 + 单会话紧凑FP16/BF16回写数据区，写入偏移与attention worker数量无关。`attention_to_ffn`下发的N会话接收区布局在FFN侧窗口，其大小依赖对侧`quant_mode`（量化按1B、非量化按2B下发），由`attention_to_ffn_v2`的tiling按实际元素宽度校验，本算子不再按非量化宽度保守镜像。调用`ffn_to_attention`传入`attn_rank_table`时其dim0（attention worker数`N`）须满足`0 < N < world_size`且与对侧一致。
 
 - `ccl_buffer_size`为HBM上分配的CCL通信缓冲区**总大小**（Bytes），等于实际注册的窗口大小：自定义内存时为`window_size`，否则由`get_buffer_for_ffn_to_attention`内部按保守容量自动计算，需满足：
 
-$$ccl\_buffer\_size \ge \mathrm{CeilAlign}\big(\mathrm{CeilAlign}(\mathrm{recvInfoSize} + \mathrm{recvDataSize} + 32\,\mathrm{KiB},\,512) + \mathrm{tableBytes},\ 2\,\mathrm{MB}\big)$$
+$$ccl\_buffer\_size \ge \mathrm{CeilAlign}\big(\mathrm{CeilAlign}(\mathrm{flagSize},\,512) + \mathrm{CeilAlign}(\mathrm{returnDataSize},\,512),\ 2\,\mathrm{MB}\big)$$
 
-其中（`sessionNum`为布局会话数：传入`attn_rank_table`时为其dim0，未传入时为保守上界`worldSize - 1`；接口内部默认按`worldSize - 1`计算）：
-  - `recvInfoSize = CeilAlign(sessionNum × microBatchNum × (2 + BS × expertNumPerToken) × 4B, 512)`（`attention_to_ffn` 下发的 N 会话 token 信息表区，镜像其对侧布局公式）
-  - `recvDataSize = CeilAlign(sessionNum × microBatchNum × BS × expertNumPerToken × HS × 2B, 512)`（`attention_to_ffn` 下发的 N 会话 token 数据区；2B 为对侧非量化元素宽度，量化模式下对侧按 1B 下发，此处为保守上界）
-  - `tableBytes = world_size × rankTableStride + 1025 × countRowStride`（各rank地址表与AIV计数行；1025 = 1条总计数行 + 1024条AIV预留计数行）
-  - `rankTableStride = CeilAlign(world_size × microBatchNum × BS × expertNumPerToken × 16B, 512)`
-  - `countRowStride = CeilAlign(world_size × 4B, 512)`
+其中：
 
-传入`attn_rank_table`时tiling按其dim0精确校验`ccl_buffer_size`是否覆盖N会话布局，不满足时报错；未传入时按可容纳的最大会话数推导布局。对端attention卡通信窗口大小由attention侧`get_buffer_for_attention_to_ffn`计算。
+  - `flagSize = microBatchNum × BS × expertNumPerToken × 4B`（本算子写入attention侧窗口的per-token flag区）
+  - `returnDataSize = microBatchNum × BS × expertNumPerToken × HS × 2B`（本算子写入attention侧窗口的单会话紧凑FP16/BF16回写数据区，写入偏移与attention worker数量无关）
+
+原窗口尾部的本算子flag source区与地址表/count行区已改为从算子workspace申请（大小由tiling自动计算；下一轮kernel启动时先回收上一轮在途WQE再复用workspace）。
+
+对端attention卡通信窗口大小由attention侧`get_buffer_for_attention_to_ffn`计算；量化模式下其结果（按1B/元素）即为本算子可接受的下限之上，tiling只校验上述落地区，因此两侧可共用同一窗口大小。
+
+- 异步发送的Tensor保活与延迟释放：
+    - 发送是异步的：kernel返回后通信引擎可能仍在读取`x`（数据WQE直接读`x`的GM行）。`ffn_to_attention`接口内部按轮次持有`x`的引用（仅引用，不拷贝），并在每次调用时非阻塞轮询设备写回的完成状态表，释放已完成轮次的引用，不在每轮通信上引入CPU同步等待。
+    - 同一buffer上的发送必须全部经由`ffn_to_attention`接口发起（保证轮次编号与kernel启动序号一一对应），且使用同一条NPU stream。
+    - 最后若干轮的在途发送在`buffer.destroy()`中通过device级同步统一等待并释放；直接丢弃buffer对象同样安全（内部状态表析构会执行相同的device同步）。
 
 - 自定义通信窗口约束（`window_addr`/`window_size`）：
     - 两个参数必须成对传入，`window_size`为本卡窗口内存的实际大小（Bytes），同时作为算子`ccl_buffer_size`。
-    - FFN卡上传入的为ffn侧内存大小，需不小于FFN侧窗口所需大小（全部attention worker的下发接收区 + 本算子flag source区与地址表区）；传入`attn_rank_table`时按其dim0精确校验，否则需覆盖保守容量（`world_size - 1`个会话）。
+    - FFN卡上传入的为ffn侧内存大小，需不小于FFN侧窗口所需大小（承接`attention_to_ffn`的下发接收区，按对侧实际quant_mode：量化按1B、非量化按2B；无法感知量化时可按保守容量`world_size - 1`个会话、非量化宽度估算，即`get_ffn_to_attention_ccl_buffer_size`的计算结果）。
     - 窗口内存由调用方管理，需在`buffer.destroy()`之前保持有效；框架仅负责清零一次，不负责分配与释放。
     - 仅channel后端（Ascend950）支持；同一进程同一group下只应创建一个通信buffer（attn卡创建`attention_to_ffn`的buffer，FFN卡创建`ffn_to_attention`的buffer）。
 
@@ -335,21 +339,24 @@ $$ccl\_buffer\_size \ge \mathrm{CeilAlign}\big(\mathrm{CeilAlign}(\mathrm{recvIn
       token_data_shape = [microBatchNum, BS, expertNumPerToken, HS]
 
       # 步骤1：准备本卡通信窗口内存并创建通信buffer。
-      # attention卡窗口需覆盖attention_to_ffn自身的staging/flag区（由get_buffer_for_attention_to_ffn
-      # 内部计算，见其文档）；FFN卡窗口需覆盖attention_to_ffn的下发接收区（每会话一个
-      # info表区+数据区）及本算子flag source/地址表区。传入attn_rank_table时按其dim0（即
-      # ATTENTION_WORKER_NUM）精确校验，未传入时按保守最大会话数（world_size - 1）校验；
-      # 此处为演示window_addr/window_size用法按保守容量手工计算。
+      # attention卡窗口需覆盖attention_to_ffn自身的token信息表/token数据区（其staging/flag区
+      # 已迁至算子workspace；本示例中该窗口同时接收ffn_to_attention的回传数据：单会话紧凑
+      # FP16/BF16数据区+flag区，写入偏移与attention worker数量无关）；
+      # FFN卡窗口需覆盖attention_to_ffn的下发接收区（每会话一个info表区+数据区，宽度按对侧
+      # quant_mode：量化1B、非量化2B；本算子flag source/地址表区已迁至算子workspace，不占用
+      # 窗口）。算子tiling仅校验attention侧落地区；此处为演示window_addr/window_size用法，
+      # FFN卡按保守容量（world_size - 1个会话、非量化宽度）手工计算。
       if rank < ATTENTION_WORKER_NUM:
           window_size = microBatchNum * BS * expertNumPerToken * (4 + HS * 2)
       else:
           # 保守容量：最大会话数 = world_size - 1；infoTableLastDim与attention_to_ffn的
-          # ffn_token_info_table_shape最后一维一致；另需为flag source/地址表区预留余量。
+          # ffn_token_info_table_shape最后一维一致；数据区按HS（2B元素）取保守上界，最终
+          # 按2MB向上对齐（flag source/地址表区由算子workspace申请，无需计入窗口大小）。
           max_sessions = WORLD_SIZE - 1
           info_table_last_dim = 2 + BS * expertNumPerToken
           window_size = max_sessions * microBatchNum * (
-              info_table_last_dim * 4 + BS * expertNumPerToken * H * 2
-          ) + 2 * 1024 * 1024
+              info_table_last_dim * 4 + BS * expertNumPerToken * HS * 2
+          )
       window_size = (
           window_size + 2 * 1024 * 1024 - 1
       ) // (2 * 1024 * 1024) * (2 * 1024 * 1024)
@@ -395,7 +402,8 @@ $$ccl\_buffer\_size \ge \mathrm{CeilAlign}\big(\mathrm{CeilAlign}(\mathrm{recvIn
               attn_rank_table=attn_rank_table,
           )
 
-      torch.npu.synchronize()
+      # 步骤4：收尾。destroy内部会先做device级同步，等待最后一轮在途发送完成后，
+      # 释放各轮保活的Tensor引用与注册的Host状态表内存。
       buffer.destroy()
       dist.barrier()
       dist.destroy_process_group()

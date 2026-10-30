@@ -9,6 +9,7 @@
  */
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <gtest/gtest.h>
@@ -28,16 +29,22 @@ using OpAttr = gert::TilingContextPara::OpAttr;
 
 struct FFNToAttentionV2CompileInfo {};
 constexpr int64_t MB_SIZE = 1024LL * 1024LL;
-// 4MB covers requiredWindowSize (~2.5MB for the default shapes with one attention worker:
-// N-scaled token window + flag sources + address tables).
+constexpr uint64_t WORKSPACE_ALIGN = 512U;
+constexpr uint64_t AIV_NUM = 48U;
+constexpr uint64_t URMA_FLAG_SLOT_SIZE = 32U;
+constexpr uint64_t REMOTE_ADDRESS_ENTRY_SIZE = 16U;
+constexpr uint64_t LIB_API_WORKSPACE_SIZE = 16U * 1024U * 1024U;
+constexpr uint64_t RESERVED_WORKSPACE_SIZE = 64U * 1024U * 1024U;
+constexpr uint64_t TOKEN_DTYPE_BYTES = 2U;
 constexpr int64_t DEFAULT_CCL_BUFFER_SIZE = 4LL * MB_SIZE;
-// attnRankTable dim0 = 11 means the window must host all 11 sessions' dispatch receiving area
-// (~23MB) plus the F2A scratch tail; 32MB covers it.
 constexpr int64_t RANK_TABLE_CCL_BUFFER_SIZE = 32LL * MB_SIZE;
-// microBatchNum = 2 doubles the per-session receiving area (~4.4MB for one attention worker);
-// 8MB covers one worker session so the relaxation (dim0 > 1) reaches the layout stage.
 constexpr int64_t MULTI_MICRO_BATCH_CCL_BUFFER_SIZE = 8LL * MB_SIZE;
+constexpr int64_t SMALL_CCL_BUFFER_SIZE = 2LL * MB_SIZE;
 
+uint64_t AlignUp(uint64_t value, uint64_t alignment)
+{
+    return (value + alignment - 1U) / alignment * alignment;
+}
 enum class InvalidInput {
     NONE,
     X_H,
@@ -153,7 +160,7 @@ void ExecuteTilingCase(const std::vector<TensorDescription>& inputs, const std::
 {
     FFNToAttentionV2CompileInfo compileInfo;
     gert::TilingContextPara tilingContextPara("FFNToAttentionV2", inputs, {{{}, ge::DT_INT64, ge::FORMAT_ND}}, attrs,
-                                              &compileInfo, "3510", 48U, 196608U, 4096U, MakeAscend950SocInfo());
+                                              &compileInfo, "3510", AIV_NUM, 196608U, 4096U, MakeAscend950SocInfo());
     Mc2Hcom::MockValues hcomTopologyMockValues{{"rankNum", 8}};
     if (expectedStatus == ge::GRAPH_SUCCESS) {
         Mc2ExecuteTestCase(tilingContextPara, hcomTopologyMockValues, expectedStatus, expectedTilingKey);
@@ -162,6 +169,18 @@ void ExecuteTilingCase(const std::vector<TensorDescription>& inputs, const std::
     Mc2ExecuteTestCase(tilingContextPara, hcomTopologyMockValues, expectedStatus);
 }
 
+bool RunTilingCase(const std::vector<TensorDescription>& inputs, const std::vector<OpAttr>& attrs,
+                   TilingInfo& tilingInfo)
+{
+    FFNToAttentionV2CompileInfo compileInfo;
+    gert::TilingContextPara tilingContextPara("FFNToAttentionV2", inputs, {{{}, ge::DT_INT64, ge::FORMAT_ND}}, attrs,
+                                              &compileInfo, "3510", AIV_NUM, 196608U, 4096U, MakeAscend950SocInfo());
+    Mc2Hcom::MockValues hcomTopologyMockValues{{"rankNum", 8}};
+    Mc2Hcom::MC2HcomTopologyMocker::GetInstance().SetValues(hcomTopologyMockValues);
+    const bool success = ExecuteTiling(tilingContextPara, tilingInfo);
+    Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+    return success;
+}
 class FFNToAttentionV2Arch35TilingTest : public testing::Test {};
 
 TEST_F(FFNToAttentionV2Arch35TilingTest, NoRankTable)
@@ -171,10 +190,49 @@ TEST_F(FFNToAttentionV2Arch35TilingTest, NoRankTable)
 
 TEST_F(FFNToAttentionV2Arch35TilingTest, RankTable)
 {
-    // attnRankTable dim0 (11) is the exact attention worker count; the buffer must host all
-    // sessions' dispatch receiving area plus the F2A scratch tail.
+    // attnRankTable dim0 (11) is the exact attention worker count.
     ExecuteTilingCase(BuildInputs(true), BuildAttrs(false, 1, RANK_TABLE_CCL_BUFFER_SIZE), ge::GRAPH_SUCCESS,
                       GET_TPL_TILING_KEY(true, TILINGKEY_TPL_A5));
+}
+
+TEST_F(FFNToAttentionV2Arch35TilingTest, RankTableWithLandingZoneOnlyBuffer)
+{
+    ExecuteTilingCase(BuildInputs(true), BuildAttrs(false, 1, DEFAULT_CCL_BUFFER_SIZE), ge::GRAPH_SUCCESS,
+                      GET_TPL_TILING_KEY(true, TILINGKEY_TPL_A5));
+}
+
+TEST_F(FFNToAttentionV2Arch35TilingTest, WorkspaceScratchDoesNotOverlapLibApiWorkspace)
+{
+    TilingInfo tilingInfo;
+    ASSERT_TRUE(RunTilingCase(BuildInputs(false), BuildAttrs(false, 1, SMALL_CCL_BUFFER_SIZE), tilingInfo));
+    ASSERT_GE(tilingInfo.tilingDataSize, sizeof(FFNToAttentionV2TilingData));
+    ASSERT_EQ(tilingInfo.workspaceSizes.size(), 1U);
+
+    FFNToAttentionV2TilingData tilingData{};
+    std::memcpy(&tilingData, tilingInfo.tilingData.get(), sizeof(tilingData));
+    const auto& info = tilingData.ffnToAttentionV2Info;
+    ASSERT_EQ(info.aivNum, AIV_NUM);
+    const uint64_t flagWorkspaceSize = static_cast<uint64_t>(info.aivNum) * URMA_FLAG_SLOT_SIZE;
+    const uint64_t rankTableStride = AlignUp(info.maxTokenNum * REMOTE_ADDRESS_ENTRY_SIZE, WORKSPACE_ALIGN);
+    const uint64_t countRowStride = AlignUp(static_cast<uint64_t>(info.worldSize) * sizeof(int32_t), WORKSPACE_ALIGN);
+    const uint64_t expectedTableBytes =
+        rankTableStride * info.worldSize + (static_cast<uint64_t>(info.aivNum) + 1U) * countRowStride;
+    const uint64_t expectedTableOffset = AlignUp(flagWorkspaceSize, WORKSPACE_ALIGN);
+    const uint64_t expectedWorkspaceSize =
+        LIB_API_WORKSPACE_SIZE + expectedTableOffset + expectedTableBytes + RESERVED_WORKSPACE_SIZE;
+    EXPECT_EQ(info.addressTableWorkspaceOffset, expectedTableOffset);
+    EXPECT_EQ(info.addressTableWorkspaceOffset % WORKSPACE_ALIGN, 0U);
+    EXPECT_EQ(info.addressTableBytes, expectedTableBytes);
+    EXPECT_EQ(static_cast<uint64_t>(tilingInfo.workspaceSizes[0]), expectedWorkspaceSize);
+    EXPECT_EQ(info.cclBufferSize, static_cast<uint64_t>(SMALL_CCL_BUFFER_SIZE));
+
+    const uint64_t tokenSlotNum = static_cast<uint64_t>(info.microBatchNum) * info.BS * info.expertNumPerToken;
+    const uint64_t flagAreaBytes = AlignUp(tokenSlotNum * sizeof(int32_t), WORKSPACE_ALIGN);
+    const uint64_t returnDataBytes = AlignUp(tokenSlotNum * info.HS * TOKEN_DTYPE_BYTES, WORKSPACE_ALIGN);
+    const uint64_t requiredWindowSize = flagAreaBytes + returnDataBytes;
+    EXPECT_LE(requiredWindowSize, static_cast<uint64_t>(SMALL_CCL_BUFFER_SIZE));
+    EXPECT_LT(static_cast<uint64_t>(SMALL_CCL_BUFFER_SIZE),
+              requiredWindowSize + flagWorkspaceSize + expectedTableBytes);
 }
 
 class FFNToAttentionV2InvalidInputTest : public testing::TestWithParam<InvalidInput> {};
@@ -222,10 +280,9 @@ TEST_F(FFNToAttentionV2Arch35TilingTest, RejectsHsSmallerThanH)
 
 TEST_F(FFNToAttentionV2Arch35TilingTest, RejectsBufferWithoutTokenInfoAlignmentSpace)
 {
-    // Rank-table mode (attnRankTable dim0 = 11) forces the window to host all 11 sessions (~23MB),
-    // drowning out the 2MB/4MB alignment boundary this pair verifies. Run without the rank table so
-    // the search picks one worker session (~2.5MB) and the 512B token-info alignment (neededSize
-    // 2097304 = 2MB + 152B) alone decides between the 2MB and 4MB buffers.
+    // Landing zone = AlignUp(135 * 4B, 512) + AlignUp(135 * 7764 * 2B, 512) = 1024 + 2096640 =
+    // 2097664 bytes (2MB + 512B): without the 512B flag-area alignment the raw area (2096820
+    // bytes) would fit in 2MB, so the alignment alone decides between the 2MB and 4MB buffers.
     ExecuteTilingCase(BuildInputs(false), BuildAlignmentBoundaryAttrs(2LL * MB_SIZE), ge::GRAPH_FAILED);
 }
 
@@ -233,6 +290,11 @@ TEST_F(FFNToAttentionV2Arch35TilingTest, AcceptsBufferWithTokenInfoAlignmentSpac
 {
     ExecuteTilingCase(BuildInputs(false), BuildAlignmentBoundaryAttrs(4LL * MB_SIZE), ge::GRAPH_SUCCESS,
                       GET_TPL_TILING_KEY(false, TILINGKEY_TPL_A5));
+}
+
+TEST_F(FFNToAttentionV2Arch35TilingTest, RejectsRankTableBufferBelowLandingZone)
+{
+    ExecuteTilingCase(BuildInputs(true), BuildAlignmentBoundaryAttrs(2LL * MB_SIZE), ge::GRAPH_FAILED);
 }
 
 } // namespace

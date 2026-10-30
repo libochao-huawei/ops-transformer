@@ -157,7 +157,7 @@
     <tr>
     <td style="white-space: nowrap">cclBufferSize</td>
     <td style="white-space: nowrap">属性</td>
-    <td style="white-space: nowrap">CCL通信缓冲区总大小（Bytes），由 <code>get_buffer_for_attention_to_ffn</code> 接口内部自动计算。需 >= token_info_size + token_data_size + staging_size + flag_staging_size（按2MB向上对齐）。</td>
+    <td style="white-space: nowrap">CCL通信缓冲区总大小（Bytes），由 <code>get_buffer_for_attention_to_ffn</code> 接口内部自动计算。需 >= token_info_size + token_data_size（按2MB向上对齐）。staging区与flag常驻区已改为从算子workspace申请，不占用窗口。</td>
     <td style="white-space: nowrap">INT64</td>
     <td style="white-space: nowrap">-</td>
     </tr>
@@ -186,7 +186,7 @@
 
 - `ccl_buffer_size`为HBM上分配的CCL通信缓冲区**总大小**（Bytes），需满足：
 
-$$ccl\_buffer\_size \ge \mathrm{CeilAlign}(\mathrm{CeilAlign}(\mathrm{tokenInfoSize},\ 512) + \mathrm{CeilAlign}(\mathrm{tokenDataSize},\ 512) + \mathrm{CeilAlign}(\mathrm{stagingSize},\ 512) + \mathrm{flagStagingSize},\ 2\,\mathrm{MB})$$
+$$ccl\_buffer\_size \ge \mathrm{CeilAlign}(\mathrm{CeilAlign}(\mathrm{tokenInfoSize},\ 512) + \mathrm{CeilAlign}(\mathrm{tokenDataSize},\ 512),\ 2\,\mathrm{MB})$$
 
 其中：
 
@@ -194,8 +194,15 @@ $$ccl\_buffer\_size \ge \mathrm{CeilAlign}(\mathrm{CeilAlign}(\mathrm{tokenInfoS
   - 非量化模式：`tokenDataSize = attentionWorkerNum × microBatchNum × BS × (K+shared) × HS × 2B`
   - INT8/FP8量化模式：`tokenDataSize = attentionWorkerNum × microBatchNum × BS × (K+shared) × HS × 1B`
   - FP4量化模式：`HS`已按打包字节计算，`tokenDataSize = attentionWorkerNum × microBatchNum × BS × (K+shared) × HS × 1B`
-  - `stagingSize = BS × (K+shared) × CeilAlign(HS × bytesPerElem, 32B)`，为窗口内token数据区之后的紧凑连续staging区（每token一个staging槽，槽步长按32B向上对齐；`bytesPerElem`与`tokenDataSize`一致，非量化为2B，量化为1B）
-  - `flagStagingSize = (BS × (K+shared) + 1) × 32B`，为staging区之后的URMA flag常驻区（每token一个32B flag槽 + 1个layer flag槽）
+
+> 窗口内仅保留token信息表与token数据区。原窗口尾部的staging区（每token一个staging槽，槽步长按32B向上对齐）与URMA flag常驻区（每token一个4B紧凑flag槽 + 1个32B layer flag槽）已改为从算子workspace申请，大小由tiling自动计算，用户无需感知。非量化模式（quantMode=0）与量化模式一致：输入`x`的行先经UB中转（GM→UB→GM）写入staging区，relay WQE从staging区读取数据发往目标卡，连续的tokenOffset可合并为单个WQE连续发送。
+
+- 异步发送与Tensor保活延迟释放：
+
+  - kernel退出时在途WQE可能尚未完成（通信引擎可能仍在读取workspace中的staging/flag区）。算子通过"设备完成通知驱动CPU延迟释放"机制保证源内存生命周期：torch_extension侧按轮次持有输入`x`的引用（仅引用，不拷贝）；下一轮kernel开头先回收前几轮的在途WQE（空闲channel立即返回，不引入每轮同步等待），随后由AIV0把已完成轮次写入注册的Host状态表；CPU侧在下一次调用时非阻塞轮询该状态表并释放已完成轮次的引用。
+  - 因此同一buffer上的调用需满足：全部经由torch_extension的`attention_to_ffn`接口发起（保证轮次编号与kernel启动序号一致），且使用同一条stream。
+  - 最后若干轮的引用在`AttentionToFfnBuffer.destroy()`中通过device级同步统一等待并释放；直接丢弃buffer对象同样安全（状态表析构会执行相同的device同步）。
+  - 该机制依赖通信域内无其他算子共享channel（前述通信域约束），drain只回收本算子发出的WQE。
 
 该大小由 `get_buffer_for_attention_to_ffn` 接口内部自动计算，用户无需自行计算或设置`ccl_buffer_size`。
 

@@ -362,7 +362,7 @@ attention_to_ffn(buffer, x, session_id, micro_batch_id, layer_id, expert_ids, ex
 
 - `ccl_buffer_size`为HBM上分配的CCL通信缓冲区**总大小**（Bytes），由`get_buffer_for_attention_to_ffn`内部自动计算，需满足：
 
-$$ccl\_buffer\_size \ge \mathrm{CeilAlign}(\mathrm{CeilAlign}(\mathrm{tokenInfoSize},\ 512) + \mathrm{CeilAlign}(\mathrm{tokenDataSize},\ 512) + \mathrm{CeilAlign}(\mathrm{stagingSize},\ 512) + \mathrm{flagStagingSize},\ 2\,\mathrm{MB})$$
+$$ccl\_buffer\_size \ge \mathrm{CeilAlign}(\mathrm{CeilAlign}(\mathrm{tokenInfoSize},\ 512) + \mathrm{CeilAlign}(\mathrm{tokenDataSize},\ 512),\ 2\,\mathrm{MB})$$
 
 其中：
 
@@ -370,12 +370,15 @@ $$ccl\_buffer\_size \ge \mathrm{CeilAlign}(\mathrm{CeilAlign}(\mathrm{tokenInfoS
   - 非量化模式：`tokenDataSize = attnWorkerNum × microBatchNum × BS × (K+shared) × HS × 2B`
   - INT8/FP8量化模式：`tokenDataSize = attnWorkerNum × microBatchNum × BS × (K+shared) × HS × 1B`
   - FP4量化模式：`HS`已按打包字节计算，`tokenDataSize = attnWorkerNum × microBatchNum × BS × (K+shared) × HS × 1B`
-  - `stagingSize = BS × (K+shared) × CeilAlign(HS × bytesPerElem, 32B)`，为窗口内token数据区之后的紧凑连续staging区（每token一个staging槽，槽步长按32B向上对齐；`bytesPerElem`与`tokenDataSize`一致，非量化为2B，量化为1B）
-  - `flagStagingSize = (BS × (K+shared) + 1) × 32B`，为staging区之后的URMA flag常驻区（每token一个32B flag槽 + 1个layer flag槽）
 
-该大小由`get_buffer_for_attention_to_ffn`内部自动计算，用户无需自行计算或设置`ccl_buffer_size`。`ccl_buffer_size`描述对端FFN卡通信窗口大小；本卡（attention侧）通信窗口大小由`window_size`指定。
+该大小由`get_buffer_for_attention_to_ffn`内部自动计算，用户无需自行计算或设置`ccl_buffer_size`。`ccl_buffer_size`描述对端FFN卡通信窗口大小；本卡（attention侧）通信窗口大小由`window_size`指定。窗口内仅保留token信息表与token数据区，原窗口尾部的紧凑staging区与URMA flag常驻区已改为从算子workspace申请（大小由tiling自动计算；下一轮kernel启动时先回收上一轮在途WQE再复用workspace）。非量化模式（quantMode=0）与量化模式一致：输入`x`的行先经UB中转（GM→UB→GM）写入staging区，relay WQE从staging区读取数据发往目标卡，连续的tokenOffset可合并为单个WQE连续发送。
 
-- 与`ffn_to_attention`共用窗口的交叉约束：`ffn_to_attention`回传数据（单会话、2B元素）落在本卡窗口头部（staging区之前）。非量化模式下N会话数据区恒可覆盖回传区；量化模式下需满足`attnWorkerNum × 1B ≥ 2B`（即`attnWorkerNum ≥ 2`），否则tiling将拒绝该配置（单会话量化下发时数据区无法容纳回传数据区）。
+- 异步发送的Tensor保活与延迟释放：
+    - 发送是异步的：kernel返回后通信引擎可能仍在读取workspace（staging/flag区）。`attention_to_ffn`接口内部按轮次持有`x`的引用（仅引用，不拷贝），并在每次调用时非阻塞轮询设备写回的完成状态表，释放已完成轮次的引用，不在每轮通信上引入CPU同步等待。
+    - 同一buffer上的发送必须全部经由`attention_to_ffn`接口发起（保证轮次编号与kernel启动序号一一对应），且使用同一条NPU stream。
+    - 最后若干轮的在途发送在`buffer.destroy()`中通过device级同步统一等待并释放；直接丢弃buffer对象同样安全（内部状态表析构会执行相同的device同步）。
+
+- 与`ffn_to_attention`共用窗口的交叉约束：`ffn_to_attention`回传数据（单会话、2B元素）落在本卡窗口头部（token数据区内）。非量化模式下N会话数据区恒可覆盖回传区；量化模式下需满足`attnWorkerNum × 1B ≥ 2B`（即`attnWorkerNum ≥ 2`），否则tiling将拒绝该配置（单会话量化下发时数据区无法容纳回传数据区）。
 
 - 自定义通信窗口约束（`window_addr`/`window_size`）：
     - 两个参数必须成对传入，`window_size`为本卡窗口内存的实际大小（Bytes）。
@@ -521,7 +524,8 @@ $$ccl\_buffer\_size \ge \mathrm{CeilAlign}(\mathrm{CeilAlign}(\mathrm{tokenInfoS
           ffn_start_rank_id=ffnStartRankId,
       )
 
-      torch.npu.synchronize()
+      # 步骤4：收尾。destroy内部会先做device级同步，等待最后一轮在途发送完成后，
+      # 释放各轮保活的Tensor引用与注册的Host状态表内存。
       buffer.destroy()
       dist.barrier()
       dist.destroy_process_group()

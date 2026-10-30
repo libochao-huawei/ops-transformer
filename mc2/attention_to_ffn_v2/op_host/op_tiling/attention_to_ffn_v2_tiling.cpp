@@ -53,8 +53,7 @@ constexpr size_t TOKEN_BYTES = 2U; // x dtype is FP16/BF16 (validated by the bas
 // Mirrors of the kernel UB buffer constants in op_kernel/attention_to_ffn_urma.h; keep both sides in sync.
 constexpr size_t URMA_BUFFER_NUM = 2U;                 // kernel: BUFFER_NUM
 constexpr size_t URMA_HCOMM_INIT_SIZE = 512U;          // kernel: URMA_HCOMM_INIT_SIZE
-constexpr size_t URMA_BATCH_BUFFER_SIZE = 16U * 1024U; // kernel: WQE region of ATTN_FFN_HCOMM_BATCH_UB_BYTES
-constexpr size_t HCOMM_CQE_SCRATCH_BYTES = 64U;        // kernel: HCOMM_CQE_SCRATCH_BYTES
+constexpr size_t URMA_BATCH_BUFFER_SIZE = 16U * 1024U; // kernel: ATTN_FFN_HCOMM_BATCH_UB_BYTES
 constexpr size_t BUCKET_BUFFER_SIZE = 32U * 1024U;     // kernel: BUCKET_BUFFER_SIZE
 constexpr size_t RANK_INFO_SEGMENT_NUM = 4U;           // kernel: RANK_INFO_SEGMENT_NUM
 constexpr size_t MX_PERGROUP_BLOCK_SIZE = 128U;        // kernel: PERGROUP_BLOCK_SIZE
@@ -199,11 +198,8 @@ ge::graphStatus CheckUrmaWinSlotCapacity(gert::TilingContext* context, const Att
     return ge::GRAPH_SUCCESS;
 }
 
-// All URMA staging sources live in the rank's own window (persistent across op calls): token data
-// is staged in a compact contiguous area, physically separated from the session-slot receiving
-// area to avoid HBM bank conflicts. Token/layer flags use a dedicated area after the staging
-// region. Nothing is staged in the per-call workspace because fire-and-forget WQEs may outlive the
-// op. Only layout validations remain here.
+// The win hosts only the shared token info table and token data region (plus the ffn_to_attention
+// return data landing inside the data region).
 ge::graphStatus CheckUrmaWinLayout(gert::TilingContext* context, AttentionToFfnV2TilingData* tilingData,
                                    uint32_t tilingKeyQuantMode, uint32_t outDtype)
 {
@@ -238,13 +234,7 @@ ge::graphStatus CheckUrmaWinLayout(gert::TilingContext* context, AttentionToFfnV
              std::to_string(f2aReturnDataBytes) + " bytes")
                 .c_str()),
         return ge::GRAPH_FAILED);
-    const size_t commuBytes = GetUrmaCommuBytes(tilingKeyQuantMode, outDtype, static_cast<size_t>(info.H));
-    const size_t stagingStride = CeilAlignSize(commuBytes, UB_ALIGN_SIZE);
-    const size_t maxTotalSendNum = static_cast<size_t>(info.X) * info.BS * expertNumPerToken;
-    const size_t stagingRegionSize = CeilAlignSize(maxTotalSendNum * stagingStride, URMA_WIN_REGION_ALIGN);
-    const size_t flagRegionSize =
-        (static_cast<size_t>(info.X) * info.BS * expertNumPerToken + 1U) * URMA_FLAG_SLOT_SIZE;
-    const size_t requiredWinBytes = infoRegionSize + dataRegionSize + stagingRegionSize + flagRegionSize;
+    const size_t requiredWinBytes = infoRegionSize + dataRegionSize;
 
     auto attrs = context->GetAttrs();
     OP_TILING_CHECK(attrs == nullptr, OP_LOGE_WITH_INVALID_INPUT(context->GetNodeName(), "attrs"),
@@ -256,8 +246,7 @@ ge::graphStatus CheckUrmaWinLayout(gert::TilingContext* context, AttentionToFfnV
                     OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
                         context->GetNodeName(), "ccl_buffer_size", std::to_string(*cclBufferSizePtr).c_str(),
                         (std::string("should >= ") + std::to_string(requiredWinBytes) +
-                         " bytes (token info + token data + compact staging + URMA flag staging area); use "
-                         "get_buffer_for_attention_to_ffn to compute it")
+                         " bytes (token info + token data area); use get_buffer_for_attention_to_ffn to compute it")
                             .c_str()),
                     return ge::GRAPH_FAILED);
 
@@ -266,7 +255,8 @@ ge::graphStatus CheckUrmaWinLayout(gert::TilingContext* context, AttentionToFfnV
 }
 
 // Mirror the per-AIV explicit InitBuffer footprint of the URMA kernel (op_kernel/attention_to_ffn_urma.h):
-// Init() + QuantInit() + HcommInit() + the isSync syncStatusWorkspaceBuf staged at runtime in SetFlagToFFN().
+// Init() + QuantInit() + HcommInit() + the isSync syncStatusWorkspaceBuf_ (SetFlagToFFN's send-status
+// matrix staging; every FFN-slot owner AIV reduces the matrix in parallel).
 // TPipe keeps every explicit buffer alive for the whole kernel lifetime, so the per-AIV UB footprint is the
 // sum of all allocations below. Buffer constants mirror the kernel side (see the mirrors block above);
 // keep both sides in sync when the kernel allocations change.
@@ -287,14 +277,22 @@ ge::graphStatus CheckUrmaUbCapacity(gert::TilingContext* context, const Attentio
     const size_t maxTotalSendNum = static_cast<size_t>(info.X) * info.BS * expertNumPerToken;
     const size_t maxTokensPerAiv = (maxTotalSendNum + aivNum - 1U) / aivNum;
 
-    const size_t expertIdsBytes = CeilAlignSize(maxTotalSendNum * sizeof(int32_t), ubAlign);
+    // Mirror of the kernel's expertIdsBuf_ row-slice sizing (op_kernel/attention_to_ffn_urma.h Init):
+    // the per-AIV token range can straddle expert_ids row boundaries, so it covers
+    // Ceil(maxTokensPerAiv, K+shared)+1 rows of K ids each, floored by maxTokensPerAiv.
+    const size_t maxRowsPerAiv = (maxTokensPerAiv + expertNumPerToken - 1U) / expertNumPerToken + 1U;
+    const size_t expertIdsSliceElems = maxRowsPerAiv * static_cast<size_t>(info.K);
+    const size_t expertIdsElems = (expertIdsSliceElems > maxTokensPerAiv) ? expertIdsSliceElems : maxTokensPerAiv;
+    const size_t expertIdsBytes = CeilAlignSize(expertIdsElems * sizeof(int32_t), ubAlign);
     const size_t statusBytes = ubAlign;
-    const size_t flagValueBytes = CeilAlignSize(maxTokensPerAiv * URMA_FLAG_SLOT_SIZE, ubAlign);
+    const size_t flagValueBytes = CeilAlignSize(maxTokensPerAiv * sizeof(int32_t), ubAlign);
     const size_t expertRankResolveBytes =
         CeilAlignSize(RANK_RESOLVE_STRIDE * static_cast<size_t>(info.expertNum) * sizeof(int32_t), ubAlign);
     const size_t tokenRankStashBytes = CeilAlignSize(maxTokensPerAiv * sizeof(int32_t), ubAlign);
     const size_t rankCountRowBytes = CeilAlignSize(static_cast<size_t>(info.worldSize) * sizeof(int32_t), ubAlign);
     const size_t rankInfoBytes = RANK_INFO_SEGMENT_NUM * rankCountRowBytes;
+    const size_t winBaseRankNum = (info.worldSize == 0U) ? 1U : static_cast<size_t>(info.worldSize);
+    const size_t rankWinBaseBytes = CeilAlignSize(winBaseRankNum * sizeof(uint64_t), ubAlign);
 
     // QuantInit()/Init() queues; castTempBuf_/sumOutBuf_ alias the fp32 buffers in quant mode.
     size_t queueBytes = 0U;
@@ -316,7 +314,7 @@ ge::graphStatus CheckUrmaUbCapacity(gert::TilingContext* context, const Attentio
                      2U * CeilAlignSize(axisH * sizeof(float), ubAlign); // receiveDataCastFloat + smoothScales
     }
 
-    // isSync: ffnStatusBuf_ on every AIV plus the SetFlagToFFN syncStatusWorkspaceBuf (aivNum rows).
+    // isSync: ffnStatusBuf_ on every AIV plus SetFlagToFFN's syncStatusWorkspaceBuf_ (aivNum rows).
     size_t syncBytes = 0U;
     if (info.syncFlag == 1U) {
         const size_t ffnNum = static_cast<size_t>(info.worldSize) - info.attentionWorkerNum;
@@ -333,10 +331,10 @@ ge::graphStatus CheckUrmaUbCapacity(gert::TilingContext* context, const Attentio
         }
     }
 
-    const uint64_t requiredUbBytes = static_cast<uint64_t>(
-        expertIdsBytes + statusBytes + flagValueBytes + expertRankResolveBytes + tokenRankStashBytes +
-        BUCKET_BUFFER_SIZE + rankInfoBytes + queueBytes + syncBytes + activeMaskBytes + URMA_HCOMM_INIT_SIZE +
-        URMA_BATCH_BUFFER_SIZE + HCOMM_CQE_SCRATCH_BYTES);
+    const uint64_t requiredUbBytes =
+        static_cast<uint64_t>(expertIdsBytes + statusBytes + flagValueBytes + expertRankResolveBytes +
+                              tokenRankStashBytes + BUCKET_BUFFER_SIZE + rankInfoBytes + rankWinBaseBytes + queueBytes +
+                              syncBytes + activeMaskBytes + URMA_HCOMM_INIT_SIZE + URMA_BATCH_BUFFER_SIZE);
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     uint64_t availableUbBytes = 0U;
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, availableUbBytes);
@@ -349,11 +347,9 @@ ge::graphStatus CheckUrmaUbCapacity(gert::TilingContext* context, const Attentio
     return ge::GRAPH_SUCCESS;
 }
 
-// Extend workspace for the relay rank tables. Phase 1 (all AIVs) counts its remote records per
-// rank and publishes one count row per AIV; the scatter pass buckets token offsets into compact
-// per-rank tables; the relay reads only the served ranks' tables, replacing the previous
-// full-list rescan per (dstRank, channel) slot.
-static void ExtendWorkspaceForRankTables(gert::TilingContext* context, AttentionToFfnV2TilingData* tilingData)
+// Extend workspace for the relay rank tables plus the staging/flag regions moved out of the win.
+static void ExtendWorkspaceForRankTables(gert::TilingContext* context, AttentionToFfnV2TilingData* tilingData,
+                                         uint32_t tilingKeyQuantMode, uint32_t outDtype)
 {
     size_t* workSpaces = context->GetWorkspaceSizes(1);
     if (workSpaces == nullptr) {
@@ -373,7 +369,12 @@ static void ExtendWorkspaceForRankTables(gert::TilingContext* context, Attention
     const size_t countMatrixBytes =
         CeilAlignSize(static_cast<size_t>(info.aivNum) * countRowStride, WORKSPACE_ELEMENT_OFFSET);
     const size_t bucketTableBytes = CeilAlignSize(maxTotalSendNum * sizeof(int32_t), WORKSPACE_ELEMENT_OFFSET);
-    workSpaces[0] += regionsOffset + countMatrixBytes + bucketTableBytes;
+    const size_t commuBytes = GetUrmaCommuBytes(tilingKeyQuantMode, outDtype, static_cast<size_t>(info.H));
+    const size_t stagingStride = CeilAlignSize(commuBytes, UB_ALIGN_SIZE);
+    const size_t stagingRegionBytes = CeilAlignSize(maxTotalSendNum * stagingStride, URMA_WIN_REGION_ALIGN);
+    const size_t flagRegionBytes =
+        CeilAlignSize(maxTotalSendNum * sizeof(int32_t), UB_ALIGN_SIZE) + URMA_FLAG_SLOT_SIZE;
+    workSpaces[0] += regionsOffset + countMatrixBytes + bucketTableBytes + stagingRegionBytes + flagRegionBytes;
 }
 
 ge::graphStatus TilingNewQuantMode(gert::TilingContext* context, uint32_t quantMode)
@@ -416,16 +417,14 @@ ge::graphStatus TilingNewQuantMode(gert::TilingContext* context, uint32_t quantM
                     OP_LOGE(nodeName, "failed to check URMA win layout"), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(CheckUrmaUbCapacity(context, tilingData, tilingKeyQuantMode, outDtype) != ge::GRAPH_SUCCESS,
                     OP_LOGE(nodeName, "failed to check URMA UB capacity"), return ge::GRAPH_FAILED);
-    ExtendWorkspaceForRankTables(context, tilingData);
+    ExtendWorkspaceForRankTables(context, tilingData, tilingKeyQuantMode, outDtype);
     return SetV2TilingKey(context, tilingKeyQuantMode, outDtype, info.isScales, info.syncFlag == 1U, info.isActiveMask);
 }
 } // namespace
 
 ge::graphStatus AttentionToFfnV2TilingFunc(gert::TilingContext* context)
 {
-    // Deployment marker: grep plog for this tag to verify the rebuilt package is actually
-
-    OP_LOGI(context->GetNodeName(), "[AT2FFN_V2_URMA_FIX] v11 (ubExpertRankResolve+batchedFlagCopy) active");
+    OP_LOGI(context->GetNodeName(), "[AT2FFN_V2_URMA_FIX] v18 (nonQuantStaged) active");
     auto attrs = context->GetAttrs();
     OP_TILING_CHECK(attrs == nullptr, OP_LOGE_WITH_INVALID_INPUT(context->GetNodeName(), "attrs"),
                     return ge::GRAPH_FAILED);
@@ -463,7 +462,7 @@ ge::graphStatus AttentionToFfnV2TilingFunc(gert::TilingContext* context)
     OP_TILING_CHECK(
         CheckUrmaUbCapacity(context, tilingData, info.quantMode, ATTN_FFN_TILINGKEY_OUT_INT8) != ge::GRAPH_SUCCESS,
         OP_LOGE(context->GetNodeName(), "failed to check URMA UB capacity"), return ge::GRAPH_FAILED);
-    ExtendWorkspaceForRankTables(context, tilingData);
+    ExtendWorkspaceForRankTables(context, tilingData, info.quantMode, ATTN_FFN_TILINGKEY_OUT_INT8);
     return SetV2TilingKey(context, info.quantMode, ATTN_FFN_TILINGKEY_OUT_INT8, info.isScales, info.syncFlag == 1U,
                           info.isActiveMask);
 }
