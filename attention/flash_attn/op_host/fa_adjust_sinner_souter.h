@@ -124,19 +124,23 @@ constexpr uint32_t FA_TEMPLATE_DN_UNMERGED = 2; // 不合轴 DN(templateId=2)
 // 共享该开关, 保证两侧分核选择严格一致; 关闭时模板路由维持原逻辑(ND/合轴DN)。
 constexpr bool DN_UNMERGED_ROUTE_ENABLED = false;
 
-// Route Q >= 256 and QK head dim != 256 to DN for no-mask (0) or causal (3).
-// Nonmatching cases retain the mainline ND / merged-DN selection.
-constexpr int64_t DN_UNMERGED_ROUTE_MIN_SEQ_Q = 256;
-
-// DN 模板路由的共享判定: host tiling 与 flash_attn_metadata(AICPU) 必须使用同一份逻辑,
-// 保证 metadata 的分核 outputLayout 选择与 kernel 模板选择严格一致。
-// Both host tiling and metadata use the QK head dimension for the D256 fallback.
-// FA_TEMPLATE_ND means no unmerged override; host tiling retains its mainline selection.
-inline uint32_t GetFlashAttnTemplateId(int64_t maxSeqQ, int64_t maskMode, int64_t qkHeadDim)
+// 路由条件: V_D<=128 + mask_mode 0/3 + max_seqlen_q>=256; 其余回退 ND 模板。
+//   - V_D>128(D=256 档) 不在当前 DN 不合轴模板范围内;
+//   - mask_mode=4(BAND) 不支持;
+//   - maxSeqlenQ<256(含 -1: host 读不到 cu_seqlens, 无法与 AICPU 严格对齐) 任务量不足。
+inline uint32_t GetFlashAttnTemplateId(uint32_t qkHeadDim, uint32_t vHeadDim, int64_t maskMode, int64_t maxSeqlenQ)
 {
-    bool routeToDnUnmerged =
-        (qkHeadDim != DSIZE_256) && (maxSeqQ >= DN_UNMERGED_ROUTE_MIN_SEQ_Q) && (maskMode == 0 || maskMode == 3);
-    return routeToDnUnmerged ? FA_TEMPLATE_DN_UNMERGED : FA_TEMPLATE_ND;
+    (void)qkHeadDim;
+    if (vHeadDim > 128U) {
+        return FA_TEMPLATE_ND;
+    }
+    if (maskMode != 0 && maskMode != 3) {
+        return FA_TEMPLATE_ND;
+    }
+    if (maxSeqlenQ < 256) {
+        return FA_TEMPLATE_ND;
+    }
+    return FA_TEMPLATE_DN_UNMERGED;
 }
 
 } // namespace fa_tiling_util

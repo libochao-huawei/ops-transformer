@@ -27,7 +27,7 @@
 #include "../../../common/op_kernel/init_output.h"
 #include "../memory_copy_arch35.h"
 #include "../../../common/op_kernel/attn_sink_gs1.h"
-#include "../utils/attenmask_gs1.h"
+#include "../utils/attn_softmax_dn_bn1s1s2_vf.h"
 #include "../../../common/op_kernel/arch_info.h"
 
 using namespace AscendC;
@@ -76,8 +76,6 @@ public:
     static constexpr uint32_t UB_OUT_VEC1_RES_EVENT1 = 3;
     static constexpr uint32_t UB_OUT_LSE_OUT_EVENT0 = 4;
     static constexpr uint32_t UB_OUT_LSE_OUT_EVENT1 = 5;
-    // MTE2<->V, mask 拷入buffer(FD block 占用 2/4/8/9/10/11, 6/7 空闲)
-    static constexpr uint32_t UB_IN_MASK_EVENT0 = 6;
 
     // L1
     static constexpr uint32_t L1_P_BUFCNT = 3U;
@@ -126,11 +124,12 @@ public:
     LocalTensor<uint8_t> ubLseOutBuffers_;
     uint32_t lseOutUbBufId_ = 0;
 
-    // arch92 DN mask layout: [Key, Query], adapted to one AIV's half-M tile.
-    static constexpr uint32_t MASK_M_BASE = AttentionCommon::Align(mBaseSize / CV_RATIO, 32U);
-    static constexpr uint32_t UB_MASK_BUFCNT = 2U;
-    static constexpr uint32_t UB_MASK_BUF_BYTES = MASK_M_BASE * s2BaseSize;
-    LocalTensor<uint8_t> ubMaskBuffers_;
+    // 这些缓冲区加起来不能超过 UB 可用大小, 超了直接编译报错(不含 FD block 复用的那块空间)
+    static constexpr uint32_t UB_TOTAL_BYTES =
+        UB_MM_RES_BUFCNT * UB_MM_RES_BUF_BYTES + UB_VEC2_RES_BUF_BYTES + UB_VEC1_RES_BUFCNT * UB_VEC1_RES_BUF_BYTES +
+        UB_SOFTMAX_SUM_BUFCNT * UB_SOFTMAX_SUM_BUF_BYTES + UB_SOFTMAX_MAX_BUFCNT * UB_SOFTMAX_MAX_BUF_BYTES +
+        UB_SOFTMAX_EXP_BUFCNT * UB_SOFTMAX_EXP_BUF_BYTES + UB_LSE_OUT_BUFCNT * UB_LSE_OUT_BUF_BYTES;
+    static_assert(UB_TOTAL_BYTES <= 254016U, "DN vec UB buffers exceed device capacity (248KB)");
 
     const ConstInfo_t& constInfo_;
 
@@ -146,7 +145,6 @@ public:
     CopyAttenOutUbToGm<OUTPUT_T, OUT_FORMAT, UbFormat::S1_ONLY> copyAttenOutUbToGm_;
     GlobalTensor<OUTPUT_T> attentionOutGm_;
     GlobalTensor<float> softmaxLseGm_;
-    GlobalTensor<uint8_t> attenMaskGmInt_;
     GlobalTensor<float> accumOutGm_;
     GlobalTensor<float> softmaxFDSumGm_;
     GlobalTensor<float> softmaxFDMaxGm_;
@@ -168,6 +166,7 @@ public:
                                      __gm__ uint8_t* softmaxLse, __gm__ uint8_t* attentionOut,
                                      __gm__ uint8_t* workspace)
     {
+        (void)attenMask; // mask_mode=3 的遮挡关系按行列号现算, 不再读 atten_mask
         uint32_t tmp1 = NEGATIVE_MIN_VALUE_FP32;
         this->negativeFloatScalar_ = *((T*)&tmp1);
 
@@ -177,10 +176,6 @@ public:
 
         if (constInfo_.isSoftmaxLseEnable) {
             softmaxLseGm_.SetGlobalBuffer((__gm__ float*)softmaxLse);
-        }
-
-        if constexpr (HAS_MASK) {
-            attenMaskGmInt_.SetGlobalBuffer((__gm__ uint8_t*)attenMask);
         }
 
         if (constInfo_.enableFlashDecode) {
@@ -234,7 +229,6 @@ public:
                 UB_LSE_OUT_BUF_BYTES); // 输出BUF:
                                        // FD中间结果SUM和MAX拷出至GM，或者LSE结果拷出；按actVecMSize*8(fp32块对齐)定容
         addrUb += UB_LSE_OUT_BUFCNT * UB_LSE_OUT_BUF_BYTES;
-        ubMaskBuffers_ = LocalTensor<uint8_t>(TPosition::VECIN, addrUb, UB_MASK_BUFCNT * UB_MASK_BUF_BYTES);
     }
 
     __aicore__ inline void ResetSoftmaxBuffer(uint32_t slotIdx, const RunInfo& runInfo)
@@ -407,7 +401,6 @@ public:
         static constexpr uint32_t vec1S2strideDn = s2BaseSize * 8;
         static constexpr uint32_t vec1ResOffsetDn = s2BaseSize * 32 + 64;
 
-        LocalTensor<uint8_t> attenMaskUb;
         LocalTensor<T> sumUb =
             softmaxSumBuf_[(runInfo.mloop % UB_SOFTMAX_SUM_BUFCNT) * (UB_SOFTMAX_SUM_BUF_BYTES / sizeof(T))];
         LocalTensor<T> maxUb =
@@ -415,32 +408,32 @@ public:
         LocalTensor<T> expUb =
             softmaxExpBuf_[(runInfo.loop % UB_SOFTMAX_EXP_BUFCNT) * (UB_SOFTMAX_EXP_BUF_BYTES / sizeof(T))];
 
-        bool isSkipMask = true;
-        const uint32_t maskBufId = runInfo.loop % UB_MASK_BUFCNT;
-        if constexpr (HAS_MASK) {
-            attenMaskUb = ubMaskBuffers_[maskBufId * UB_MASK_BUF_BYTES];
-            Mutex::Lock<PIPE_MTE2>(UB_IN_MASK_EVENT0 + maskBufId);
-            AttenMaskCopyInDn(attenMaskUb, 0, runInfo.actVecMSize, isSkipMask, runInfo);
-            Mutex::Unlock<PIPE_MTE2>(UB_IN_MASK_EVENT0 + maskBufId);
-        }
-
         Mutex::Lock<PIPE_V>(UB_OUT_VEC1_RES_EVENT0 + vec1ResUbBufId_);
         LocalTensor<INPUT_T> stage1CastTensor =
             ubVec1ResBuffers_[vec1ResUbBufId_ * UB_VEC1_RES_BUF_BYTES].template ReinterpretCast<INPUT_T>();
         if constexpr (HAS_MASK) {
-            if (!isSkipMask) {
-                Mutex::Lock<PIPE_V>(UB_IN_MASK_EVENT0 + maskBufId);
+            // 本半区第 r 行 = query token(firstQ + r), 本块第 c 列 = key token(s2Idx + c)。
+            // 右对齐 causal 要求 key <= query + nextTokensLeftUp, 即 c <= maskLine + r。
+            const int64_t firstQ = runInfo.s1Idx + runInfo.vecMbaseIdx;
+            const int64_t maskLine = runInfo.nextTokensLeftUp + firstQ - runInfo.s2Idx;
+            const bool needMask =
+                static_cast<int64_t>(runInfo.s2Idx + runInfo.actSingleLoopS2Size) > (firstQ + runInfo.nextTokensLeftUp);
+            if (needMask) {
+                ProcessVec1VfDnLine<T, INPUT_T, true, s2BaseSize>(
+                    stage1CastTensor, sumUb, maxUb, mm1ResUbTensor, expUb, runInfo.actMSizeAlign32 >> 1,
+                    runInfo.actSingleLoopS2Size, static_cast<T>(constInfo_.scaleValue), negativeFloatScalar_, maskLine);
+            } else {
+                ProcessVec1VfDnLine<T, INPUT_T, false, s2BaseSize>(
+                    stage1CastTensor, sumUb, maxUb, mm1ResUbTensor, expUb, runInfo.actMSizeAlign32 >> 1,
+                    runInfo.actSingleLoopS2Size, static_cast<T>(constInfo_.scaleValue), negativeFloatScalar_, maskLine);
             }
-        }
-        FaVectorApi::ProcessVec1VfDn<T, INPUT_T, true, HAS_MASK, s2BaseSize>(
-            stage1CastTensor, sumUb, maxUb, mm1ResUbTensor, expUb, nullptr, attenMaskUb, runInfo.actMSizeAlign32 >> 1,
-            runInfo.actSingleLoopS2SizeAlign, runInfo.actSingleLoopS2Size, static_cast<T>(constInfo_.scaleValue), 1.0f,
-            negativeFloatScalar_, 0.0F, !isSkipMask, 1.0f, 0.0f, MASK_M_BASE);
-
-        if constexpr (HAS_MASK) {
-            if (!isSkipMask) {
-                Mutex::Unlock<PIPE_V>(UB_IN_MASK_EVENT0 + maskBufId);
-            }
+        } else {
+            LocalTensor<uint8_t> unusedMaskTensor;
+            constexpr float descaleQK = 1.0F;
+            FaVectorApi::ProcessVec1VfDn<T, INPUT_T, true, false, s2BaseSize>(
+                stage1CastTensor, sumUb, maxUb, mm1ResUbTensor, expUb, nullptr, unusedMaskTensor,
+                runInfo.actMSizeAlign32 >> 1, runInfo.actSingleLoopS2SizeAlign, runInfo.actSingleLoopS2Size,
+                static_cast<T>(constInfo_.scaleValue), descaleQK, negativeFloatScalar_, 0.0F, false);
         }
         Mutex::Unlock<PIPE_V>(UB_OUT_VEC1_RES_EVENT0 + vec1ResUbBufId_);
         Mutex::Lock<PIPE_MTE3>(UB_OUT_VEC1_RES_EVENT0 + vec1ResUbBufId_);
@@ -465,36 +458,6 @@ public:
 
         Mutex::Unlock<PIPE_MTE3>(UB_OUT_VEC1_RES_EVENT0 + vec1ResUbBufId_);
         vec1ResUbBufId_ = (vec1ResUbBufId_ + 1U) % UB_VEC1_RES_BUFCNT;
-    }
-
-    __aicore__ inline void AttenMaskCopyInDn(LocalTensor<uint8_t> attenMaskUb, uint32_t vecMIdx, uint32_t mDealSize,
-                                             bool& isSkipMask, RunInfo& runInfo)
-    {
-        MaskInfo<MaskFormat::S1_ONLY> info;
-        info.s1StartIdx = runInfo.s1Idx + runInfo.vecMbaseIdx + vecMIdx;
-        info.s1dealNum = MASK_M_BASE;
-        info.s1Size = runInfo.actS1Size;
-        info.gSize = constInfo_.gSize;
-        info.s2StartIdx = runInfo.s2Idx;
-        info.s2dealNum = runInfo.actSingleLoopS2Size;
-        info.s2Size = runInfo.actS2Size;
-        info.nBaseSize = s2BaseSize;
-        info.preToken = constInfo_.preTokens;
-        info.nextToken = constInfo_.nextTokens;
-        info.sparseMode = static_cast<SparseMode>(constInfo_.sparseMode);
-        info.batchIdx = (constInfo_.attenMaskBatch == 1) ? 0 : runInfo.bIdx;
-        info.attenMaskBatchStride = constInfo_.attenMaskS1Size * constInfo_.attenMaskS2Size;
-        info.attenMaskS1Stride = constInfo_.attenMaskS2Size;
-        info.attenMaskDstStride = 0;
-        info.maskValue = negativeIntScalar_;
-        info.s1LeftPaddingSize = runInfo.qPaddingBeginOffset;
-        info.s2LeftPaddingSize = runInfo.kvPaddingBeginOffset;
-        info.attenMaskType = MASK_BOOL;
-
-        isSkipMask = IsSkipAttentionmask(info);
-        if (!isSkipMask) {
-            AttentionmaskCopyInDn<uint8_t, true, s2BaseSize>(attenMaskUb, attenMaskGmInt_, info);
-        }
     }
 
     __aicore__ inline void Vec1PostProcess(RunInfo runInfo)
