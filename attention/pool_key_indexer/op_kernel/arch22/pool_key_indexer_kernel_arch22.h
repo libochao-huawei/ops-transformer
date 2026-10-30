@@ -28,6 +28,78 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
+// arch22 ProcessDecode 的 isLDOpen 调用门开关。1=!isLDOpen 时整个 ProcessDecode 直接 return,
+// prefill 不再白付 InitLDBuffers(pipe->Reset()+LD 缓冲重分配) + ICachePreLoad + 一次
+// 40 AIV 全设备 SyncAll(); 0=无条件执行(基线路径)。
+// 数值零影响: !isLDOpen ⇒ splitCoreInfo.isLD 恒 false(SplitCore 的 S2 跨核规避把
+// coreDealBlockCnt 抬到整组 ⇒ s2End=s2BaseNum-1; over2K 分支同样直接给 s2End=s2BaseNum-1)
+// ⇒ ProcessLD 本就是死代码; InitLDBuffers 只重分配 LD 专属缓冲、不写任何输出张量;
+// ICachePreLoad 是纯 icache 提示。isLDOpen 由 constInfo(全核同 tiling)推导 ⇒ 全核一致
+// 跳过或一致执行, 不会半参与导致栅栏挂死。
+// 注意: 只包 InitLDBuffers 的调用点, 其函数体不动 —— 内部 ExpandSlotDrainAll →
+// pipe->Reset() → ExpandSlotAcquire → SetWaitFlag<MTE3_S> → VToSSync 的次序是精度约束,
+// 改次序会引入 MTE3 死锁/aicore 超时(507014)。
+#ifndef PKI_DECODE_LD_GATE
+#define PKI_DECODE_LD_GATE 1
+#endif
+// Init 期参数常驻开关: pool_tail_k / actual_seq_q / actual_seq_k 的每块 GM 标量读改
+// Init 期常驻。1=在 Init 期(SplitCore 之前)把三张量逐 batch 的原始 GM 值缓存到 kernel
+// 成员定长数组, 热路径只读缓存; 0=热路径逐次 GM 标量读(基线路径)。
+// 数值 bit-exact: 同一 GM 同一元素, 且这些张量在 kernel 执行期只读 ⇒ 缓存值与逐次读回
+// 的值逐位相同; TND 的前缀和差分仍由原函数 GetActualSeqLen/原读点原式完成, 本开关只替换
+// "值的来源", 不做任何预差分(混用"缓存差分值"与"缓存前缀和"会 off-by-one)。
+// 载体 = device 标量侧 local memory(类成员数组), 不占 UB(int8 UB 余量仅 7584B);
+// batchSize 超 PKI_PARAM_RESIDENT_MAX_B 时 paramResidentOn_=false, 回退逐次 GM 读。
+// 全核一致性: 缓存建于 SplitCore 之前, 各核读同一 GM ⇒ 缓存逐值相同。
+#ifndef PKI_PARAM_RESIDENT
+#define PKI_PARAM_RESIDENT 1
+#endif
+#ifndef PKI_PARAM_RESIDENT_MAX_B
+#define PKI_PARAM_RESIDENT_MAX_B 64
+#endif
+// ReadSeqRaw 的张量标识(只用于选中对应的常驻数组, 不参与任何算术)
+constexpr uint32_t PKI_SEQ_Q = 0U;
+constexpr uint32_t PKI_SEQ_K = 1U;
+
+// int8-only LD gate: 仅当 quantMode==2(int8) && sparseIndicesMode==1(compact) 且组原子装箱
+// 损失 lossInd 达阈值 τ=10% 时, 放开 S2 跨核切分(isLDOpen=true)。放开后复用现行通路:
+// SplitCore 的规避分支(`!isLDOpen` 守卫)自然旁路、isLD 置位、ProcessDecode/ProcessLD、
+// InitLDBuffers/InitSortOutBuf 与展开事件机不动。
+// 判据为 device 侧精确式(host 静态上界易误判, 禁用):
+//   lossInd = ⌈G/C⌉·Nmax/(T/C) − 1,  C = usedCoreNum(下发原值, SplitCore 收敛前读取)
+//   G/Nmax/T 与 GetTotalBaseBlockNum 同源一趟推导(同一个 GetS1S2ActualSeqLen/
+//   GetS2BaseBlockNumOnMask 调用与实参), 逐核读同一份 tiling/actual_seq ⇒ 全核一致,
+//   SyncAll 不会半参与。
+// τ 用定点整数比较(无浮点): lossInd×100 ≥ 10 ⇔ 10·⌈G/C⌉·Nmax·C ≥ 11·T。
+// over2K 否决在本判据之外(over2K 下 s2Loop≡1 无切分对象)。
+// 1=本 gate 生效; 0=新增代码全部不生成(#if 隔离), isLDOpen 仅由既有 unitUB+over2K 判据
+//   决定 ⇒ 行为与该 gate 引入前等价。
+// 与 PKI_DECODE_LD_GATE 正交: 那是对既有 gate 的调用门, 本开关是 gate 的判定条件,
+//   两者独立开/关。
+// bf16/fp16 实例化: Refine/计数调用点包在 if constexpr (LIT::isInt8) 内 ⇒ 非 int8 模板
+//   不生成该代码; V1/over2K 在运行时判据第一道即返回 ⇒ 输出不变。
+#ifndef PKI_INT8_LD_GATE
+#define PKI_INT8_LD_GATE 0
+#endif
+// gate 调试计数的独立开关(与 gate 判定本体拆分): 调试计数 = 每 AIV 8×int32 落盘到
+// ldIdx 区专属槽 + ProcessMain 尾 1 条 PipeBarrier<PIPE_ALL>。gate 的判定/生效语义
+// 两值完全相同, DBG=0 仅失去上板取证能力:
+//   1=调试形态(gate 命中计数 + 组统计落盘);
+//   0=发布形态: 零计数区/零落盘/零额外 PipeBarrier, gate 未开全域也无本设施的开销。
+#ifndef PKI_LD_GATE_DBG
+#define PKI_LD_GATE_DBG 0
+#endif
+// τ=10% 的定点比较系数: lossInd≥τ ⇔ LOSS_NUM·⌈G/C⌉·Nmax·C ≥ LOSS_DEN·T
+#define PKI_LD_GATE_LOSS_NUM 10ULL
+#define PKI_LD_GATE_LOSS_DEN 11ULL
+// quantMode 的存储口径: host -1/0/1/2 → tiling 存值 +1(SetTilingData), int8(用户值 2)⇒ 3
+#define PKI_QUANT_MODE_INT8_STORED 3
+#if PKI_LD_GATE_DBG
+// gate 调试计数区 magic("PKLD"): 落在 host 预留的 ldIdx 区起点(wsOffLdIdx), kernel 自有
+// 布局从不触及该区(见 FlushLdGateDbg 注释), 零 host/tiling 改动
+constexpr int32_t PKI_LD_DBG_MAGIC = 0x504B4C44;
+#endif
+
 // 由于S2循环前，RunInfo还没有赋值，使用TempLoopInfo临时存放B、N、S1轴相关的信息；同时减少重复计算
 struct TempLoopInfo {
     uint32_t bN2Idx = 0;
@@ -74,7 +146,8 @@ public:
     using W_EXPLICIT_T = typename LIT::weightsType;
     using W_T = typename std::conditional<std::is_same<W_EXPLICIT_T, void>::value, W_DERIVED_T, W_EXPLICIT_T>::type;
 
-    using MM1_OUT_T = float;
+    // MM(score)输出 dtype: int8 走 fixpipe DEQF16 直写 GM fp16, 其余 fp32
+    using MM1_OUT_T = typename std::conditional<LIT::isInt8, half, float>::type;
 
     PoolKeyIndexerServiceCube<LIT> matmulService;
     PoolKeyIndexerServiceVector<LIT> vectorService;
@@ -102,6 +175,9 @@ protected:
     uint64_t queryCoreOffset = 0ULL;
     uint64_t keyCoreOffset = 0ULL;
     uint64_t weightsCoreOffset = 0ULL;
+    // int8 量化 scale 基址偏移(q_descale 随 weights 行 / k_descale 池行前缀)
+    uint64_t qScaleCoreOffset = 0ULL;
+    uint64_t kScaleCoreOffset = 0ULL;
     uint64_t indiceOutCoreOffset = 0ULL;
     // values 输出行宽恒为 sparseCount, 与 indices(poolSize>1 时为 outputLen)
     // 不同, 必须单独维护基址偏移, 不可复用 indiceOutCoreOffset
@@ -120,6 +196,17 @@ protected:
     GlobalTensor<int64_t> actualSeqLengthsGm;
     GlobalTensor<int64_t> poolTailKGm_;
     bool hasPoolTailK_ = false;
+#if PKI_PARAM_RESIDENT
+    // Init 期常驻的三张量原始 GM 值(逐 batch, int64 与 GetValue 返回类型一致)。
+    // 载体是 device 标量侧 local memory(类成员定长数组), 不进 UB 池、不调用
+    // InitBuffer ⇒ UB 各分配门与余量零影响。
+    // 只在 paramResidentOn_ 为真(batchSize<=上界 且 TND 前缀和读点可达)时被读,
+    // 且 [0, batchSize) 全部由 InitParamResident 先填满 ⇒ 无未初始化读。
+    int64_t seqQRaw_[PKI_PARAM_RESIDENT_MAX_B];
+    int64_t seqKRaw_[PKI_PARAM_RESIDENT_MAX_B];
+    int64_t tailKRaw_[PKI_PARAM_RESIDENT_MAX_B];
+    bool paramResidentOn_ = false;
+#endif
     // workspace
     GlobalTensor<MM1_OUT_T> mm1ResGm;  // 存放S
     GlobalTensor<float> vec1ResGm;     // 存放TopK计算中间结果
@@ -139,6 +226,15 @@ protected:
     __aicore__ inline void InitTilingData(const PoolKeyIndexerTilingData* __restrict tilingData);
     __aicore__ inline void InitBuffers();
     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t* actualSeqLengthsQ, __gm__ uint8_t* actualSeqLengths);
+#if PKI_PARAM_RESIDENT
+    // Init 期把三张量逐 batch 的原始 GM 值缓存到成员数组(见成员声明处)
+    __aicore__ inline void InitParamResident();
+#endif
+    // 值的来源二选一 —— 常驻数组(PKI_PARAM_RESIDENT 启用且 paramResidentOn_ 时)
+    // / gm.GetValue(其余情况)。srcTag 只用于选中数组, 不参与算术;
+    // 返回类型与 GetValue 一致(int64_t)
+    __aicore__ inline int64_t ReadSeqRaw(uint32_t srcTag, uint32_t idx, GlobalTensor<int64_t>& actualSeqLengthsGm);
+    __aicore__ inline int64_t ReadTailKRaw(uint32_t idx);
     // ================================Split Core================================
     __aicore__ inline void SplitCore(uint32_t curCoreIdx, uint32_t& coreNum, PkiCommon::SplitCoreInfo& info);
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig);
@@ -152,12 +248,38 @@ protected:
     __aicore__ inline void CalcGS1LoopParams(uint32_t bN2Idx);
     __aicore__ inline void GetBN2Idx(uint32_t bN2Idx);
     __aicore__ inline uint32_t GetActualSeqLen(uint32_t bIdx, uint32_t actualLenDims, bool isAccumSeq,
-                                               GlobalTensor<int64_t>& actualSeqLengthsGm, uint32_t defaultSeqLen);
+                                               GlobalTensor<int64_t>& actualSeqLengthsGm, uint32_t defaultSeqLen,
+                                               uint32_t srcTag);
+    // 逐 batch actS1Size 的最小值 —— sortOutBuf 的 main/cache 两路径运行期互斥判据
+    // (判据必须取 min, 见 CalcMinActS1OverBatches 定义处注释)
+    __aicore__ inline uint32_t CalcMinActS1OverBatches();
     __aicore__ inline void GetS1S2ActualSeqLen(uint32_t bIdx, uint32_t& actS1Size, uint32_t& actS2Size,
                                                uint32_t& actS2SizeOrig);
     __aicore__ inline void CalcS2LoopParams(uint32_t bN2LoopIdx, uint32_t gS1LoopIdx);
     __aicore__ inline void CalcRunInfo(uint32_t loop, uint32_t s2LoopIdx, PkiCommon::RunInfo& runInfo);
-    __aicore__ inline void DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx, uint32_t s1Start);
+    __aicore__ inline void DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx, uint32_t s1Start,
+                                               bool appendTail = false);
+    // S2 跨核切分启用判定((bN2,gS1) 并行单元静态上界 < 核对数)
+    __aicore__ inline uint32_t CalcS1ParallelUnitUpperBound();
+#if PKI_INT8_LD_GATE
+    // ================================int8-only LD gate=================
+    // gate 追加判定(仅 int8 实例化被调用): 现行 unitUB 项关闭时, 按组装箱损失补开。
+    __aicore__ inline void RefineLDGateByPackLoss();
+    // 一趟组统计(G=有块组数, Nmax=最大组块数, T=总块数, 与 GetTotalBaseBlockNum 同源同式),
+    // 返回 lossInd×100 ≥ 10 的定点判定; DBG=1 时统计值顺手存入 dbgG_/dbgNmax_/dbgT_/dbgPct_ 供调试读取。
+    __aicore__ inline bool CalcPackLossOpen();
+#if PKI_LD_GATE_DBG
+    // 轻量 gate 调试计数(随 PKI_LD_GATE_DBG 编译掉): 本 AIV 落 8 个 int32 到 host
+    // 预留 ldIdx 区起点(wsOffLdIdx)的专属槽位 —— 块数/flags/组统计/magic。
+    __aicore__ inline void FlushLdGateDbg(uint32_t blockCnt);
+    __gm__ int32_t* pkiDbgBase_ = nullptr; // = workspace + wsOffLdIdx, 仅 AIV&&int8&&!over2K 时非空
+    uint32_t ldGateSrc_ = 0U;              // 0=关, 1=unitUB 开, 2=loss 开(hit), 3=over2K 否决
+    uint64_t dbgG_ = 0ULL;
+    uint64_t dbgNmax_ = 0ULL;
+    uint64_t dbgT_ = 0ULL;
+    uint32_t dbgPct_ = 0xFFFFFFFFU; // lossInd×100(截断整数值); 未参与判定=0xFFFFFFFF
+#endif
+#endif
 };
 
 template <typename LIT>
@@ -185,6 +307,7 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::InitTilingData(const PoolKeyIn
     constInfo.wsOffLdScore = tilingData->wsOffLdScore;
     constInfo.wsOffLdIdx = tilingData->wsOffLdIdx;
     constInfo.qkScale = tilingData->qkScale;
+    constInfo.sparseIndicesMode = tilingData->sparseIndicesMode;
 
     constInfo.outputLayout = LAYOUT_T; // 输出和输入形状一致
     if (LAYOUT_T == PkiLayout::TND) {
@@ -204,13 +327,175 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::InitTilingData(const PoolKeyIn
     constInfo.s1BaseSize = constInfo.isSparseCountOver2K ? SPARSE_COUNT_8K / constInfo.sparseCount * 2 : 8;
     constInfo.mBaseSize = constInfo.s1BaseSize * constInfo.gSize;
     constInfo.mBaseSizeAlign = PkiCommon::Align(constInfo.mBaseSize, BLOCK_CUBE_SIZE);
+
+    // S2 跨核切分启用(批量/S1 维并行不足时放开 S2 跨核, 走 LD 归并)。
+    // isSparseCountOver2K 时 s2Loop 恒 1 无切分对象, 排除。
+    constInfo.isLDOpen = (CalcS1ParallelUnitUpperBound() < usedCoreNum) && !constInfo.isSparseCountOver2K;
 }
+
+// (bN2, gS1) 并行单元数静态上界。BSND 的 actual_seq_q 被 host 校验为
+// 必 null -> actS1 == s1Size, 静态精确; TND actS1 运行期未知, 取上界
+// CeilDiv(T1, s1BaseSize) + (B-1)(逐 batch 进位, 不低估 -> gate 保守关闭)
+template <typename LIT>
+__aicore__ inline uint32_t PoolKeyIndexerKernel<LIT>::CalcS1ParallelUnitUpperBound()
+{
+    if constexpr (LAYOUT_T == PkiLayout::TND) {
+        return CeilDiv(constInfo.qSeqSize, constInfo.s1BaseSize) + (constInfo.batchSize - 1);
+    } else {
+        return constInfo.batchSize * CeilDiv(constInfo.qSeqSize, constInfo.s1BaseSize);
+    }
+}
+
+#if PKI_INT8_LD_GATE
+// gate 追加判定。组合语义 =
+//   isLDOpen = (unitUB < C || (int8 && compact && lossInd≥τ)) && !over2K
+// 其中 unitUB 项已由 InitTilingData 算入, 本函数只在其关闭时补开 loss 项;
+// over2K 否决由本函数第一道复刻, 与 InitTilingData 侧独立成立。
+// 调用点: Init() 中 InitParamResident 之后、SplitCore 之前 —— usedCoreNum 尚未被
+// SplitCore 的 coreNum 收敛改写, 此处读到的仍是 host 下发原值 C=aicNum;
+// 常驻已建好(组统计经 GetS1S2ActualSeqLen 走常驻/GetValue 原式, 与 SplitCore 内部的
+// GetTotalBaseBlockNum 逐值同源 ⇒ 全核一致)。
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerKernel<LIT>::RefineLDGateByPackLoss()
+{
+    if (constInfo.isLDOpen) {
+#if PKI_LD_GATE_DBG
+        ldGateSrc_ = 1U; // unitUB 项已开(decode 形态恒如此) ⇒ 不重复计算, 也永不计 hit
+#endif
+        return;
+    }
+    if (constInfo.isSparseCountOver2K) {
+#if PKI_LD_GATE_DBG
+        ldGateSrc_ = 3U; // over2K 否决(括号外), 与 :281 的同一否决语义一致
+#endif
+        return;
+    }
+    // quantMode 存储值 = 用户值 +1: 用户值 2(int8) ⇒ 存储 3。调用点已有 if constexpr
+    // (LIT::isInt8), 本条为防御性复核(判据使用用户口径的 2, 存储值为 3)。
+    if (constInfo.quantMode != static_cast<int32_t>(PKI_QUANT_MODE_INT8_STORED)) {
+        return;
+    }
+    if (constInfo.sparseIndicesMode != 1U) {
+        return; // V1 保护: sparseIndicesMode 缺省 0(legacy), 非 compact 不进本判据
+    }
+    if (CalcPackLossOpen()) {
+        constInfo.isLDOpen = true;
+#if PKI_LD_GATE_DBG
+        ldGateSrc_ = 2U;
+#endif
+    }
+}
+
+// 组统计一趟推导: 与 GetTotalBaseBlockNum 同源同式(同一个 GetS1S2ActualSeqLen /
+// CeilDiv / GetS2BaseBlockNumOnMask 调用与实参), 额外累计 G(有块组数)与 Nmax(最大组块数)。
+// 本函数只在 !over2K 域被调用(Refine 已否决 over2K), 镜像其 else 分支即可;
+// kHeadNum(恒 1)按原式计入, 与块枚举保持同一公式。
+// lossInd×100 ≥ 10 的定点比较(无浮点): 10·⌈G/C⌉·Nmax·C ≥ 11·T。
+// 溢出界: ⌈G/C⌉·C ≤ G+C ≤ 2^33 量级实远小于; Nmax ≤ actS2Size/s2BaseSize; 全程 uint64,
+// 乘积上限远小于 2^64(任何可寻址 shape 下 G·Nmax·10·C ≪ 2^64)。
+template <typename LIT>
+__aicore__ inline bool PoolKeyIndexerKernel<LIT>::CalcPackLossOpen()
+{
+    const uint64_t C = static_cast<uint64_t>(usedCoreNum);
+    if (C == 0ULL) {
+        return false;
+    }
+    uint64_t G = 0ULL;
+    uint64_t T = 0ULL;
+    uint64_t Nmax = 0ULL;
+    uint32_t actS1Size, actS2Size, actS2SizeOrig;
+    uint32_t s1GBaseNum, s2BaseNum;
+    for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; bIdx++) {
+        GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size, actS2SizeOrig);
+        s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
+        if (!constInfo.attenMaskFlag) {
+            s2BaseNum = CeilDiv(actS2Size, constInfo.s2BaseSize);
+            if (s2BaseNum > 0U && s1GBaseNum > 0U) {
+                G += static_cast<uint64_t>(s1GBaseNum) * constInfo.kHeadNum;
+                T += static_cast<uint64_t>(s1GBaseNum) * static_cast<uint64_t>(s2BaseNum) * constInfo.kHeadNum;
+                Nmax = (static_cast<uint64_t>(s2BaseNum) > Nmax) ? static_cast<uint64_t>(s2BaseNum) : Nmax;
+            }
+        } else {
+            for (uint32_t gS1Idx = 0; gS1Idx < s1GBaseNum; gS1Idx++) {
+                s2BaseNum = GetS2BaseBlockNumOnMask(gS1Idx, actS1Size, actS2SizeOrig);
+                if (s2BaseNum > 0U) {
+                    G += constInfo.kHeadNum;
+                    T += static_cast<uint64_t>(s2BaseNum) * constInfo.kHeadNum;
+                    Nmax = (static_cast<uint64_t>(s2BaseNum) > Nmax) ? static_cast<uint64_t>(s2BaseNum) : Nmax;
+                }
+            }
+        }
+    }
+#if PKI_LD_GATE_DBG
+    dbgG_ = G;
+    dbgNmax_ = Nmax;
+    dbgT_ = T;
+#endif
+    if (G == 0ULL || T == 0ULL) {
+        return false;
+    }
+    const uint64_t groupRounds = (G + C - 1ULL) / C; // ⌈G/C⌉
+    const uint64_t num = groupRounds * Nmax * C;     // lossInd 的分子(分母 = T)
+#if PKI_LD_GATE_DBG
+    // 记录 lossInd×100 截断值(供调试): pct = floor(100·num/T) − 100, 下限截 0。
+    const uint64_t pct100 = (num * 100ULL) / T;
+    dbgPct_ = (pct100 >= 100ULL) ? static_cast<uint32_t>(pct100 - 100ULL) : 0U;
+#endif
+    return PKI_LD_GATE_LOSS_NUM * num >= PKI_LD_GATE_LOSS_DEN * T;
+}
+
+#if PKI_LD_GATE_DBG
+// 轻量 gate 调试计数(调试形态内置, 随 PKI_LD_GATE_DBG 编译掉; DBG=0 ⇒ 零计数区/零落盘/
+// 无本函数尾部的 PipeBarrier<PIPE_ALL>)。
+// 落点: host 预留 ldIdx 区起点 `workspace + wsOffLdIdx`。kernel 自有三区布局中 vec1Param
+// 基址 = mm1Res_k + vec1Res_k, 与 host 布局的 wsOffLdIdx(= scoreGm_h + ldScore_h)相差至少
+// (ldScore_h − vec1Res_k)(int8 非 over2K 域; ldScore 按 TOPK_MAX=8192 常数上界预留), 而
+// vec1Param_k 区长 = host ldIdxSize 恰等 ⇒ [wsOffLdIdx, wsOffLdIdx+ldIdxSize) 整段是 host
+// 已分配、kernel 数据流从不触及的区域; 区容量 40,960B(A2)/49,152B(A3) ≥ 计数区上界
+// 64槽×64B=4,096B, 且总 ws ≥ wsOffLdIdx+ldIdxSize ⇒ 零越界、零 host/tiling 改动。
+// 标量 SetValue 走 S pipe + 收尾 PipeBarrier<PIPE_ALL> 排干, 后写覆盖前写; 每 AIV 只写
+// 自己的 8×int32 槽, 核间无写冲突。
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerKernel<LIT>::FlushLdGateDbg(uint32_t blockCnt)
+{
+    if (pkiDbgBase_ == nullptr) {
+        return;
+    }
+    GlobalTensor<int32_t> dbg;
+    dbg.SetGlobalBuffer(pkiDbgBase_);
+    // 槽距 16×int32=64B: 每个 AIV 独占一条 64B GM cache line。
+    // (arch22 标量 GM 写按 line 粒度 posted, 同一 64B 行内两个 AIV 同时写会相互丢失,
+    //  槽距必须按整行隔离。)
+    const uint64_t slot = static_cast<uint64_t>(tmpBlockIdx) * 16ULL;
+    int32_t flags = 0;
+    flags |= (ldGateSrc_ == 2U) ? 1 : 0;        // bit0: gate 由 loss 项打开(hit) —— bf16/V1/decode 恒 0
+    flags |= splitCoreInfo.isLD ? 2 : 0;        // bit1: 本 AIV 为 LD 归并核(fan-in 头核)
+    flags |= constInfo.isLDOpen ? 4 : 0;        // bit2: 生效 isLDOpen
+    flags |= (aiCoreIdx < usedCoreNum) ? 8 : 0; // bit3: 本核有主(非 SplitCore 收敛后的空槽)
+    flags |= (constInfo.sparseIndicesMode == 1U) ? 16 : 0;                        // bit4
+    flags |= constInfo.attenMaskFlag ? 32 : 0;                                    // bit5: mask_mode==3
+    dbg.SetValue(static_cast<int64_t>(slot) + 0, static_cast<int32_t>(blockCnt)); // 本 AIV 最终块数(直方图)
+    dbg.SetValue(static_cast<int64_t>(slot) + 1, flags);
+    dbg.SetValue(static_cast<int64_t>(slot) + 2, static_cast<int32_t>(dbgG_));    // G(参与判定才有值)
+    dbg.SetValue(static_cast<int64_t>(slot) + 3, static_cast<int32_t>(dbgNmax_)); // Nmax
+    dbg.SetValue(static_cast<int64_t>(slot) + 4, static_cast<int32_t>(dbgT_));    // T
+    dbg.SetValue(static_cast<int64_t>(slot) + 5, static_cast<int32_t>(usedCoreNum));
+    dbg.SetValue(static_cast<int64_t>(slot) + 6, static_cast<int32_t>(dbgPct_)); // lossInd×100
+    dbg.SetValue(static_cast<int64_t>(slot) + 7, PKI_LD_DBG_MAGIC);              // "PKLD"
+    AscendC::PipeBarrier<PIPE_ALL>(); // S 写排干(arch22 无 PIPE_S, 用 PIPE_ALL)
+}
+#endif // PKI_LD_GATE_DBG
+#endif
 
 template <typename LIT>
 __aicore__ inline void PoolKeyIndexerKernel<LIT>::InitBuffers()
 {
     if ASCEND_IS_AIV {
-        vectorService.InitBuffers(pipe);
+        // sortOutBuf main/cache 互斥判据 = 逐 batch actS1 最小值。
+        // InitActualSeqLen 已在 Init() 中先于本函数完成(actualSeqLengthsGmQ 可读),
+        // 且此处只有标量 GM 读(S pipe)、尚无 MTE2/V 在途 ⇒ 无需额外同步
+        // (SplitCore 同样在 Init 期读该张量)。
+        vectorService.InitBuffers(pipe, CalcMinActS1OverBatches());
     } else {
         matmulService.InitBuffers(pipe);
     }
@@ -235,18 +520,101 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::InitActualSeqLen(__gm__ uint8_
 }
 
 template <typename LIT>
+__aicore__ inline int64_t PoolKeyIndexerKernel<LIT>::ReadSeqRaw(uint32_t srcTag, uint32_t idx,
+                                                                GlobalTensor<int64_t>& actualSeqLengthsGm)
+{
+#if PKI_PARAM_RESIDENT
+    if (paramResidentOn_) {
+        return (srcTag == PKI_SEQ_Q) ? seqQRaw_[idx] : seqKRaw_[idx];
+    }
+#endif
+    return actualSeqLengthsGm.GetValue(idx);
+}
+
+template <typename LIT>
+__aicore__ inline int64_t PoolKeyIndexerKernel<LIT>::ReadTailKRaw(uint32_t idx)
+{
+#if PKI_PARAM_RESIDENT
+    if (paramResidentOn_) {
+        return tailKRaw_[idx];
+    }
+#endif
+    return poolTailKGm_.GetValue(idx);
+}
+
+#if PKI_PARAM_RESIDENT
+// Init 期一次性缓存 pool_tail_k / actual_seq_q / actual_seq_k 的原始 GM 值(不做任何
+// 差分/换算, 差分仍由 GetActualSeqLen 原式完成)。
+// 读取模式与 CalcMinActS1OverBatches 相同: "逐 batch 纯标量 GM 读"循环, 无 MTE2/V 在途
+// ⇒ 无需额外同步。
+// 调用点必须早于 SplitCore(其经 GetTotalBaseBlockNum/GetS1S2ActualSeqLen 逐 batch 读同
+// 一批张量, 且分核结果要求全核一致: 同 GM 同输入 ⇒ 各核缓存逐值相同)。
+// 启用条件(三条, 任一不满足即 paramResidentOn_=false ⇒ 回退逐次 GM 读路径):
+//   ① batchSize <= PKI_PARAM_RESIDENT_MAX_B(载体是定长成员数组, 不占 UB);
+//   ② TND 实例化下两路 actual_seq 均可读 —— CalcRunInfo 的 isFirstS2InnerLoop
+//      前缀和读点不带 dims 判空, 若该路 actual_seq 为 null 则原路径读的是无效张量,
+//      不能把它替换成缓存的 0(语义差); BSND 实例化无该读点 ⇒ 不受此条限制。
+//   ③ 三张量的读点各自的可达性由调用处原有的 hasPoolTailK_/actualLenDims 判据保持
+//      不变 ⇒ 缓存里对应位置永不被读, 无需额外条件。
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerKernel<LIT>::InitParamResident()
+{
+    bool prefixReadable = true;
+    if constexpr (LAYOUT_T == PkiLayout::TND) {
+        prefixReadable = (constInfo.actualLenQDims != 0) && (constInfo.actualLenDims != 0);
+    }
+    paramResidentOn_ = (constInfo.batchSize <= PKI_PARAM_RESIDENT_MAX_B) && prefixReadable;
+    if (!paramResidentOn_) {
+        return;
+    }
+    for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; bIdx++) {
+        seqQRaw_[bIdx] = (constInfo.actualLenQDims != 0) ? actualSeqLengthsGmQ.GetValue(bIdx) : 0;
+        seqKRaw_[bIdx] = (constInfo.actualLenDims != 0) ? actualSeqLengthsGm.GetValue(bIdx) : 0;
+        if (hasPoolTailK_) {
+            tailKRaw_[bIdx] = poolTailKGm_.GetValue(bIdx);
+        }
+    }
+}
+#endif
+
+template <typename LIT>
 __aicore__ inline uint32_t PoolKeyIndexerKernel<LIT>::GetActualSeqLen(uint32_t bIdx, uint32_t actualLenDims,
                                                                       bool isAccumSeq,
                                                                       GlobalTensor<int64_t>& actualSeqLengthsGm,
-                                                                      uint32_t defaultSeqLen)
+                                                                      uint32_t defaultSeqLen, uint32_t srcTag)
 {
     if (actualLenDims == 0) {
         return defaultSeqLen;
     } else if (isAccumSeq && bIdx > 0) {
-        return static_cast<uint32_t>(actualSeqLengthsGm.GetValue(bIdx) - actualSeqLengthsGm.GetValue(bIdx - 1));
+        return static_cast<uint32_t>(ReadSeqRaw(srcTag, bIdx, actualSeqLengthsGm) -
+                                     ReadSeqRaw(srcTag, bIdx - 1, actualSeqLengthsGm));
     } else {
-        return static_cast<uint32_t>(actualSeqLengthsGm.GetValue(bIdx));
+        return static_cast<uint32_t>(ReadSeqRaw(srcTag, bIdx, actualSeqLengthsGm));
     }
+}
+
+// 逐 batch 求 actS1Size 的最小值, 作为 sortOutBuf 的 main/cache 两路径
+// 运行期互斥判据传给 vectorService.InitBuffers。
+// 为什么必须是 min: cache 路径的进入条件是 (actS1Size<=4 && !over2K)(ProcessVec 的
+// if/else 分岔), 而 actS1Size 逐 batch 取自 actual_seq_q ⇒ 同一次 launch 内不同 batch
+// 可分别走 cache/main。取首批或取 max 都会在"混合 batch"下漏判 ⇒ SortedBasicBlock_
+// 写越 sortOutBuf, 而 release 态 InitBuffer 越池不报错 ⇒ 静默踩相邻 UB buffer。
+// 与 GetS1S2ActualSeqLen 的 actS1Size **同源同式**(同一个 GetActualSeqLen 调用与同样
+// 的实参), 故与 ProcessVec 的分岔判据严格一致, 不存在口径漂移。
+// 边界: actualLenQDims==0(actual_seq_q 为 null, BSND 恒如此)时 GetActualSeqLen 返回
+// qSeqSize ⇒ min 退化为静态值; 任一 batch actS1==0(空 batch)把 min 压到 0 ⇒ 判据自动
+// 保守(保留 cache 区), 与该 batch 走 curActSeqLenIsZero 早退路径不冲突; batchSize==0
+// 时无任何 ProcessVec, 返回 qSeqSize 亦安全。
+template <typename LIT>
+__aicore__ inline uint32_t PoolKeyIndexerKernel<LIT>::CalcMinActS1OverBatches()
+{
+    uint32_t minActS1 = constInfo.qSeqSize;
+    for (uint64_t bIdx = 0; bIdx < constInfo.batchSize; bIdx++) {
+        uint32_t actS1 = GetActualSeqLen(static_cast<uint32_t>(bIdx), constInfo.actualLenQDims, constInfo.isAccumSeqS1,
+                                         actualSeqLengthsGmQ, constInfo.qSeqSize, PKI_SEQ_Q);
+        minActS1 = actS1 < minActS1 ? actS1 : minActS1;
+    }
+    return minActS1;
 }
 
 template <typename LIT>
@@ -254,10 +622,10 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::GetS1S2ActualSeqLen(uint32_t b
                                                                       uint32_t& actS2Size, uint32_t& actS2SizeOrig)
 {
     actS1Size = GetActualSeqLen(bIdx, constInfo.actualLenQDims, constInfo.isAccumSeqS1, actualSeqLengthsGmQ,
-                                constInfo.qSeqSize);
-    uint32_t actS2Pool =
-        GetActualSeqLen(bIdx, constInfo.actualLenDims, constInfo.isAccumSeqS2, actualSeqLengthsGm, constInfo.kSeqSize);
-    uint32_t tailK = hasPoolTailK_ ? static_cast<uint32_t>(poolTailKGm_.GetValue(bIdx)) : 0;
+                                constInfo.qSeqSize, PKI_SEQ_Q);
+    uint32_t actS2Pool = GetActualSeqLen(bIdx, constInfo.actualLenDims, constInfo.isAccumSeqS2, actualSeqLengthsGm,
+                                         constInfo.kSeqSize, PKI_SEQ_K);
+    uint32_t tailK = hasPoolTailK_ ? static_cast<uint32_t>(ReadTailKRaw(bIdx)) : 0;
     actS2SizeOrig = actS2Pool * constInfo.poolSize + tailK;
     actS2Size = actS2SizeOrig / constInfo.poolSize;
 }
@@ -310,6 +678,23 @@ __aicore__ void inline PoolKeyIndexerKernel<LIT>::SplitCore(uint32_t curCoreIdx,
 {
     // 计算每个核最少处理的块数, 剩余的部分前面的核每个核多处理一块
     uint32_t totalBlockNum = GetTotalBaseBlockNum();
+    if (totalBlockNum == 0U) {
+        // 全批次 0 池(纯尾块, pool_tail_k>0): 无块可枚举, 由核 0 以整批区间走
+        // DealActSeqLenIsZero(appendTail) 收尾; 其余核区间置为不可循环(start>end)
+        coreNum = 1U;
+        if (curCoreIdx == 0U) {
+            info.bN2Start = 0U;
+            info.bN2End = constInfo.batchSize * constInfo.kHeadNum - 1U;
+            info.gS1Start = 0U;
+            info.gS1End = 0U;
+            info.s2Start = 0U;
+            info.s2End = 0U;
+        } else {
+            info.bN2Start = constInfo.batchSize * constInfo.kHeadNum;
+            info.bN2End = constInfo.batchSize * constInfo.kHeadNum - 1U;
+        }
+        return;
+    }
     uint32_t minBlockPerCore = totalBlockNum / coreNum;
     uint32_t deal1MoreBlockCoreNum = totalBlockNum % coreNum;
     uint32_t coreIdx = 0;
@@ -358,9 +743,11 @@ __aicore__ void inline PoolKeyIndexerKernel<LIT>::SplitCore(uint32_t curCoreIdx,
                     findLastCoreEnd = false;
                 }
                 uint32_t s2RemainBaseNum = s2Loop - s2Idx;
-                // S2 跨核规避: 保证每个 (batch, gS1) 的 S2 块完整落在单核内
-                // (LD 归并要求 S2 分段完整), 代价是多 batch 大 S2 场景核利用率下降。
-                if (s2Idx == 0 && lastGS1RemainBlockCnt + s2RemainBaseNum > coreDealBlockCnt) {
+                // S2 跨核规避(仅 !isLDOpen): 保证每个 (batch, gS1) 的 S2 块
+                // 完整落单核(单核串行, 代价是批量并行不足时核利用率下降)。
+                // isLDOpen 时放开: S2 块可跨核连续切分, 由 LD 归并(ProcessLD)
+                // 合成全局 TopK。
+                if (!constInfo.isLDOpen && s2Idx == 0 && lastGS1RemainBlockCnt + s2RemainBaseNum > coreDealBlockCnt) {
                     coreDealBlockCnt = lastGS1RemainBlockCnt + s2RemainBaseNum;
                 }
                 if (lastGS1RemainBlockCnt + s2RemainBaseNum >= coreDealBlockCnt) {
@@ -413,30 +800,62 @@ __aicore__ void inline PoolKeyIndexerKernel<LIT>::SplitCore(uint32_t curCoreIdx,
 }
 
 template <typename LIT>
-__aicore__ inline void PoolKeyIndexerKernel<LIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx, uint32_t s1Start)
+__aicore__ inline void PoolKeyIndexerKernel<LIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx, uint32_t s1Start,
+                                                                      bool appendTail)
 {
+    // 0 池批次的 l_orig 即尾 token 数; 可见性与 ExpandAndAppendIndices 同一公式
+    const int32_t poolTailK = (appendTail && hasPoolTailK_) ? static_cast<int32_t>(ReadTailKRaw(bIdx)) : 0;
+    const int32_t lOrig = static_cast<int32_t>(tempLoopInfo.actS2SizeOrig);
     if ASCEND_IS_AIV {
         // poolSize>1 时 indices 输出行宽为 outputLen(见 CalcRunInfo 中 idxOutStride 说明)
         uint32_t idxOutStride = (constInfo.poolSize > 1) ?
                                     (constInfo.sparseCount * constInfo.poolSize + constInfo.poolSize - 1) :
                                     constInfo.sparseCount;
+        // 0 池收尾: 尾 token 在 UB 内预写随清理整行一次 MTE3 落地(对齐 arch35),
+        // 落位与可见性和主路径 ExpandAndAppendIndices 同一公式
+        uint32_t tailPos = (constInfo.sparseIndicesMode == 1U) ? 0U : constInfo.sparseCount * constInfo.poolSize;
         if (constInfo.outputLayout == PkiLayout::TND) {
             uint32_t tSize = static_cast<uint32_t>(actualSeqLengthsGmQ.GetValue(constInfo.batchSize - 1));
             uint32_t tBase = bIdx == 0 ? 0 : static_cast<uint32_t>(actualSeqLengthsGmQ.GetValue(bIdx - 1));
             uint32_t s1Count = tempLoopInfo.actS1Size;
 
             for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
-                uint64_t indiceOutOffset = (tBase + s1Idx) * constInfo.kHeadNum * idxOutStride + // T轴、s1轴偏移
-                                           n2Idx * idxOutStride;                                 // N2轴偏移
-                vectorService.CleanInvalidOutput(indiceOutOffset);
+                // S1 规模 x 步长乘法提升 64 位: qSeqSize*idxOutStride 可超 2^32(uint32 回绕)
+                uint64_t indiceOutOffset = static_cast<uint64_t>(tBase + s1Idx) * constInfo.kHeadNum * idxOutStride +
+                                           n2Idx * idxOutStride; // T轴、s1轴偏移
+                int32_t tailVisible = 0;
+                int32_t tailFirstTok = 0;
+                if (poolTailK > 0 && constInfo.poolSize > 1) {
+                    tailVisible = poolTailK;
+                    if (constInfo.maskMode != 0) {
+                        int32_t globalPosQ = lOrig - static_cast<int32_t>(s1Count) + static_cast<int32_t>(s1Idx);
+                        tailVisible =
+                            PkiCommon::Max(0, PkiCommon::Min(poolTailK, globalPosQ - (lOrig - poolTailK) + 1));
+                    }
+                    tailFirstTok = lOrig - poolTailK;
+                }
+                vectorService.CleanInvalidOutput(indiceOutOffset, tailPos, tailVisible, tailFirstTok);
             }
         } else if (constInfo.outputLayout == PkiLayout::BSND) {
             for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
                 // B,S1,N2,K
-                uint64_t indiceOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * idxOutStride +
-                                           s1Idx * constInfo.kHeadNum * idxOutStride + // B轴、S1轴偏移
-                                           n2Idx * idxOutStride;                       // N2轴偏移
-                vectorService.CleanInvalidOutput(indiceOutOffset);
+                uint64_t indiceOutOffset =
+                    static_cast<uint64_t>(bIdx) * constInfo.qSeqSize * constInfo.kHeadNum * idxOutStride +
+                    static_cast<uint64_t>(s1Idx) * constInfo.kHeadNum * idxOutStride +
+                    n2Idx * idxOutStride; // B轴、S1轴偏移
+                int32_t tailVisible = 0;
+                int32_t tailFirstTok = 0;
+                if (poolTailK > 0 && constInfo.poolSize > 1) {
+                    tailVisible = poolTailK;
+                    if (constInfo.maskMode != 0) {
+                        int32_t globalPosQ =
+                            lOrig - static_cast<int32_t>(constInfo.qSeqSize) + static_cast<int32_t>(s1Idx);
+                        tailVisible =
+                            PkiCommon::Max(0, PkiCommon::Min(poolTailK, globalPosQ - (lOrig - poolTailK) + 1));
+                    }
+                    tailFirstTok = lOrig - poolTailK;
+                }
+                vectorService.CleanInvalidOutput(indiceOutOffset, tailPos, tailVisible, tailFirstTok);
             }
         }
     }
@@ -463,6 +882,32 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::Init(
         poolTailKGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(poolTailK), constInfo.batchSize);
         hasPoolTailK_ = true;
     }
+#if PKI_PARAM_RESIDENT
+    // 必须早于 SplitCore —— 后者经 GetTotalBaseBlockNum/GetS1S2ActualSeqLen 逐 batch
+    // 读同一批张量, 且分核结果要求全核一致。
+    // 三张量的 SetGlobalBuffer 均已完成(上面两行 + InitActualSeqLen)。
+    InitParamResident();
+#endif
+#if PKI_INT8_LD_GATE
+    // int8-only LD gate 追加判定。位置约束: ① 在 InitActualSeqLen/InitParamResident 之后
+    // (组统计要读 actual_seq, 且与 SplitCore 同样走常驻 ⇒ 全核逐值一致);
+    // ② 在 SplitCore 之前(isLDOpen 是 SplitCore 规避分支的输入; 且 usedCoreNum 尚未被
+    // coreNum 收敛改写, 此处 C 仍是 host 下发原值 aicNum)。仅 int8 实例化生成调用。
+    // 仅 int8 实例化生成调用(bf16/fp16 模板逐字不含此路径)。
+    if constexpr (LIT::isInt8) {
+        RefineLDGateByPackLoss();
+        // 计数区接线: AIV && !over2K 才启用(over2K 下 ldScore 预留与 kernel 实写宽度恰等,
+        // 尾部空闲区可能为 0 ⇒ 必须排除; 该排除与 gate 的 over2K 否决同域, 不损失调试取证面)。
+        // ASCEND_IS_AIV 展开为 `constexpr(...)`, 不能作 && 操作数, 只能独立成 if(与本文件既有用法一致)
+#if PKI_LD_GATE_DBG
+        if ASCEND_IS_AIV {
+            if (!constInfo.isSparseCountOver2K) {
+                pkiDbgBase_ = reinterpret_cast<__gm__ int32_t*>(workspace + constInfo.wsOffLdIdx);
+            }
+        }
+#endif
+    }
+#endif
 
     // 计算分核
     SplitCore(aiCoreIdx, usedCoreNum, splitCoreInfo);
@@ -476,9 +921,12 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::Init(
     mm1ResGm.SetGlobalBuffer((__gm__ MM1_OUT_T*)(workspace + offset + aiCoreIdx * singleCoreMm1ResSize));
     offset += GetBlockNum() * singleCoreMm1ResSize;
 
-    // ld流程 ws: [aic, s1_cube, 头尾, idx/value, 2048] float
+    // ld流程 ws: [aic, s1_cube, 头尾, idx/value, virTopK] float; 宽度与 service_vector
+    // 的 virTopK 同源(CalcVirTopK), host 侧 ldScoreSize 按 topk 上限 8192 预留,
+    // kernel 实写宽度恒在其内
+    uint32_t ldTopkW = CalcVirTopK(static_cast<uint32_t>(constInfo.sparseCount), constInfo.isSparseCountOver2K);
     vec1ResGm.SetGlobalBuffer((__gm__ float*)(workspace + offset));
-    offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOUBLE * WS_DOUBLE * BASE_TOPK * sizeof(float);
+    offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOUBLE * WS_DOUBLE * ldTopkW * sizeof(float);
 
     // ld参数 ws: [aic, s1_cube, 头尾, 16ele] int64
     vec1ParamGm.SetGlobalBuffer((__gm__ int64_t*)(workspace + offset));
@@ -490,6 +938,18 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::Init(
         valueOutGm.SetGlobalBuffer((__gm__ float*)sparse_values);
         weightsGm.SetGlobalBuffer((__gm__ W_T*)weights);
         vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, vec1ParamGm, weightsGm, indiceOutGm, valueOutGm);
+        if constexpr (LIT::isInt8) {
+            // int8 AIV: GetKeyScaleHalf 的 PA 寻址需要 block_table(现仅 AIC 分支设置);
+            // descale 以 half 视图接线(FP16, D2)
+            if constexpr (PAGE_ATTENTION) {
+                blockTableGm.SetGlobalBuffer((__gm__ int32_t*)blockTable);
+            }
+            GlobalTensor<half> qScaleGmHalf;
+            GlobalTensor<half> kScaleGmHalf;
+            qScaleGmHalf.SetGlobalBuffer((__gm__ half*)qDescale);
+            kScaleGmHalf.SetGlobalBuffer((__gm__ half*)kDescale);
+            vectorService.InitVecQuantTensor(qScaleGmHalf, kScaleGmHalf, blockTableGm);
+        }
     } else {
         matmulService.InitParams(constInfo);
         queryGm.SetGlobalBuffer((__gm__ Q_T*)query);
@@ -570,7 +1030,7 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::CalcRunInfo(uint32_t loop, uin
     runInfo.actS2Size = tempLoopInfo.actS2Size;
     runInfo.actS2SizeOrig = tempLoopInfo.actS2SizeOrig;
     // 当前 batch 的尾部 token 数(ExpandAndAppendIndices 尾块追加与 LD 参数均依赖)
-    runInfo.poolTailK = hasPoolTailK_ ? static_cast<int32_t>(poolTailKGm_.GetValue(tempLoopInfo.bIdx)) : 0;
+    runInfo.poolTailK = hasPoolTailK_ ? static_cast<int32_t>(ReadTailKRaw(tempLoopInfo.bIdx)) : 0;
     // 计算实际基本块size
     runInfo.actMBaseSize = tempLoopInfo.actMBaseSize;
     runInfo.actualSingleProcessSInnerSize = constInfo.s2BaseSize;
@@ -590,10 +1050,17 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::CalcRunInfo(uint32_t loop, uin
         uint64_t actualSeqQPrefixSum;
         uint64_t actualSeqKPrefixSum;
         if constexpr (LAYOUT_T == PkiLayout::TND) {
+            // 组首块的前缀和读点(每 (bN2,gS1) 组一次)同样走常驻; 该读点不带 dims 判空
+            // ⇒ InitParamResident 的启用条件② 保证 TND 实例化下两路 actual_seq 均可读,
+            // 不存在语义差; 表达式除值的来源外未变。
             actualSeqQPrefixSum =
-                (runInfo.bIdx <= 0) ? 0 : static_cast<uint64_t>(actualSeqLengthsGmQ.GetValue(runInfo.bIdx - 1));
+                (runInfo.bIdx <= 0) ?
+                    0 :
+                    static_cast<uint64_t>(ReadSeqRaw(PKI_SEQ_Q, runInfo.bIdx - 1, actualSeqLengthsGmQ));
             actualSeqKPrefixSum =
-                (runInfo.bIdx <= 0) ? 0 : static_cast<uint64_t>(actualSeqLengthsGm.GetValue(runInfo.bIdx - 1));
+                (runInfo.bIdx <= 0) ?
+                    0 :
+                    static_cast<uint64_t>(ReadSeqRaw(PKI_SEQ_K, runInfo.bIdx - 1, actualSeqLengthsGm));
         } else { // BSND
             actualSeqQPrefixSum = (runInfo.bIdx <= 0) ? 0 : runInfo.bIdx * constInfo.qSeqSize;
             actualSeqKPrefixSum = (runInfo.bIdx <= 0) ? 0 : runInfo.bIdx * constInfo.kSeqSize;
@@ -605,6 +1072,12 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::CalcRunInfo(uint32_t loop, uin
         keyCoreOffset = tndKeyBIdxOffset + runInfo.n2Idx * constInfo.headDim;
         // B,S1,N1(N2,G)/T,N1(N2,G)
         weightsCoreOffset = actualSeqQPrefixSum * constInfo.qHeadNum + runInfo.n2Idx * constInfo.gSize;
+        if constexpr (LIT::isInt8) {
+            // int8 scale 偏移与 arch35 mode0 同构: q_descale 随 weights 行(去 D 轴逐维相等);
+            // k_descale 非 PA 为池行前缀基址, PA 由 GetKeyScaleHalf 按 block_table 绝对寻址(不用线性偏移)
+            qScaleCoreOffset = weightsCoreOffset;
+            kScaleCoreOffset = actualSeqKPrefixSum * constInfo.kHeadNum;
+        }
         // B,S1,N2,k/T,N2,k; poolSize>1 时 indices 行宽为 outputLen(≠sparseCount),
         // 否则 batch>0 行基址错位, 写入覆盖相邻行
         uint32_t idxOutStride = (constInfo.poolSize > 1) ?
@@ -620,6 +1093,10 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::CalcRunInfo(uint32_t loop, uin
     runInfo.tensorKeyOffset =
         keyCoreOffset + runInfo.s2Idx * constInfo.s2BaseSize * constInfo.kHeadNum * constInfo.headDim;
     runInfo.tensorWeightsOffset = weightsCoreOffset;
+    if constexpr (LIT::isInt8) {
+        runInfo.tensorQScaleOffset = qScaleCoreOffset;
+        runInfo.tensorKeyScaleOffset = kScaleCoreOffset + runInfo.s2Idx * constInfo.s2BaseSize * constInfo.kHeadNum;
+    }
     runInfo.indiceOutOffset = indiceOutCoreOffset;
     runInfo.valueOutOffset = valueOutCoreOffset;
 }
@@ -687,6 +1164,12 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::ProcessMain()
 {
     if (aiCoreIdx >= usedCoreNum) {
         // 无任务核直接返回
+#if PKI_INT8_LD_GATE && PKI_LD_GATE_DBG
+        // 调试计数: 无任务核也要落槽(块数=0, flags bit3=0), 否则空槽残留 ws 旧值
+        if constexpr (LIT::isInt8) {
+            FlushLdGateDbg(0U);
+        }
+#endif
         return;
     }
 
@@ -703,7 +1186,7 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::ProcessMain()
     for (uint32_t bN2LoopIdx = splitCoreInfo.bN2Start; bN2LoopIdx <= splitCoreInfo.bN2End; bN2LoopIdx++) {
         CalcGS1LoopParams(bN2LoopIdx);
         if (tempLoopInfo.curActSeqLenIsZero) {
-            DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, 0U);
+            DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, 0U, true);
             continue;
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
@@ -722,6 +1205,13 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::ProcessMain()
 
     if ASCEND_IS_AIV {
         vectorService.FreeEventID();
+#if PKI_INT8_LD_GATE && PKI_LD_GATE_DBG
+        // 调试计数: 本 AIV 主相最终块数(gloop = ProcessBaseBlock 调用次数)落槽。
+        // 在 FreeEventID 之后写: 事件机收尾次序不变, 只是追加标量 S 写 + 末尾 PIPE_ALL。
+        if constexpr (LIT::isInt8) {
+            FlushLdGateDbg(gloop);
+        }
+#endif
     } else {
         matmulService.FreeEventID();
         CrossCoreWaitFlag(constInfo.syncV1C1);
@@ -748,6 +1238,28 @@ __aicore__ inline void PoolKeyIndexerKernel<LIT>::ProcessBaseBlock(uint32_t loop
 template <typename LIT>
 __aicore__ inline void PoolKeyIndexerKernel<LIT>::ProcessDecode()
 {
+#if PKI_DECODE_LD_GATE
+    // isLDOpen 调用门: !isLDOpen 时直接 return。门放在函数首行(在 PipeBarrier/SyncAll
+    // 之前、ASCEND_IS_AIV 之外)—— 只门 ProcessLD 而保留 SyncAll 拿不到"移除全设备
+    // 会合点"的收益。
+    // 数值零影响(逐条): !isLDOpen ⇒ splitCoreInfo.isLD 恒 false ⇒ ProcessLD 是死代码;
+    // InitLDBuffers 只重分配 LD 专属缓冲、不写输出张量; ICachePreLoad 是纯 icache 提示。
+    // 同步安全(三条独立论据):
+    //   ① isLDOpen 由 constInfo(全核同 tiling)推导 ⇒ 全核一致跳过或一致执行,
+    //      SyncAll 不会半参与挂死;
+    //   ② 跳过 InitLDBuffers 的 pipe->Reset() 不影响主相输出落地: ProcessInvalid 本就
+    //      以 InitGlobalMemory(纯 MTE3 GM 写)直接 return 收尾(无排干) ⇒ "kernel 退出时
+    //      MTE3 在途写由 runtime/硬件排空"是既有路径已依赖的契约; SyncAll 内的
+    //      PipeBarrier<PIPE_ALL> 为跨核会合服务, 不为 kernel 收尾服务;
+    //   ③ 无悬挂事件: ExpandSlotDrainAll 在每次槽协议分支退出前已调用, FreeEventID 已
+    //      在 ProcessMain 收尾排干 pingpong 槽 ⇒ 进 ProcessDecode 时无未消费的槽 set。
+    // 注意: InitLDBuffers 函数体不动 —— 内部 ExpandSlotDrainAll → pipe->Reset() →
+    //   ExpandSlotAcquire → SetWaitFlag<MTE3_S> → VToSSync 的次序是精度约束,
+    //   改次序会引入 MTE3 死锁/aicore 超时(507014)。本门只改是否调用。
+    if (!constInfo.isLDOpen) {
+        return;
+    }
+#endif
     if ASCEND_IS_AIV {
         vectorService.InitLDBuffers(pipe);
         ICachePreLoad(LD_PREFETCH_LEN);

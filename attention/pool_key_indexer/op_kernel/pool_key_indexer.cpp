@@ -71,11 +71,22 @@ __global__ __aicore__ void pool_key_indexer(__gm__ uint8_t* query, __gm__ uint8_
                                    PKI_LAYOUT(LAYOUT_K), false, float, half);
             }
         }
+    } else if constexpr (ORIG_DTYPE_QUERY == DT_INT8) {
+        // int8 对称量化(quant_mode=2): SCALE_T=half, WEIGHTS_T=half(量化 weights 仅
+        // FP16, D2; DT_INT8(2) != DT_FLOAT8_E4M3FN(36), 与上方 FP8 分支互斥, 不会
+        // 落入 ORIG_DTYPE_WEIGHTS 分发); 模板参数顺序同 FP8: ..., DT_W_FLAG, SCALE_T, WEIGHTS_T
+        INVOKE_PKI_OP_IMPL(PoolKeyIndexerKernel, int8_t, int8_t, int32_t, PKI_LAYOUT(LAYOUT_Q), PKI_LAYOUT(LAYOUT_K),
+                           false, half, half);
     }
 #else
     // arch22 (A2/A3): Sort+MrgSort TopK, single-dst Fixpipe, GM workspace
     if constexpr (DT_Q == PKI_TPL_FP16 && DT_K == PKI_TPL_FP16) {
         INVOKE_PKI_OP_IMPL(PoolKeyIndexerKernel, half, half, int32_t, PKI_LAYOUT(LAYOUT_Q), PKI_LAYOUT(LAYOUT_K));
+    } else if constexpr (DT_Q == PKI_TPL_INT8 && DT_K == PKI_TPL_INT8) {
+        // int8: SCALE_T=half, WEIGHTS_T=half 显式携带(量化 weights 仅 FP16, D2);
+        // 不显式传入则 W_T 误推导为 int8_t(PkiTypeTraits 无 int8 偏特化兜底亦已加固)
+        INVOKE_PKI_OP_IMPL(PoolKeyIndexerKernel, int8_t, int8_t, int32_t, PKI_LAYOUT(LAYOUT_Q), PKI_LAYOUT(LAYOUT_K),
+                           false, half, half);
     } else {
         INVOKE_PKI_OP_IMPL(PoolKeyIndexerKernel, bfloat16_t, bfloat16_t, int32_t, PKI_LAYOUT(LAYOUT_Q),
                            PKI_LAYOUT(LAYOUT_K));

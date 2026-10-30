@@ -36,7 +36,7 @@ class PoolKeyIndexerOpBuilder(OpBuilder):
             "Tensor? block_table=None, Tensor? q_descale=None, Tensor? k_descale=None, "
             'str layout_q="BSND", str layout_k="BSND", '
             "int topk=2048, int pool_size=16, int mask_mode=3, int quant_mode=-1, "
-            "bool return_value=False) -> (Tensor, Tensor)"
+            "bool return_value=False, int sparse_indices_mode=0) -> (Tensor, Tensor)"
         )
 
     def register_meta(self):
@@ -64,6 +64,7 @@ class PoolKeyIndexerOpBuilder(OpBuilder):
             mask_mode=3,
             quant_mode=-1,
             return_value=False,
+            sparse_indices_mode=0,
         ):
             indices_len = topk + pool_size - 1
             values_len = topk // pool_size
@@ -107,10 +108,18 @@ def pool_key_indexer(
     mask_mode=3,
     quant_mode=-1,
     return_value=False,
+    sparse_indices_mode=0,
 ):
     """
     Dispatcher implementation for NPU.
     'PrivateUse1' is the dispatch key for custom NPU backends.
+
+    sparse_indices_mode: 索引输出布局模式(尾块追加模式)。
+      0 = legacy(默认)——tail 固定偏移 topk, 短序列展开区与尾区之间有 -1 缝隙,
+          与 aclnnPoolKeyIndexer(V1) 历史行为逐比特一致;
+      1 = compact——tail 紧跟有效展开 token, -1 全部位于行尾(消除中间空洞),
+          走 aclnnPoolKeyIndexerV2 接口。
+    行内有效 token 集合与数量两种模式完全一致, 仅位置布局不同。
     """
     op_module = pool_key_indexer_op_builder.load()
     return op_module.pool_key_indexer(
@@ -130,4 +139,5 @@ def pool_key_indexer(
         mask_mode,
         quant_mode,
         return_value,
+        sparse_indices_mode,
     )

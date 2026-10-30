@@ -153,14 +153,31 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     const int64_t* quantModePtr = attrs->GetInt(PKI_ATTR_QUANT_MODE);
     OP_CHECK_NULL_WITH_CONTEXT(context_, quantModePtr);
     info.quantMode = static_cast<int32_t>(*quantModePtr);
-    if (info.quantMode != -1 && info.quantMode != 0 && info.quantMode != 1) {
-        OP_LOGE(context_, "quant_mode must be -1, 0 or 1, got %d", info.quantMode);
+    if (info.quantMode != -1 && info.quantMode != 0 && info.quantMode != 1 && info.quantMode != PKI_QUANT_INT8) {
+        OP_LOGE(context_, "quant_mode must be -1, 0, 1 or 2, got %d", info.quantMode);
         return ge::GRAPH_FAILED;
     }
 
     const bool* returnValuePtr = attrs->GetAttrPointer<bool>(PKI_ATTR_RETURN_VALUE);
     OP_CHECK_NULL_WITH_CONTEXT(context_, returnValuePtr);
     info.returnValue = *returnValuePtr;
+
+    // sparse_indices_mode(索引输出布局模式, Version(2) 属性): 0=legacy / 1=compact。
+    // 仅 V2 接口(aclnnPoolKeyIndexerV2)/图模式会设置; V1 接口的运行时属性容器
+    // 可能不含该项(Version(2) 标记), 读取以 GetAttrNum + 判空双重守护, 缺省 legacy。
+    info.sparseIndicesMode = PKI_SPARSE_INDICES_MODE_LEGACY;
+    if (attrs->GetAttrNum() > PKI_ATTR_SPARSE_INDICES_MODE) {
+        const int64_t* modePtr = attrs->GetAttrPointer<int64_t>(PKI_ATTR_SPARSE_INDICES_MODE);
+        if (modePtr != nullptr) {
+            if (*modePtr != static_cast<int64_t>(PKI_SPARSE_INDICES_MODE_LEGACY) &&
+                *modePtr != static_cast<int64_t>(PKI_SPARSE_INDICES_MODE_COMPACT)) {
+                OP_LOGE(context_, "sparse_indices_mode must be 0 (legacy) or 1 (compact), got %ld",
+                        static_cast<long>(*modePtr));
+                return ge::GRAPH_FAILED;
+            }
+            info.sparseIndicesMode = static_cast<uint32_t>(*modePtr);
+        }
+    }
 
     // topk % poolSize == 0
     if (info.poolSize == 0 || info.topk % info.poolSize != 0) {
@@ -190,8 +207,26 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     OP_CHECK_NULL_WITH_CONTEXT(context_, poolTailKTensor);
     OP_CHECK_IF(queryShape->GetStorageShape().GetShapeSize() == 0, OP_LOGE(context_, "query must not be empty tensor"),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(keyShape->GetStorageShape().GetShapeSize() == 0, OP_LOGE(context_, "pool_key must not be empty tensor"),
-                return ge::GRAPH_FAILED);
+    // pool_key 允许"0 池"空张量(BSND dim1=0 / TND·PA dim0=0): 全部有效 token 经
+    // pool_tail_k 表达(纯尾块), kernel 收尾通道不读 k 数据、只写 -1+尾索引。
+    // 其余空形态(如 N2/D 轴为 0)仍拒绝。
+    if (keyShape->GetStorageShape().GetShapeSize() == 0) {
+        const auto& ks = keyShape->GetStorageShape();
+        bool zeroPool = false;
+        if (info.pageAttention) {
+            zeroPool = (ks.GetDimNum() == 4) && (ks.GetDim(0) == 0);
+        } else if (info.layoutK == PkiDataLayout::TND) {
+            zeroPool = (ks.GetDimNum() == 3) && (ks.GetDim(0) == 0);
+        } else { // BSND
+            zeroPool = (ks.GetDimNum() == 4) && (ks.GetDim(1) == 0);
+        }
+        OP_CHECK_IF(!zeroPool,
+                    OP_LOGE(context_, "empty pool_key must encode zero pools: BSND dim(1)=0 or TND/PA dim(0)=0"),
+                    return ge::GRAPH_FAILED);
+        keyZeroPool_ = true;
+    } else {
+        keyZeroPool_ = false;
+    }
 
     // 捕获 pool_key 运行时 stride(0 轴非连续支持); 优先级: key_stride0 属性 >
     // tiling context 运行时 stride(仅图模式填充, eager/aclnn 返回 nullptr)
@@ -336,6 +371,37 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
                     OP_LOGE(context_, "quant_mode=1, weights must be FP16 or BF16, got %d",
                             static_cast<int32_t>(info.weightsDtype)),
                     return ge::GRAPH_FAILED);
+    } else if (info.quantMode == PKI_QUANT_INT8) {
+        // quantMode=2: int8 对称量化(q/k=INT8, descale=FP16, weights 仅 FP16)
+        // 三平台放开, 无架构门禁(spec dtype_policy.supported_combinations[0])
+        OP_CHECK_IF(qDescaleTensor == nullptr, OP_LOGE(context_, "quant_mode=2, q_descale must not be null"),
+                    return ge::GRAPH_FAILED);
+        // 0 池纯尾块(pool_key 池数为 0)时 k_descale 可缺省: kernel 不读取反量化系数。
+        // 判据用 keyZeroPool_(空张量形态校验处已置位): 此处 info.s2Size 尚未解析,
+        // 以"!=0"守护会恒假失效, 放正常场景漏传 k_descale 进 kernel 读空指针
+        OP_CHECK_IF(kDescaleTensor == nullptr && !keyZeroPool_,
+                    OP_LOGE(context_, "quant_mode=2, k_descale must not be null"), return ge::GRAPH_FAILED);
+        OP_CHECK_IF(
+            info.queryDtype != ge::DT_INT8,
+            OP_LOGE(context_, "quant_mode=2, query dtype must be INT8, got %d", static_cast<int32_t>(info.queryDtype)),
+            return ge::GRAPH_FAILED);
+        ge::DataType qScaleDtype = context_->GetOptionalInputDesc(PKI_Q_DESCALE_INDEX)->GetDataType();
+        OP_CHECK_IF(qScaleDtype != ge::DT_FLOAT16,
+                    OP_LOGE(context_, "quant_mode=2, q_descale dtype must be FLOAT16, got %d",
+                            static_cast<int32_t>(qScaleDtype)),
+                    return ge::GRAPH_FAILED);
+        // 0 池纯尾块时 k_descale 可为空张量(见上方放宽), 其 dtype 检查同步跳过
+        if (kDescaleTensor != nullptr) {
+            ge::DataType kScaleDtype = context_->GetOptionalInputDesc(PKI_K_DESCALE_INDEX)->GetDataType();
+            OP_CHECK_IF(kScaleDtype != ge::DT_FLOAT16,
+                        OP_LOGE(context_, "quant_mode=2, k_descale dtype must be FLOAT16, got %d",
+                                static_cast<int32_t>(kScaleDtype)),
+                        return ge::GRAPH_FAILED);
+        }
+        OP_CHECK_IF(
+            info.weightsDtype != ge::DT_FLOAT16,
+            OP_LOGE(context_, "quant_mode=2, weights must be FLOAT16, got %d", static_cast<int32_t>(info.weightsDtype)),
+            return ge::GRAPH_FAILED);
     }
 
     // N1, N2, D from query shape
@@ -411,8 +477,9 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
         // (kernel kSeqSize 用作 scoreGm 行距, 不可为 0)
         info.s2Size = 0;
         // k_descale stride0 接线(量化场景): 优先级同 key_stride0;
-        // 连续 stride0: mode=0=blockSize*N2, mode=1=blockSize*N2*(D/32); 非量化保持 0
-        if (info.quantMode == PKI_QUANT_FP8_PER_TOKEN || info.quantMode == PKI_QUANT_MXFP8) {
+        // 连续 stride0: mode=0/2=blockSize*N2(FP16 scale 元素单位), mode=1=blockSize*N2*(D/32); 非量化保持 0
+        if (info.quantMode == PKI_QUANT_FP8_PER_TOKEN || info.quantMode == PKI_QUANT_MXFP8 ||
+            info.quantMode == PKI_QUANT_INT8) {
             const int64_t* kdsStride0Attr = attrs->GetAttrPointer<int64_t>(PKI_ATTR_K_DESCALE_STRIDE0);
             if (kdsStride0Attr != nullptr && *kdsStride0Attr >= 0) {
                 // 属性指定: 校验不小于连续 stride(0 轴非连续只允许加 padding)
@@ -583,7 +650,8 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     }
 
     // q_descale shape (non-null, quantMode>=0): mode=0 为 BSND 3D / TND 2D;
-    // mode=1 (mxFP8) 追加 [D/64, 2] 尾维 -> BSND 5D / TND 4D
+    // mode=1 (mxFP8) 追加 [D/64, 2] 尾维 -> BSND 5D / TND 4D;
+    // mode=2 (int8) 与 mode=0 同口径(去 D 轴逐维相等, 落 3D/2D 分支)
     if (qDescaleTensor != nullptr) {
         const gert::StorageShape* qdsShape = context_->GetOptionalInputShape(PKI_Q_DESCALE_INDEX);
         OP_CHECK_NULL_WITH_CONTEXT(context_, qdsShape);
@@ -642,7 +710,8 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     }
 
     // k_descale shape (non-null, quantMode>=0): mode=0 为 BSND/PA 3D 或 TND 2D;
-    // mode=1 (mxFP8) 追加 [D/64, 2] 尾维 -> BSND/PA 5D / TND 4D
+    // mode=1 (mxFP8) 追加 [D/64, 2] 尾维 -> BSND/PA 5D / TND 4D;
+    // mode=2 (int8) 与 mode=0 同口径(去 D 轴逐维相等, 落 3D/2D 分支)
     if (kDescaleTensor != nullptr) {
         const gert::StorageShape* kdsShape = context_->GetOptionalInputShape(PKI_K_DESCALE_INDEX);
         OP_CHECK_NULL_WITH_CONTEXT(context_, kdsShape);
@@ -930,7 +999,9 @@ ge::graphStatus PoolKeyIndexerTiling::CheckKeyContiguous(const PoolKeyIndexerTil
     size_t checkStartIdx = (info.layoutK == PkiDataLayout::PA_BBND) ? 1 : 0;
 
     // ---- pool_key 连续性校验(失败日志含 tensor 名/轴号/实际 stride/期望 stride/shape) ----
-    if (!keyStridesVec_.empty()) {
+    // 0 池空张量(pool_key 未被读取)跳过: 空张量各轴 stride 为分配器残留值(如 dim0=128
+    // 而期望 0), 与连续性语义无关; 池数为 0 时 kernel 不消费 key 数据与 keyStride0
+    if (!keyStridesVec_.empty() && !keyZeroPool_) {
         const gert::StorageShape* keyShape = context_->GetInputShape(PKI_POOL_KEY_INDEX);
         if (keyShape != nullptr) {
             auto& shape = keyShape->GetStorageShape();
@@ -971,7 +1042,8 @@ ge::graphStatus PoolKeyIndexerTiling::CheckKeyContiguous(const PoolKeyIndexerTil
         }
     }
     // ---- k_descale 非连续校验(量化场景, 与 pool_key 同规则: PA 仅 0 轴可非连续, 其余轴必须连续) ----
-    if (info.quantMode == PKI_QUANT_FP8_PER_TOKEN || info.quantMode == PKI_QUANT_MXFP8) {
+    if (info.quantMode == PKI_QUANT_FP8_PER_TOKEN || info.quantMode == PKI_QUANT_MXFP8 ||
+        info.quantMode == PKI_QUANT_INT8) {
         if (!keyDequantScaleStridesVec_.empty()) {
             const gert::StorageShape* kdsShape = context_->GetOptionalInputShape(PKI_K_DESCALE_INDEX);
             if (kdsShape != nullptr) {
@@ -1047,6 +1119,20 @@ uint32_t PoolKeyIndexerTiling::GetTrunkLen(uint32_t sparseCount)
     return PKI_TRUNK_LEN_12K;
 }
 
+// scoreGm 尺寸的 arch 分支开关。1=只对**已确证走 arch22 kernel 的
+// SoC**(NpuArch==DAV_2201, 即 Ascend910B / Ascend910_93)按 arch22 公式取尺寸,
+// 其余 arch 保留 std::max(arch22, arch35) 兜底; 0=无条件 max(基线)。
+// 数值零影响: 只改 workspace **总量**, 三区的相对 offset 与 kernel 侧镜像公式
+// (本函数 :1111-1156 ↔ kernel_arch22.h Init 的 offset 累加)一字未动。
+// 分支判据取"白名单 arch22"而非"黑名单 arch35": NpuArch=2201 在 CANN 平台表里
+// 恰好且只有 Ascend910B/Ascend910_93 两族(platform_config/*.ini 全表核对),
+// 二者都编译 arch22 kernel(op_kernel/pool_key_indexer.cpp:15-19 的
+// #if (__CCE_AICORE__ == 310) → arch35 / #else → arch22)⇒ 任何未登记 arch
+// (含 A5/DAV_3510 与未来变体)都落在 max 兜底分支, 结构上不可能欠配。
+#ifndef PKI_WS_ARCH_BRANCH
+#define PKI_WS_ARCH_BRANCH 1
+#endif
+
 ge::graphStatus PoolKeyIndexerTiling::CalcWorkspaceSize(PoolKeyIndexerTilingInfo& info, uint64_t& workspaceSize)
 {
     // workspace 布局须与 kernel 侧一致: | mm1ResGm(双缓冲score) | vec1ResGm(LD中间结果) |
@@ -1070,24 +1156,59 @@ ge::graphStatus PoolKeyIndexerTiling::CalcWorkspaceSize(PoolKeyIndexerTilingInfo
     uint64_t s1BaseSize = (info.sparseCount > PKI_BASE_TOPK) ? (PKI_SPARSE_COUNT_8K / info.sparseCount) * 2 : 8;
     uint64_t mBaseSizeAlign = RoundUp64(s1BaseSize * info.gSize, PKI_BLOCK_CUBE_SIZE);
 
-    // scoreGm: aicNum × 双缓冲 × mBaseSizeAlign × s2BaseSize × sizeof(SCORE_T)
-    uint64_t scoreGmSize =
-        RoundUp64(static_cast<uint64_t>(aicNum) * PKI_WS_DOUBLE * mBaseSizeAlign * PKI_S2_BASE_SIZE * PKI_SCORE_T_SIZE,
+    // arch22 score 区元素大小: int8 模式 fixpipe DEQF16 输出 fp16(2B), 其余 fp32(4B);
+    // 仅 arch22 公式使用(arch22 恒 uint32 键, 与 arch35 PKI_SCORE_T_SIZE 无关)
+    constexpr uint64_t PKI_SCORE_T_SIZE_FP16 = 2;
+    constexpr uint64_t PKI_SCORE_T_SIZE_B32 = 4;
+    uint64_t scoreElemSize = (info.quantMode == PKI_QUANT_INT8) ? PKI_SCORE_T_SIZE_FP16 : PKI_SCORE_T_SIZE_B32;
+
+    // scoreGm: aicNum × 双缓冲 × mBaseSizeAlign × s2BaseSize × scoreElemSize (arch22 口径)
+    uint64_t scoreGmSize22 =
+        RoundUp64(static_cast<uint64_t>(aicNum) * PKI_WS_DOUBLE * mBaseSizeAlign * PKI_S2_BASE_SIZE * scoreElemSize,
                   PKI_GM_ALIGN_BYTES);
+    uint64_t scoreGmSize = scoreGmSize22;
     // arch35 kernel score 区域: aicNum × s1BaseSize(4|2) × Align(s2Size,128) × 4B;
     // TND/PA 的 s2Size 可能更大, 需取 max 覆盖
+    // ⚠ int8 保持 PKI_SCORE_T_SIZE=4B 不变(arch35 score 区为 SCORE_T=uint32 sortable key,
+    //   AIV 在寄存器内完成换算): 误将此处替换为 fp16 尺寸会导致 A5 workspace
+    //   欠配且无卡可测, 静默越界
     uint64_t s1BaseSize35 = (info.sparseCount > PKI_BASE_TOPK) ? PKI35_S1_BASE_SIZE_SMALL : PKI35_S1_BASE_SIZE;
     uint64_t s2Size35Align = (info.s2Size + PKI35_S2_BASE_SIZE - 1) / PKI35_S2_BASE_SIZE * PKI35_S2_BASE_SIZE;
+    const uint64_t scoreElemSize35 = (info.quantMode >= 0) ? PKI_SCORE_T_SIZE_Q : PKI_SCORE_T_SIZE;
     uint64_t scoreGmSize35 =
-        RoundUp64(static_cast<uint64_t>(aicNum) * s1BaseSize35 * s2Size35Align * PKI_SCORE_T_SIZE, PKI_GM_ALIGN_BYTES);
+        RoundUp64(static_cast<uint64_t>(aicNum) * s1BaseSize35 * s2Size35Align * scoreElemSize35, PKI_GM_ALIGN_BYTES);
+#if PKI_WS_ARCH_BRANCH
+    // 只有 NpuArch!=DAV_2201(= 不走 arch22 kernel 的 SoC, 含 A5/3510)
+    // 才需要 arch35 项兜底。arch22 侧(910B/910_93)的 kernel 只按 arch22 公式镜像
+    // 推导 mm1ResGm 的分核步长(kernel_arch22.h Init), 从不触及 arch35 项 ⇒ 保留
+    // max 只是白占地址空间(典型 prefill 工况 arch35 项可达 83.97MB, 把 int8 的 2B
+    // scoreElemSize 收益完全吃掉, 使 score 区 dtype 感知成为死代码)。
+    // ⚠ 上面 A5 欠配警告语义保持不变: 本分支下 A5 仍取 max; arch35 项尺寸沿用
+    //   既有的 scoreElemSize35 公式(量化模式键宽感知), 不再改写。
+    if (info.npuArch != NpuArch::DAV_2201) {
+        scoreGmSize = std::max(scoreGmSize, scoreGmSize35);
+    }
+#else
     scoreGmSize = std::max(scoreGmSize, scoreGmSize35);
+#endif
     tilingData_.set_wsOffScore(offset);
     offset += scoreGmSize;
 
+    // arch35 跨核尾段暂存区, 尺寸与 arch35 score 区同构(aicNum × s1BaseSize35 ×
+    // Align(s2Size,128) × 4B)。isLDOpen 时 follower 在区间起始组处理完立即把尾段分数
+    // 转存至此(常规 score 区按组内列复用, 会被后续组/自身归并覆盖), 段首核归并改读此区。
+    // sparseCount>2048 时 kernel 侧 isLDOpen 恒 false, 无需预留
+    if (info.sparseCount <= PKI_BASE_TOPK) {
+        uint64_t ldTailSize35 = RoundUp64(
+            static_cast<uint64_t>(aicNum) * s1BaseSize35 * s2Size35Align * scoreElemSize35, PKI_GM_ALIGN_BYTES);
+        offset += ldTailSize35;
+    }
+
     // LD score: aicNum × s1BaseSize × 2(头/尾) × 2(idx/value) × TOPK_MAX × sizeof(SCORE_T)
     // 按 topk 上限 8192 预留，覆盖 kernel 实写的 BASE_TOPK(2048)
+    // arch22 LD 分数暂存区: arch22 恒 uint32 键
     uint64_t ldScoreSize = RoundUp64(static_cast<uint64_t>(aicNum) * s1BaseSize * PKI_WS_DOUBLE * PKI_WS_DOUBLE *
-                                         PKI_TOPK_MAX_SIZE * PKI_SCORE_T_SIZE,
+                                         PKI_TOPK_MAX_SIZE * PKI_SCORE_T_SIZE_B32,
                                      32);
     tilingData_.set_wsOffLdScore(offset);
     offset += ldScoreSize;
@@ -1099,8 +1220,18 @@ ge::graphStatus PoolKeyIndexerTiling::CalcWorkspaceSize(PoolKeyIndexerTilingInfo
     offset += ldIdxSize;
 
     workspaceSize = offset;
+#if PKI_WS_ARCH_BRANCH
+    // 日志追加 npuArch 与两个 arch 公式的分项尺寸, 使"A5 是否欠配"可在
+    // host 日志上直接对拍(scoreGm22=arch22 项 / scoreGm35=arch35 项 / scoreGm=实取)
+    OP_LOGI(context_->GetNodeName(),
+            "PoolKeyIndexer workspace: npuArch=%u, scoreGm=%lu(scoreGm22=%lu, scoreGm35=%lu), ldScore=%lu, "
+            "ldIdx=%lu, total=%lu",
+            static_cast<uint32_t>(info.npuArch), scoreGmSize, scoreGmSize22, scoreGmSize35, ldScoreSize, ldIdxSize,
+            workspaceSize);
+#else
     OP_LOGI(context_->GetNodeName(), "PoolKeyIndexer workspace: scoreGm=%lu, ldScore=%lu, ldIdx=%lu, total=%lu",
             scoreGmSize, ldScoreSize, ldIdxSize, workspaceSize);
+#endif
     return ge::GRAPH_SUCCESS;
 }
 
@@ -1124,7 +1255,16 @@ void PoolKeyIndexerTiling::SetTilingData(PoolKeyIndexerTilingInfo& info)
     tilingData_.set_keyStride0(info.keyStride0);
     tilingData_.set_keyDequantScaleStride0(info.keyDequantScaleStride0);
     // 算子文档公式: S = Q @ K_pool^T * 1/sqrt(headDim), host 侧预计算缩放系数
-    tilingData_.set_qkScale(1.0f / std::sqrt(static_cast<float>(info.headDim)));
+    // int8: 中间分数含 2^-10 缩放(fixpipe DEQF16), value 输出按 D4 补偿 2^10,
+    // 与 1/sqrt(headDim) 合并为单常数, AIV 既有后乘点(Muls qkScale)零改动
+    float scale = 1.0f / std::sqrt(static_cast<float>(info.headDim));
+    if (info.quantMode == PKI_QUANT_INT8) {
+        scale *= 1024.0f;
+    }
+    tilingData_.set_qkScale(scale);
+    // 索引输出布局模式: V1 接口(aclnnPoolKeyIndexer)恒为 legacy(与历史版本逐比特
+    // 一致, 模型侧兼容); V2 接口(aclnnPoolKeyIndexerV2)/图模式按 sparse_indices_mode 属性选择
+    tilingData_.set_sparseIndicesMode(info.sparseIndicesMode);
 }
 
 ge::graphStatus PoolKeyIndexerTiling::DoTiling(PoolKeyIndexerTilingInfo* tilingInfo)
@@ -1176,7 +1316,8 @@ ge::graphStatus PoolKeyIndexerTiling::DoTiling(PoolKeyIndexerTilingInfo* tilingI
     }
 
     // Set tiling key: map runtime attributes to template tiling key values
-    // DT_Q/DT_K: FP16=1, BF16=27, FP8=2 (PKI_TPL_* in template_tiling_key.h)
+    // DT_Q/DT_K: FP16=1, BF16=27, FP8=2, INT8=4 (PKI_TPL_* in template_tiling_key.h;
+    // INT8 取私有码 4 与既有 {1,27,2} 互异)
     uint32_t tplDtQ = 0;
     if (info.queryDtype == ge::DT_FLOAT16) {
         tplDtQ = 1;
@@ -1184,6 +1325,8 @@ ge::graphStatus PoolKeyIndexerTiling::DoTiling(PoolKeyIndexerTilingInfo* tilingI
         tplDtQ = 27;
     } else if (info.queryDtype == ge::DT_FLOAT8_E4M3FN) {
         tplDtQ = 2;
+    } else if (info.queryDtype == ge::DT_INT8) {
+        tplDtQ = 4;
     }
     // quant_mode: host(-1/0/1) → tpl(0/1/2) via +1 offset
     uint32_t tplQuantMode = static_cast<uint32_t>(info.quantMode + 1);
@@ -1242,5 +1385,9 @@ static ge::graphStatus TilingPrepareForPoolKeyIndexer(gert::TilingParseContext* 
 IMPL_OP_OPTILING(PoolKeyIndexer)
     .Tiling(TilingPoolKeyIndexer)
     .TilingParse<PoolKeyIndexerCompileInfo>(TilingPrepareForPoolKeyIndexer);
+
+// 注册宏自 tiling.h 迁入: 结构体被 PoolKeyIndexerV2 复用, 留在头文件会在
+// 多个 TU 内对同名 op 重复注册
+REGISTER_TILING_DATA_CLASS(PoolKeyIndexer, PoolKeyIndexerTilingData)
 
 } // namespace optiling

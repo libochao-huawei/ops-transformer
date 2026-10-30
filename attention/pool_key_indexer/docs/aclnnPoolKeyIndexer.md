@@ -23,13 +23,13 @@
 
 ## 功能说明
 
-- 接口功能：`pool_key_indexer`将多个连续token打包成一个pool（池），以pool为单位计算注意力相关性分数并选取top-k位置，从而在保持稀疏注意力优势的同时减少索引开销。该算子适用于基于key pool的稀疏注意力场景下的稀疏索引选择。支持FLOAT16、BFLOAT16浮点输入，并支持配合反量化系数的FLOAT8_E4M3FN量化输入（FP8 per-token-head或mxFP8量化模式）。
+- 接口功能：`pool_key_indexer`将多个连续token打包成一个pool（池），以pool为单位计算注意力相关性分数并选取top-k位置，从而在保持稀疏注意力优势的同时减少索引开销。该算子适用于基于key pool的稀疏注意力场景下的稀疏索引选择。支持FLOAT16、BFLOAT16浮点输入，并支持配合反量化系数的FLOAT8_E4M3FN量化输入（FP8 per-token-head或mxFP8量化模式）与INT8量化输入。
 
 - 计算公式：
 
   完整计算流程分为输入反量化、分数计算与选择、索引展开与追加三个部分。
 
-  **输入反量化（仅量化场景，quantMode为0或1）：**
+  **输入反量化（仅量化场景，quantMode为0、1或2）：**
 
   当quantMode为-1（不量化）时，直接使用原始输入：
 
@@ -37,7 +37,7 @@
   Q = query,\quad K_{pool} = poolKey
   $$
 
-  当quantMode为0或1（量化）时，先对FLOAT8_E4M3FN输入结合反量化系数进行反量化：
+  当quantMode为0、1或2（量化）时，先对量化输入结合反量化系数进行反量化：
 
   $$
   Q = \text{Dequant}(query, q\_descale)
@@ -47,7 +47,7 @@
   K_{pool} = \text{Dequant}(poolKey, k\_descale)
   $$
 
-  其中quantMode为0表示FP8 per-token-head量化模式，反量化系数为FLOAT类型；quantMode为1表示mxFP8量化模式，反量化系数为FLOAT8_E8M0类型。
+  其中quantMode为0表示FP8 per-token-head量化模式，反量化系数为FLOAT类型；quantMode为1表示mxFP8量化模式，反量化系数为FLOAT8_E8M0类型；quantMode为2表示int8量化模式，query、poolKey为INT8类型，反量化系数为FLOAT16类型（q_descale为per-token-head粒度、k_descale为per-token粒度，均为对称量化scale）。
 
   **分数计算与选择：**
 
@@ -189,15 +189,16 @@ aclnnStatus aclnnPoolKeyIndexer(
       <td>query（aclTensor*）</td>
       <td>输入</td>
       <td>公式中的输入Q。</td>
-      <td>不支持空tensor。</td>
-      <td>FLOAT16、BFLOAT16、FLOAT8_E4M3FN</td>
-      <td>ND</td>
       <td>
           <ul>
+                <li>不支持空tensor。</li>
                 <li>layoutQueryOptional为BSND时，shape为(B,S1,N1,D)。</li>
                 <li>layoutQueryOptional为TND时，shape为(T1,N1,D)。</li>
           </ul>
       </td>
+      <td>FLOAT16、BFLOAT16、FLOAT8_E4M3FN、INT8</td>
+      <td>ND</td>
+      <td>3-4</td>
       <td>√</td>
     </tr>
     <tr>
@@ -206,7 +207,7 @@ aclnnStatus aclnnPoolKeyIndexer(
       <td>公式中的输入K<sub>pool</sub>。</td>
       <td>
           <ul>
-                <li>不支持空tensor。</li>
+                <li>支持“0 池”空张量（纯尾块模式：BSND S2=0、TND T2=0、PA block_num=0）；此时各batch有效key全部由poolTailK表达，尾token按因果可见性写入sparseIndices。</li>
                 <li>block_num为PageAttention时block总数，block_size为一个block的pool数（块内每行为一个pool的key，行距为headDim，不做token展开）。</li>
                 <li>数据类型需与query保持一致。</li>
                 <li>数据布局需与query保持一致，PageAttention场景（layoutKeyOptional为PA_BBND）除外。</li>
@@ -215,9 +216,9 @@ aclnnStatus aclnnPoolKeyIndexer(
                 <li>layoutKeyOptional为TND时，shape为(T2, N2, D)。</li>
           </ul>
       </td>
-      <td>FLOAT16、BFLOAT16、FLOAT8_E4M3FN</td>
+      <td>FLOAT16、BFLOAT16、FLOAT8_E4M3FN、INT8</td>
       <td>ND</td>
-      <td>2-5</td>
+      <td>3-4</td>
       <td>支持0轴非连续（仅PA_BBND布局，需配合keyStride0属性；BSND/TND布局要求连续输入）</td>
     </tr>
     <tr>
@@ -229,6 +230,7 @@ aclnnStatus aclnnPoolKeyIndexer(
                 <li>不支持空tensor。</li>
                 <li>layoutQueryOptional为BSND时，shape为(B,S1,N1)。</li>
                 <li>layoutQueryOptional为TND时，shape为(T1,N1)。</li>
+                <li>quantMode为2（int8量化）时，数据类型仅支持FLOAT16。</li>
           </ul>
       </td>
       <td>FLOAT16、BFLOAT16</td>
@@ -313,12 +315,14 @@ aclnnStatus aclnnPoolKeyIndexer(
           <ul>
                 <li>可选输入，非量化场景（quantMode为-1）可传入空指针。</li>
                 <li>不支持空Tensor。</li>
-                <li>量化场景下必传，数据类型由quantMode决定：quantMode为0时为FLOAT（FP8 per-token-head量化），quantMode为1时为FLOAT8_E8M0（mxFP8量化）。</li>
+                <li>量化场景下必传，数据类型由quantMode决定：quantMode为0时为FLOAT（FP8 per-token-head量化），quantMode为1时为FLOAT8_E8M0（mxFP8量化），quantMode为2时为FLOAT16。</li>
                 <li>quantMode为0时：layoutQueryOptional为BSND时shape为(B,S1,N1)；layoutQueryOptional为TND时shape为(T1,N1)。</li>
                 <li>quantMode为1时（mxFP8，每32个D维度元素共享一个E8M0 scale）：layoutQueryOptional为BSND时shape为(B,S1,N1,D/64,2)；layoutQueryOptional为TND时shape为(T1,N1,D/64,2)。</li>
+                <li>quantMode为2时（int8）：layoutQueryOptional为BSND时shape为(B,S1,N1)；layoutQueryOptional为TND时shape为(T1,N1)，各维度与query对应维度一致。</li>
+                <li>quantMode为2时元素取值须为正数（对称量化scale）。</li>
           </ul>
       </td>
-      <td>FLOAT、FLOAT8_E8M0</td>
+      <td>FLOAT、FLOAT8_E8M0、FLOAT16</td>
       <td>ND</td>
       <td>2-5</td>
       <td>√</td>
@@ -331,12 +335,14 @@ aclnnStatus aclnnPoolKeyIndexer(
           <ul>
                 <li>可选输入，非量化场景（quantMode为-1）可传入空指针。</li>
                 <li>不支持空Tensor。</li>
-                <li>量化场景下必传，数据类型由quantMode决定：quantMode为0时为FLOAT（FP8 per-token-head量化），quantMode为1时为FLOAT8_E8M0（mxFP8量化）。</li>
+                <li>量化场景下必传，数据类型由quantMode决定：quantMode为0时为FLOAT（FP8 per-token-head量化），quantMode为1时为FLOAT8_E8M0（mxFP8量化），quantMode为2时为FLOAT16。</li>
                 <li>quantMode为0时：layoutKeyOptional为BSND时shape为(B,S2,N2)；layoutKeyOptional为TND时shape为(T2,N2)；layoutKeyOptional为PA_BBND时shape为(block_num, block_size, N2)。</li>
                 <li>quantMode为1时（mxFP8）：layoutKeyOptional为BSND时shape为(B,S2,N2,D/64,2)；layoutKeyOptional为TND时shape为(T2,N2,D/64,2)；layoutKeyOptional为PA_BBND时shape为(block_num, block_size, N2, D/64,2)。</li>
+                <li>quantMode为2时（int8）：shape为poolKey去掉D轴，即layoutKeyOptional为BSND时shape为(B,S2,N2)；layoutKeyOptional为TND时shape为(T2,N2)；layoutKeyOptional为PA_BBND时shape为(block_num, block_size, N2)，各维度与poolKey对应维度一致。</li>
+                <li>quantMode为2时元素取值须为正数（对称量化scale）。</li>
           </ul>
       </td>
-      <td>FLOAT、FLOAT8_E8M0</td>
+      <td>FLOAT、FLOAT8_E8M0、FLOAT16</td>
       <td>ND</td>
       <td>2-5</td>
       <td>支持0轴非连续（仅PA_BBND布局且量化场景，需配合kDescaleStride0属性；BSND/TND布局要求连续输入）</td>
@@ -420,6 +426,7 @@ aclnnStatus aclnnPoolKeyIndexer(
                 <li>quantMode为-1时，表示不量化。</li>
                 <li>quantMode为0时，表示FP8 per-token-head量化模式，反量化系数为FLOAT。</li>
                 <li>quantMode为1时，表示mxFP8量化模式，反量化系数为FLOAT8_E8M0。</li>
+                <li>quantMode为2时，表示int8量化模式，query、poolKey为INT8，反量化系数qDescaleOptional、kDescaleOptional为FLOAT16（q为per-token-head粒度，k为per-token粒度）。</li>
           </ul>
       </td>
       <td>-</td>
@@ -464,9 +471,9 @@ aclnnStatus aclnnPoolKeyIndexer(
       <td>kDescaleOptional第0轴的stride（元素单位），用于layoutKeyOptional为PA_BBND场景下0轴非连续kDescaleOptional的寻址。可选属性，建议值为-1。</td>
       <td>
           <ul>
-                <li>仅量化场景（quantMode为0或1）有效。</li>
+                <li>仅量化场景（quantMode为0、1或2）有效。</li>
                 <li>-1表示未指定，按连续输入由shape推导stride。</li>
-                <li>指定时取值必须不小于连续stride：quantMode为0时为block_size * N2，quantMode为1时为block_size * N2 * (D / 32)。</li>
+                <li>指定时取值必须不小于连续stride：quantMode为0时为block_size * N2，quantMode为1时为block_size * N2 * (D / 32)，quantMode为2时为block_size * N2（FLOAT16 scale，元素单位）。</li>
                 <li>指定值与kDescaleOptional运行时实际stride冲突时报错。</li>
           </ul>
       </td>
@@ -633,12 +640,12 @@ aclnnStatus aclnnPoolKeyIndexer(
   - 当layoutKeyOptional为PA_BBND且kDescaleOptional为0轴非连续输入时（量化场景），kDescaleStride0应传入kDescaleOptional的实际stride(0)（元素单位，且不小于连续stride：quantMode为0时为block_size * N2，quantMode为1时为block_size * N2 * (D / 32)）；kDescaleStride0为-1时表示未指定，按连续输入推导；kDescaleStride0指定值与kDescaleOptional运行时实际stride冲突时报错。
 - 输入数据类型限制：
   - 参数query、poolKey的数据类型应保持一致。
-  - 非量化场景（quantMode为-1）下，参数weights的数据类型应与query、poolKey保持一致；量化场景（quantMode为0或1）下，参数weights为FLOAT16或BFLOAT16。
+  - 非量化场景（quantMode为-1）下，参数weights的数据类型应与query、poolKey保持一致；量化场景（quantMode为0或1）下，参数weights为FLOAT16或BFLOAT16；int8量化场景（quantMode为2）下，参数weights仅支持FLOAT16。
   <!-- npu="950" id8 -->
-  - <term>Ascend 950PR&950DT系列产品</term>：支持FLOAT8_E4M3FN（query、poolKey）数据类型，并支持量化场景（quantMode为0时反量化系数为FLOAT，quantMode为1时反量化系数为FLOAT8_E8M0）。
+  - <term>Ascend 950PR&950DT系列产品</term>：支持FLOAT8_E4M3FN（query、poolKey）数据类型，并支持量化场景（quantMode为0时反量化系数为FLOAT，quantMode为1时反量化系数为FLOAT8_E8M0）；支持INT8量化场景（quantMode为2时query、poolKey为INT8，反量化系数为FLOAT16）。
   <!-- end id8 -->
   <!-- npu="A3,910b" id7 -->
-  - <term>Atlas A3系列产品</term>、<term>Atlas A2系列产品</term>：不支持FLOAT8_E4M3FN与FLOAT8_E8M0数据类型，不支持量化场景。
+  - <term>Atlas A3系列产品</term>、<term>Atlas A2系列产品</term>：不支持FLOAT8_E4M3FN与FLOAT8_E8M0数据类型，不支持FP8量化场景（quantMode为0或1）；支持INT8量化场景（quantMode为2时query、poolKey为INT8，weights、反量化系数为FLOAT16）。
   <!-- end id7 -->
 - 输入数据布局限制：
   - 参数query、poolKey的数据布局（layoutQueryOptional与layoutKeyOptional）需保持一致，PageAttention场景（layoutKeyOptional为PA_BBND时）除外。
@@ -753,9 +760,14 @@ int InitializeTensors(TensorResources& resources) {
     int64_t sparseIndicesShapeSize = GetShapeSize(sparseIndicesShape);
     int64_t sparseValuesShapeSize = GetShapeSize(sparseValuesShape);
 
-    std::vector<float> queryHostData(queryShapeSize, 1);
-    std::vector<float> poolKeyHostData(poolKeyShapeSize, 1);
-    std::vector<float> weightsHostData(weightsShapeSize, 1);
+    // FP16 tensor 的 host 数据按 half 位型(uint16_t)填充, 与 aclDataType::ACL_FLOAT16 匹配;
+    // 0x3C00 = FP16 1.0。不可用 float 字节流直接填充 —— 会被按 half 解读为错位值
+    // (1.0f 的字节流 00 00 80 3F -> [0.0, 2.0] 交替)。若未来需要填充任意 float 值,
+    // 须先做 float->half 位型转换再填入
+    constexpr uint16_t kFp16One = 0x3C00;
+    std::vector<uint16_t> queryHostData(queryShapeSize, kFp16One);
+    std::vector<uint16_t> poolKeyHostData(poolKeyShapeSize, kFp16One);
+    std::vector<uint16_t> weightsHostData(weightsShapeSize, kFp16One);
     std::vector<int32_t> sparseIndicesHostData(sparseIndicesShapeSize, 1);
     std::vector<float> sparseValuesHostData(sparseValuesShapeSize, 1);
 

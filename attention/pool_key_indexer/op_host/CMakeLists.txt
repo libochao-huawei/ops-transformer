@@ -25,5 +25,8 @@ add_ops_compile_options(
 )
 
 if (NOT BUILD_OPS_RTY_KERNEL)
-    add_modules_sources(OPTYPE pool_key_indexer ACLNNTYPE aclnn)
+    # ACLNN_EXTRA_VERSION v2: def 中 version 属性带 .Version(2) 标记, opbuild 会
+    # 额外生成 aclnn_pool_key_indexer_v2.{cpp,h}(V2 接口), 须经此声明才会编入
+    # ops_aclnn / 打包进 op_api(参考 kv_rms_norm_rope_cache 同款配置)
+    add_modules_sources(OPTYPE pool_key_indexer ACLNNTYPE aclnn ACLNN_EXTRA_VERSION v2)
 endif()

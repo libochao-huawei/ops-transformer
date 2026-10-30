@@ -24,16 +24,50 @@
 
 namespace PkiKernel {
 using namespace PkiCommon;
+
+// int8 fixpipe 常量 CSR 写外提开关。1=把 Fixp() int8 分支里两条
+// **全 kernel 常量**的 CSR 写(SetFixpipeNz2ndFlag(1,1,1) → set_nd_para、
+// SetFixpipePreQuantFlag(0x3a800000) → set_quant_pre)外提到 AllocEventID() 一次;
+// 0=每次 Fixp 重写(基线; 每 base block 8 次)。
+// 数值 bit-exact(依据 CANN 实现级核对):
+//   - 两个 CSR 都是 AIC 侧粘滞寄存器(dav_c220/kernel_operator_fixpipe_impl.h:67-84),
+//     写一次即保持到被覆写;
+//   - 本 kernel 内 nd_para / quant_pre 的**唯一写者就是这两行**: 全仓 dav_c220 只有
+//     三个入口(SetFixpipeNz2ndFlagImpl / SetFixpipePreQuantFlagImpl、set_spr 的
+//     SetNdParaImpl/SetQuantPreImpl、cube_others 的 SetNdPARA/SetQuantPRE), 后两组
+//     本算子从不调用; 实际出数的 DataCopyL0C2GMImpl(data_copy_impl.h:1095+)只把
+//     quantPre/nz2ndEn/reluPre/unitFlag 作 copy_matrix_cc_to_gm 的**指令字段**传入,
+//     全程不改写这两个 CSR(会内部 SetNdParaImpl 的是 Fixpipe<> API 路径的
+//     FixpipeL0C2GMImpl:256-262, arch22 PKI 不用它, arch35 才用);
+//   - SetMMLayoutTransform 写的是 set_ctrl 的 MM_LAYOUT_MODE_BIT(kernel_reg.h:190),
+//     Mmad/LoadData 写的是 set_fmatrix / set_fmatrix_b / set_padding
+//     (dav_c220/kernel_operator_mm_impl.h:480/499/515)⇒ 三者与 nd_para/quant_pre
+//     是**不同 CSR**, 块间不存在复位者;
+//   - 外提点取 AllocEventID() 的 SetMMLayoutTransform(true) **之后**(保守次序),
+//     且 AllocEventID 在 ProcessMain 首部、早于任何 Fixp。
+// **只改 int8 分支**。bf16 分支的 SetFixpipeNz2ndFlag 原样不动 ⇒
+//      bf16 的指令序列与 CSR 写次数完全不变, 平凡满足"bf16 不劣化/不受影响";
+//      外提处用 if constexpr (LIT::isInt8) 包住, bf16 实例化不产生 quant_pre 写
+//      (bf16 本就不写 quant_pre)。
+// ⚠ 失效前提: 若将来把 arch22 的出数改成 Fixpipe<> API, 该 API 内部会
+//   SetNdParaImpl(ndPara) 覆写 nd_para ⇒ 本外提即失效, 必须同时关掉本开关。
+#ifndef PKI_FIXPIPE_CSR_HOIST
+#define PKI_FIXPIPE_CSR_HOIST 1
+#endif
+
 template <typename LIT>
 class PoolKeyIndexerServiceCube {
 public:
     using Q_T = typename LIT::queryType;
     using K_T = typename LIT::keyType;
+    // fixpipe 输出 dtype: int8 走 DEQF16 反量化直写 GM fp16, 其余 fp32
+    using MM1_OUT_T = typename std::conditional<LIT::isInt8, half, float>::type;
 
     __aicore__ inline PoolKeyIndexerServiceCube(){};
     __aicore__ inline void InitBuffers(TPipe* pipe);
     __aicore__ inline void InitMm1GlobalTensor(const GlobalTensor<int32_t>& blkTableGm, const GlobalTensor<K_T>& keyGm,
-                                               const GlobalTensor<Q_T>& queryGm, const GlobalTensor<float>& mm1ResGm);
+                                               const GlobalTensor<Q_T>& queryGm,
+                                               const GlobalTensor<MM1_OUT_T>& mm1ResGm);
     __aicore__ inline void InitParams(const ConstInfo& constInfo);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -59,6 +93,12 @@ public:
     static constexpr uint64_t D_BASIC_BLOCK_L0 = 128;
     static constexpr uint64_t S2_BASIC_BLOCK_L0 = 128;
 
+    // NZ 布局行偏移乘子: fp16 每 16 元素(32B)一行块, int8 为 32 元素(32B);
+    // int8 每行 32 元素(32B), dstNzC0Stride 的 16 行对齐保持不变
+    static constexpr uint64_t FP16_BLOCK_CUBE = 16;
+    static constexpr uint64_t S8_BLOCK_CUBE = 32;
+    static constexpr uint64_t QK_BLOCK_CUBE = (sizeof(K_T) == 1) ? S8_BLOCK_CUBE : FP16_BLOCK_CUBE;
+
     static constexpr uint64_t QUERY_BUFFER_OFFSET = M_BASIC_BLOCK * D_BASIC_BLOCK;
     static constexpr uint64_t KEY_BUFFER_OFFSET = S2_BASIC_BLOCK * D_BASIC_BLOCK;
     static constexpr uint64_t L0AB_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0;
@@ -68,7 +108,7 @@ protected:
     __aicore__ inline void Fixp(uint64_t s1gGmOffset, uint64_t s2GmOffset, uint64_t s1gL0RealSize,
                                 uint64_t s2L0RealSize, const PkiCommon::RunInfo& runInfo);
     __aicore__ inline void ComuteL0c(uint64_t s1gL0RealSize, uint64_t s2L0RealSize, const PkiCommon::RunInfo& runInfo);
-    __aicore__ inline void LoadKeyToL0b(uint64_t s2L0Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize,
+    __aicore__ inline void LoadKeyToL0b(uint64_t s2L1Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize,
                                         const PkiCommon::RunInfo& runInfo);
     __aicore__ inline void LoadQueryToL0a(uint64_t s1gL1Offset, uint64_t s1gL0Offset, uint64_t s1gL1RealSize,
                                           uint64_t s1gL0RealSize, const PkiCommon::RunInfo& runInfo);
@@ -78,7 +118,7 @@ protected:
     GlobalTensor<int32_t> blkTableGm_;
     GlobalTensor<K_T> keyGm_;
     GlobalTensor<Q_T> queryGm_;
-    GlobalTensor<float> mm1ResGm_;
+    GlobalTensor<MM1_OUT_T> mm1ResGm_;
 
     TBuf<TPosition::A1> bufQL1_;
     LocalTensor<Q_T> queryL1_;
@@ -131,7 +171,7 @@ template <typename LIT>
 __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::InitMm1GlobalTensor(const GlobalTensor<int32_t>& blkTableGm,
                                                                            const GlobalTensor<K_T>& keyGm,
                                                                            const GlobalTensor<Q_T>& queryGm,
-                                                                           const GlobalTensor<float>& mm1ResGm)
+                                                                           const GlobalTensor<MM1_OUT_T>& mm1ResGm)
 {
     blkTableGm_ = blkTableGm;
     keyGm_ = keyGm;
@@ -230,10 +270,11 @@ __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::KeyNd2Nz(uint64_t s2L1Rea
         nd2nzPara.dstNzNStride = 1;
         nd2nzPara.srcNdMatrixStride = 0;
         nd2nzPara.dstNzMatrixStride = 0;
+        // NZ 行块偏移乘子随 dtype: int8 每行块 32 元素(S8), fp16 为 16
         DataCopy(keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET +
                         (s2L1Offset >= S2_BASIC_BLOCK_L0 ?
-                             S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 + (s2L1Offset - S2_BASIC_BLOCK_L0) * BLOCK_CUBE :
-                             s2L1Offset * BLOCK_CUBE)],
+                             S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 + (s2L1Offset - S2_BASIC_BLOCK_L0) * QK_BLOCK_CUBE :
+                             s2L1Offset * QK_BLOCK_CUBE)],
                  keyGm_[keyGmOffset], nd2nzPara);
 
         s2L1Offset += s2Mte2Size;
@@ -274,10 +315,11 @@ __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::KeyNd2NzForPA(uint64_t s2
         nd2nzPara.dstNzNStride = 1;
         nd2nzPara.srcNdMatrixStride = 0;
         nd2nzPara.dstNzMatrixStride = 0;
+        // NZ 行块偏移乘子随 dtype: int8 每行块 32 元素(S8), fp16 为 16
         DataCopy(keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET +
                         (s2L1Offset >= S2_BASIC_BLOCK_L0 ?
-                             S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 + (s2L1Offset - S2_BASIC_BLOCK_L0) * BLOCK_CUBE :
-                             s2L1Offset * BLOCK_CUBE)],
+                             S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 + (s2L1Offset - S2_BASIC_BLOCK_L0) * QK_BLOCK_CUBE :
+                             s2L1Offset * QK_BLOCK_CUBE)],
                  keyGm_[keyGmOffset], nd2nzPara);
 
         s2L1Offset += s2Mte2Size;
@@ -348,7 +390,8 @@ __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::LoadKeyToL0b(uint64_t s2L
     uint64_t keyL1Offset = s2L1Offset >= S2_BASIC_BLOCK_L0 ? S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 : 0;
     LoadData2DParams loadData2DParams;
     loadData2DParams.startIndex = 0;
-    loadData2DParams.repeatTimes = CeilDiv(s2L0RealSize, BLOCK_CUBE) * CeilDiv(constInfo_.headDim, BLOCK_CUBE);
+    // K 向因子按 dtype 块宽: int8 128/32=4(repeatTimes 折半), fp16 128/16=8
+    loadData2DParams.repeatTimes = CeilDiv(s2L0RealSize, BLOCK_CUBE) * CeilDiv(constInfo_.headDim, QK_BLOCK_CUBE);
     loadData2DParams.srcStride = 1;
     loadData2DParams.dstGap = 0;
     loadData2DParams.ifTranspose = false;
@@ -367,8 +410,16 @@ __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::ComuteL0c(uint64_t s1gL0R
     mmadParams.cmatrixInitVal = true;
     mmadParams.cmatrixSource = false;
     mmadParams.unitFlag = 0b11;
-    Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
-         keyL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
+    if constexpr (LIT::isInt8) {
+        // int8×int8 → int32 精确累加(|q̂k̂| ≤ 128·127² < 2^31), cL0_ 按位型重解释
+        Mmad(cL0_.ReinterpretCast<int32_t>()[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET],
+             queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
+             keyL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
+    } else {
+        Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET],
+             queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
+             keyL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
+    }
     if ((mmadParams.m / 16) * (mmadParams.n / 16) < 10) {
         PipeBarrier<PIPE_M>();
     }
@@ -379,26 +430,64 @@ __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::Fixp(uint64_t s1gGmOffset
                                                             uint64_t s1gL0RealSize, uint64_t s2L0RealSize,
                                                             const PkiCommon::RunInfo& runInfo)
 {
-    AscendC::DataCopyCO12DstParams intriParams;
-    intriParams.mSize = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
-    intriParams.nSize = s2L0RealSize;
-    intriParams.dstStride = runInfo.actualSingleProcessSInnerSizeAlign;
-    intriParams.srcStride = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
-    // set mode according to dtype
-    intriParams.quantPre = QuantMode_t::NoQuant;
-    intriParams.nz2ndEn = true;
-    intriParams.unitFlag = 0b11; // 3 unitflag
-    intriParams.reluPre = 1;
-    AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
-    AscendC::DataCopy(mm1ResGm_[(runInfo.loop % 2) * constInfo_.mBaseSizeAlign * constInfo_.s2BaseSize +
-                                s1gGmOffset * intriParams.dstStride + s2GmOffset],
-                      cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], intriParams);
+    if constexpr (LIT::isInt8) {
+        // int8: L0C int32 --DEQF16(×2^-10)+reluPre--> GM fp16
+        // quantPre/reluPre/SetFixpipePreQuantFlag 参数组; nz2nd 直写 GM 沿用
+        // 非量化路径; unitFlag 取 GM nz2nd 输出路径的 0b11(与 quantPre 正交,
+        // 若出现错数优先复核此项)
+        AscendC::DataCopyCO12DstParams intriParams;
+        intriParams.mSize = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
+        intriParams.nSize = s2L0RealSize; // 与非量化同口径, 硬件按 nSize 精确写列
+        intriParams.dstStride = runInfo.actualSingleProcessSInnerSizeAlign;
+        intriParams.srcStride = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
+        intriParams.quantPre = QuantMode_t::DEQF16; // int32 → fp16 反量化
+        intriParams.channelSplit = 0;
+        intriParams.nz2ndEn = true;
+        intriParams.unitFlag = 0b11;
+        intriParams.reluPre = 1; // DEQF16 舍入后 ReLU(= golden clamp 顺序)
+#if PKI_FIXPIPE_CSR_HOIST
+        // 两条常量 CSR 写已外提到 AllocEventID()(见该处注释与开关处的
+        // 唯一写者论证)。指令字段(quantPre/nz2ndEn/reluPre/unitFlag/channelSplit)
+        // 随 intriParams 每次照传。
+#else
+        AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
+        AscendC::SetFixpipePreQuantFlag(0x3a800000); // FP32 位型的 2^-10
+#endif
+        AscendC::DataCopy(mm1ResGm_[(runInfo.loop % 2) * constInfo_.mBaseSizeAlign * constInfo_.s2BaseSize +
+                                    s1gGmOffset * intriParams.dstStride + s2GmOffset],
+                          cL0_.ReinterpretCast<int32_t>()[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], intriParams);
+    } else {
+        AscendC::DataCopyCO12DstParams intriParams;
+        intriParams.mSize = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
+        intriParams.nSize = s2L0RealSize;
+        intriParams.dstStride = runInfo.actualSingleProcessSInnerSizeAlign;
+        intriParams.srcStride = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
+        // set mode according to dtype
+        intriParams.quantPre = QuantMode_t::NoQuant;
+        intriParams.nz2ndEn = true;
+        intriParams.unitFlag = 0b11; // 3 unitflag
+        intriParams.reluPre = 1;
+        AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
+        AscendC::DataCopy(mm1ResGm_[(runInfo.loop % 2) * constInfo_.mBaseSizeAlign * constInfo_.s2BaseSize +
+                                    s1gGmOffset * intriParams.dstStride + s2GmOffset],
+                          cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], intriParams);
+    }
 }
-
 template <typename LIT>
 __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::AllocEventID()
 {
     SetMMLayoutTransform(true);
+#if PKI_FIXPIPE_CSR_HOIST
+    // int8 fixpipe 的两条常量 CSR 写外提到此处, 每 kernel 一次(基线是每次 Fixp
+    // 重写一次)。次序: 必须在 SetMMLayoutTransform(true) 之后(二者为不同 CSR ——
+    // set_ctrl vs set_nd_para/set_quant_pre —— 仍取保守次序)。
+    // 只覆盖 int8: bf16 分支的 SetFixpipeNz2ndFlag 保持原位原样, 且 bf16
+    // 实例化在此不产生任何 quant_pre CSR 写。
+    if constexpr (LIT::isInt8) {
+        AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
+        AscendC::SetFixpipePreQuantFlag(0x3a800000); // FP32 位型的 2^-10
+    }
+#endif
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 0);
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 2);

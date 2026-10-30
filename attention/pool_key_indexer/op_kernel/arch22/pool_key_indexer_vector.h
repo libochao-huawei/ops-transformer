@@ -65,6 +65,24 @@ __aicore__ inline void CopyIn(LocalTensor<float>& mmOutUb, LocalTensor<T>& weigh
     AscendC::DataCopyPad(weightsUb, weightScaleGm[weights_gmoffset], dataCopyweightParams, padTParams);
 }
 
+/**
+  仅搬 mm1 结果的 CopyIn 变体: weights 已由调用方整块预取(见 service_vector 的
+  weightsRowBuf_), 搬运参数与 CopyIn 的 mm1 部分一致。
+ */
+__aicore__ inline void CopyInMm1(LocalTensor<float>& mmOutUb, GlobalTensor<float>& mMoutGm, int64_t MMout_gmoffset,
+                                 int64_t groupInner, int64_t s2Inner, int64_t mmUbStride)
+{
+    // 将MMout_gmoffset copy到UB上
+    AscendC::DataCopyPadExtParams<float> padParams{false, 0, 0, 0};
+    AscendC::DataCopyExtParams dataCopymMoutParams;
+    dataCopymMoutParams.blockCount = groupInner;
+    dataCopymMoutParams.blockLen = s2Inner * sizeof(float);
+    dataCopymMoutParams.srcStride = 0;
+    dataCopymMoutParams.dstStride = mmUbStride;
+    dataCopymMoutParams.rsv = 0;
+    AscendC::DataCopyPad(mmOutUb, mMoutGm[MMout_gmoffset], dataCopymMoutParams, padParams);
+}
+
 template <typename T>
 __aicore__ inline void CopyOut(const GlobalTensor<T>& dstGm, const LocalTensor<T>& srcUb, int64_t copyCount)
 {
@@ -74,6 +92,111 @@ __aicore__ inline void CopyOut(const GlobalTensor<T>& dstGm, const LocalTensor<T
     dataCopyOutyParams.srcStride = 0;
     dataCopyOutyParams.dstStride = 0;
     AscendC::DataCopyPad(dstGm, srcUb, dataCopyOutyParams);
+}
+
+// int8 路径搬入: score 为 fixpipe DEQF16 写出的 fp16, weights/q_descale 为 FP16。
+// score 直搬 float 计算区的 half 视图"行后半"(行距 2*ubRowHalf half): half 源起点比
+// float 目的起点高 ubRowHalf*sizeof(half) 字节, 后续原地扩展 Cast 逐元素写恒落后于读,
+// 无需独立 half 暂存区(UB 预算零追加); weights 与 q_descale 同 pattern 同偏移(去 D 轴逐维相等)。
+// s2Inner 为 GM 行距(actualSingleProcessSInnerSizeAlign), ubRowHalf 为 UB 行宽(s2BaseSize)。
+template <typename T>
+__aicore__ inline void CopyInInt8(LocalTensor<float>& mmOutUb, LocalTensor<T>& weightsUb, LocalTensor<T>& qScaleUb,
+                                  GlobalTensor<half>& mMoutGm, GlobalTensor<T>& weightScaleGm,
+                                  GlobalTensor<T>& qScaleGm, int64_t MMout_gmoffset, int64_t weights_gmoffset,
+                                  int64_t groupInner, int64_t s2Inner, int64_t ubRowHalf, int64_t mmUbStride)
+{
+    // score(fp16) 搬入 float 计算区行后半: 目的行距 = 2*ubRowHalf*2B, blockLen = s2Inner*2B
+    // dstStride 单位 32B
+    AscendC::DataCopyPadExtParams<half> padParams{false, 0, 0, 0};
+    AscendC::DataCopyExtParams dataCopymMoutParams;
+    dataCopymMoutParams.blockCount = groupInner;
+    dataCopymMoutParams.blockLen = s2Inner * sizeof(half);
+    dataCopymMoutParams.srcStride = 0;
+    dataCopymMoutParams.dstStride = mmUbStride;
+    dataCopymMoutParams.rsv = 0;
+    LocalTensor<half> mmOutHalfUb = mmOutUb.template ReinterpretCast<half>()[ubRowHalf];
+    AscendC::DataCopyPad(mmOutHalfUb, mMoutGm[MMout_gmoffset], dataCopymMoutParams, padParams);
+
+    // weights 与 q_descale 同偏移各搬一行(半精度, 落在段尾 float 区头部 half 视图)
+    AscendC::DataCopyPadExtParams<T> padTParams{false, 0, 0, 0};
+    AscendC::DataCopyExtParams dataCopyweightParams;
+    dataCopyweightParams.blockCount = 1;
+    dataCopyweightParams.blockLen = groupInner * sizeof(T);
+    dataCopyweightParams.srcStride = 0;
+    dataCopyweightParams.dstStride = 0;
+    dataCopyweightParams.rsv = 0;
+    AscendC::DataCopyPad(weightsUb, weightScaleGm[weights_gmoffset], dataCopyweightParams, padTParams);
+    AscendC::DataCopyPad(qScaleUb, qScaleGm[weights_gmoffset], dataCopyweightParams, padTParams);
+}
+
+/**
+  int8 路径**仅搬 score** 的 CopyInInt8 变体(预取路径): weights/q_descale 已由
+  调用方在 base block 之前一次整块预取(见 service_vector 的 weightsRowBuf_/
+  qScaleRowBuf_), 行内不再逐 outerG 下发两条 32B 微拷贝。score 段的搬运参数与
+  CopyInInt8 的前半段**完全一致**(同 blockCount/blockLen/srcStride/dstStride/落点),
+  故搬入 UB 的位型不变。
+ */
+__aicore__ inline void CopyInScoreInt8(LocalTensor<float>& mmOutUb, GlobalTensor<half>& mMoutGm, int64_t MMout_gmoffset,
+                                       int64_t groupInner, int64_t s2Inner, int64_t ubRowHalf, int64_t mmUbStride)
+{
+    // score(fp16) 搬入 float 计算区行后半: 目的行距 = 2*ubRowHalf*2B, blockLen = s2Inner*2B
+    // dstStride 单位 32B
+    AscendC::DataCopyPadExtParams<half> padParams{false, 0, 0, 0};
+    AscendC::DataCopyExtParams dataCopymMoutParams;
+    dataCopymMoutParams.blockCount = groupInner;
+    dataCopymMoutParams.blockLen = s2Inner * sizeof(half);
+    dataCopymMoutParams.srcStride = 0;
+    dataCopymMoutParams.dstStride = mmUbStride;
+    dataCopymMoutParams.rsv = 0;
+    LocalTensor<half> mmOutHalfUb = mmOutUb.ReinterpretCast<half>()[ubRowHalf];
+    AscendC::DataCopyPad(mmOutHalfUb, mMoutGm[MMout_gmoffset], dataCopymMoutParams, padParams);
+}
+
+// int8 路径加权: wq = w ⊗ dq 在 FP16 域预乘(half 硬件乘=正确舍入, 与 golden
+// 逐位一致), 再 Cast fp32 广播加权; 与非量化 DoScale 的差异仅此预乘, 其余同构。
+// score 的 half→float 原地扩展 Cast 由调用方先行完成(逐行, 行内源/目的无重叠风险)。
+// wqTUb = wq 预乘的**落盘区**, weightsTUb = weights 源:
+//   - 块级预取路径: 两者不同 buffer(wqTUb=wqRowBuf_), 预取区全程只读
+//     ⇒ 同一 base block 内后续行/后续 outerG 读到的 weights 恒为 GM 原值;
+//   - 回退路径: 调用方传同一 tensor ⇒ Mul 退化为原地写, 逐字节一致。
+// 两个操作数的取值与 count 均不因落盘区改变 ⇒ wq 位型不变。
+template <typename T>
+__aicore__ inline void DoScaleInt8(const LocalTensor<float>& reduceCacheBuf, LocalTensor<float>& mmOutUb,
+                                   LocalTensor<float>& weightsUb, LocalTensor<T>& wqTUb, LocalTensor<T>& weightsTUb,
+                                   const LocalTensor<T>& qScaleTUb, LocalTensor<float>& tmpBuff, int64_t groupInner,
+                                   int64_t s2Inner, int32_t outerGidx)
+{
+    // wq 预乘: half 域乘(同宽无重叠), 结果写 wqTUb(落盘区)
+    AscendC::Mul(wqTUb, weightsTUb, qScaleTUb, groupInner);
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // wq cast fp32: 原地扩展(half 源在 float 目的之后, 逐元素写落后于读, 与 DoScale 同模式)
+    AscendC::Cast(weightsUb, wqTUb, RoundMode::CAST_NONE, groupInner);
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // weight broadcast: [groupInner, 1] -> [groupInner, 8]
+    AscendC::Brcb(tmpBuff, weightsUb, PkiCommon::CeilDiv(groupInner, static_cast<int64_t>(B32_BLOCK_ALIGN_NUM)),
+                  {1, B32_VEC_REPEAT_STRIDE});
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // do scale: [groupInner, 8] * [groupInner, s2Inner]
+    uint64_t countPerRepeat = VEC_REPEAT_BYTES / sizeof(float);
+    uint64_t repeatTimes = s2Inner / countPerRepeat;
+    for (int32_t i = 0; i < groupInner; i++) {
+        if (outerGidx == 0) {
+            AscendC::Mul(reduceCacheBuf[i * s2Inner], mmOutUb[i * s2Inner], tmpBuff[i * B32_BLOCK_ALIGN_NUM],
+                         countPerRepeat, repeatTimes, {1, 1, 0, B32_VEC_REPEAT_STRIDE, B32_VEC_REPEAT_STRIDE, 0});
+        } else {
+            AscendC::Mul(mmOutUb[i * s2Inner], mmOutUb[i * s2Inner], tmpBuff[i * B32_BLOCK_ALIGN_NUM], countPerRepeat,
+                         repeatTimes, {1, 1, 0, B32_VEC_REPEAT_STRIDE, B32_VEC_REPEAT_STRIDE, 0});
+        }
+    }
+
+    if (outerGidx != 0) {
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(reduceCacheBuf, mmOutUb, reduceCacheBuf, groupInner * s2Inner);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
 }
 
 template <typename T>
@@ -312,6 +435,34 @@ __aicore__ inline void MergeSort(const LocalTensor<float>& mrgDst, int32_t mrgDs
         AscendC::DataCopy(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
         AscendC::PipeBarrier<PIPE_V>();
     }
+}
+
+/**
+  MergeSort 的无回拷乒乓版: 归并(src1=accCur 累加器, src2=mrgSrc 新块, 顺序与
+  回拷版一致保证稳定保序)全量输出(mrgDstNum+mrgSrcNum 对)写 accNxt, 由调用方
+  翻转 parity 跟踪累加器位置, 省去 DataCopy 回拷与其后的 PipeBarrier。
+  约束: accNxt 容量 >= (mrgDstNum+mrgSrcNum)*2 float(累加器行 spill 区或 sortPPBuf_);
+  accCur/accNxt/mrgSrc 两两地址不重叠(MrgSort 不支持 src/dst 重叠); mrgDstNum<=3072
+  (与回拷版小分量分支同口径, 调用侧已限定非 over2K, virTopK<=2048)。
+  MrgSort 流式输出的前 mrgDstNum 对与回拷版截断后的内容逐位一致。
+ */
+__aicore__ inline void MergeSortPP(const LocalTensor<float>& accCur, LocalTensor<float>& accNxt, int32_t mrgDstNum,
+                                   LocalTensor<float>& mrgSrc, int32_t mrgSrcNum)
+{
+    AscendC::MrgSort4Info params;
+    // src 顺序: 累加器(accCur)必须在 src1, 新块(mrgSrc)在 src2, 否则输出不完整污染累加器
+    params.elementLengths[MRG_QUE_0] = mrgDstNum;
+    params.elementLengths[MRG_QUE_1] = mrgSrcNum;
+    params.ifExhaustedSuspension = false;
+    params.validBit = 0b0011;
+    params.repeatTimes = 1;
+
+    AscendC::MrgSortSrcList<float> srcList;
+    srcList.src1 = accCur;
+    srcList.src2 = mrgSrc;
+
+    AscendC::MrgSort<float>(accNxt, srcList, params);
+    AscendC::PipeBarrier<PIPE_V>();
 }
 
 /**

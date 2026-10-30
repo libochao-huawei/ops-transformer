@@ -32,6 +32,15 @@ struct UIntSortTraits<float> {
     static constexpr UInt ALL_ONE = 0xFFFFFFFF;
 };
 
+template <>
+struct UIntSortTraits<bfloat16_t> {
+    using UInt = uint16_t;
+    static constexpr UInt ZERO = 0x0000;
+    static constexpr UInt SIGN_MASK = 0x8000;
+    static constexpr UInt NAN_MASK = 0xFFC0;
+    static constexpr UInt ALL_ONE = 0xFFFF;
+};
+
 template <typename FloatT>
 struct UIntSortConstCtx {
     using Traits = UIntSortTraits<FloatT>;
@@ -195,18 +204,63 @@ __aicore__ inline void UIntToFloatReturnValue(const LocalTensor<float>& out_, co
     }
 }
 
+// uint16(bf16 sortable key) -> fp32 values: 反变换到 bf16 值域后经 values 缓冲
+// 原地 bf16 视图中转, 半宽对两段做 bf16->fp32 展宽落回输出(同域复用, float store
+// 完全覆盖 scratch 字节范围, 原位安全)
+__aicore__ inline void UIntToFloatReturnValue(const LocalTensor<float>& out_, const LocalTensor<uint16_t>& in,
+                                              const uint32_t topK)
+{
+    auto outBuf = (__local_mem__ float*)out_.GetPhyAddr();
+    auto inBuf = (__local_mem__ uint16_t*)in.GetPhyAddr();
+    auto bfView = (__local_mem__ bfloat16_t*)out_.GetPhyAddr();
+
+    const uint16_t repeatSize = 128;
+    uint16_t topkLoopNum = (topK + repeatSize - 1) / repeatSize;
+
+    __VEC_SCOPE__
+    {
+        AscendC::Reg::RegTensor<uint16_t> regIn;
+        AscendC::Reg::RegTensor<bfloat16_t> regBf;
+        AscendC::Reg::RegTensor<bfloat16_t> regLo;
+        AscendC::Reg::RegTensor<bfloat16_t> regHi;
+        AscendC::Reg::RegTensor<float> regF[2];
+        AscendC::Reg::MaskReg maskAllB16 = AscendC::Reg::CreateMask<bfloat16_t, AscendC::Reg::MaskPattern::ALL>();
+        AscendC::Reg::MaskReg maskHalfB16 = AscendC::Reg::CreateMask<bfloat16_t, AscendC::Reg::MaskPattern::H>();
+        AscendC::Reg::MaskReg maskAllF = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::ALL>();
+        constexpr static Reg::CastTrait castTraitBf16ToFP32 = {Reg::RegLayout::ZERO, Reg::SatMode::UNKNOWN,
+                                                               Reg::MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
+        UIntSortConstCtx<bfloat16_t> bf16KeyCtx;
+        InitUIntSortConstCtx(bf16KeyCtx, maskAllB16);
+        for (uint16_t i = 0; i < topkLoopNum; ++i) {
+            AscendC::Reg::LoadAlign<uint16_t>(regIn, inBuf + i * repeatSize);
+            UIntToSortableKey<bfloat16_t>(regBf, regIn, bf16KeyCtx, maskAllB16);
+            AscendC::Reg::StoreAlign<bfloat16_t, AscendC::Reg::StoreDist::DIST_NORM>(bfView + i * repeatSize, regBf,
+                                                                                     maskAllB16);
+            AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
+            AscendC::Reg::LoadAlign<bfloat16_t>(regLo, bfView + i * repeatSize);
+            AscendC::Reg::LoadAlign<bfloat16_t>(regHi, bfView + i * repeatSize + 64);
+            AscendC::Reg::Cast<float, bfloat16_t, castTraitBf16ToFP32>(regF[0], regLo, maskHalfB16);
+            AscendC::Reg::Cast<float, bfloat16_t, castTraitBf16ToFP32>(regF[1], regHi, maskHalfB16);
+            AscendC::Reg::StoreAlign<float, AscendC::Reg::StoreDist::DIST_NORM>(outBuf + i * repeatSize, regF[0],
+                                                                                maskAllF);
+            AscendC::Reg::StoreAlign<float, AscendC::Reg::StoreDist::DIST_NORM>(outBuf + i * repeatSize + 64, regF[1],
+                                                                                maskAllF);
+        }
+    }
+}
+
 __simd_callee__ inline void BroadcastLane(AscendC::Reg::RegTensor<float>& dst, __local_mem__ float* src,
                                           uint16_t laneIdx)
 {
     AscendC::Reg::LoadAlign<float, AscendC::Reg::LoadDist::DIST_BRC_B32>(dst, src + laneIdx);
 }
 
-template <typename W_T>
-__aicore__ inline void MulWeightAndReduceSum(const LocalTensor<uint32_t>& out, // out    [S2Base]     [128   ] 2
-                                             const LocalTensor<float>& qk,     // q*k^t  [G, S2Base]  [64 128] 2
-                                             const LocalTensor<W_T>& weight,   // w      [G]          [64    ] 1
-                                             const int gSize,                  // G 64
-                                             const float scale)                // 1/sqrt(headDim)
+template <typename KEY_T, typename W_T>
+__aicore__ inline void MulWeightAndReduceSum(const LocalTensor<KEY_T>& out,  // out    [S2Base]     [128   ] 2
+                                             const LocalTensor<float>& qk,   // q*k^t  [G, S2Base]  [64 128] 2
+                                             const LocalTensor<W_T>& weight, // w      [G]          [64    ] 1
+                                             const int gSize,                // G 64
+                                             const float scale)              // 1/sqrt(headDim)
 {
     __local_mem__ W_T* weight_ = (__local_mem__ W_T*)weight.GetPhyAddr();
 
@@ -214,7 +268,7 @@ __aicore__ inline void MulWeightAndReduceSum(const LocalTensor<uint32_t>& out, /
 
     auto qk0 = (__local_mem__ float*)qk.GetPhyAddr();
     auto qk1 = qk0 + VL;
-    auto out0 = (__local_mem__ uint32_t*)out.GetPhyAddr();
+    auto out0 = (__local_mem__ KEY_T*)out.GetPhyAddr();
     auto out1 = out0 + VL;
 
     __VEC_SCOPE__
@@ -262,18 +316,39 @@ __aicore__ inline void MulWeightAndReduceSum(const LocalTensor<uint32_t>& out, /
         AscendC::Reg::Mul(regSum[0], regSum[0], regScale, maskAll);
         AscendC::Reg::Mul(regSum[1], regSum[1], regScale, maskAll);
 
-        AscendC::Reg::RegTensor<uint32_t> regOut[2];
-        FloatX2ToSortableKey<float>(regOut[0], regOut[1], regSum[0], regSum[1], fp32Ctx, maskAll);
+        if constexpr (sizeof(KEY_T) == 4) {
+            AscendC::Reg::RegTensor<uint32_t> regOut[2];
+            FloatX2ToSortableKey<float>(regOut[0], regOut[1], regSum[0], regSum[1], fp32Ctx, maskAll);
 
-        AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out0, regOut[0], maskAll);
-        AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out1, regOut[1], maskAll);
+            AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out0, regOut[0], maskAll);
+            AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out1, regOut[1], maskAll);
+        } else {
+            // uint16 键: DeInterleave 预排 + 奇/偶 lane 压缩 cast -> bf16(RNE) 全宽可排序键
+            // (quant_lightning_indexer_v2 同款配方: ODD 先写 ZEROING, EVEN 后写 MERGING 保留奇槽)
+            (void)out1;
+            constexpr static Reg::CastTrait traitF32ToBf16Even = {Reg::RegLayout::ZERO, Reg::SatMode::NO_SAT,
+                                                                  Reg::MaskMergeMode::MERGING, RoundMode::CAST_ROUND};
+            constexpr static Reg::CastTrait traitF32ToBf16Odd = {Reg::RegLayout::ONE, Reg::SatMode::NO_SAT,
+                                                                 Reg::MaskMergeMode::ZEROING, RoundMode::CAST_ROUND};
+            AscendC::Reg::MaskReg maskAllB16 = AscendC::Reg::CreateMask<bfloat16_t, AscendC::Reg::MaskPattern::ALL>();
+            AscendC::Reg::DeInterleave(regSum[0], regSum[1], regSum[0], regSum[1]);
+            AscendC::Reg::RegTensor<bfloat16_t> regBf;
+            AscendC::Reg::Cast<bfloat16_t, float, traitF32ToBf16Odd>(regBf, regSum[1], maskAll);
+            AscendC::Reg::Cast<bfloat16_t, float, traitF32ToBf16Even>(regBf, regSum[0], maskAll);
+            FloatSortConstCtx<bfloat16_t> bf16Ctx;
+            InitFloatSortConstCtx(bf16Ctx, maskAllB16);
+            AscendC::Reg::RegTensor<uint16_t> regKey;
+            FloatToSortableKey<bfloat16_t>(regKey, regBf, bf16Ctx, maskAllB16);
+            AscendC::Reg::StoreAlign<uint16_t, AscendC::Reg::StoreDist::DIST_NORM>(out0, regKey, maskAllB16);
+        }
     }
 }
 
 // mode=0 (FP8 per-token-head) scale 融合版: scale 为正标量, 可从 D 维点积中
 // 完全提出, out = (Σ_g relu(Σ_d q·k)·w_g·dq)·dk; weight 为已预乘 qScale 的 fp32 UB
+template <typename KEY_T>
 __aicore__ inline void MulWeightAndReduceSumWithScale(
-    const LocalTensor<uint32_t>& out, // out    [S2Base]     [128   ] 2
+    const LocalTensor<KEY_T>& out,    // out    [S2Base]     [128   ] 2
     const LocalTensor<float>& qk,     // q*k^t  [G, S2Base]  [64 128] 2
     const LocalTensor<float>& weight, // w*dq   [G]          [64    ] 1
     const LocalTensor<float>& kScale, // kScale [S2Base]     [128   ] 2
@@ -287,7 +362,7 @@ __aicore__ inline void MulWeightAndReduceSumWithScale(
 
     auto qk0 = (__local_mem__ float*)qk.GetPhyAddr();
     auto qk1 = qk0 + VL;
-    auto out0 = (__local_mem__ uint32_t*)out.GetPhyAddr();
+    auto out0 = (__local_mem__ KEY_T*)out.GetPhyAddr();
     auto out1 = out0 + VL;
     auto kScale0 = kScale_;
     auto kScale1 = kScale_ + VL;
@@ -335,11 +410,31 @@ __aicore__ inline void MulWeightAndReduceSumWithScale(
         AscendC::Reg::Mul(regSum[0], regSum[0], regScale, maskAll);
         AscendC::Reg::Mul(regSum[1], regSum[1], regScale, maskAll);
 
-        AscendC::Reg::RegTensor<uint32_t> regOut[2];
-        FloatX2ToSortableKey<float>(regOut[0], regOut[1], regSum[0], regSum[1], fp32Ctx, maskAll);
+        if constexpr (sizeof(KEY_T) == 4) {
+            AscendC::Reg::RegTensor<uint32_t> regOut[2];
+            FloatX2ToSortableKey<float>(regOut[0], regOut[1], regSum[0], regSum[1], fp32Ctx, maskAll);
 
-        AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out0, regOut[0], maskAll);
-        AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out1, regOut[1], maskAll);
+            AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out0, regOut[0], maskAll);
+            AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out1, regOut[1], maskAll);
+        } else {
+            // uint16 键: DeInterleave 预排 + 奇/偶 lane 压缩 cast -> bf16(RNE) 全宽可排序键
+            // (quant_lightning_indexer_v2 同款配方: ODD 先写 ZEROING, EVEN 后写 MERGING 保留奇槽)
+            (void)out1;
+            constexpr static Reg::CastTrait traitF32ToBf16Even = {Reg::RegLayout::ZERO, Reg::SatMode::NO_SAT,
+                                                                  Reg::MaskMergeMode::MERGING, RoundMode::CAST_ROUND};
+            constexpr static Reg::CastTrait traitF32ToBf16Odd = {Reg::RegLayout::ONE, Reg::SatMode::NO_SAT,
+                                                                 Reg::MaskMergeMode::ZEROING, RoundMode::CAST_ROUND};
+            AscendC::Reg::MaskReg maskAllB16 = AscendC::Reg::CreateMask<bfloat16_t, AscendC::Reg::MaskPattern::ALL>();
+            AscendC::Reg::DeInterleave(regSum[0], regSum[1], regSum[0], regSum[1]);
+            AscendC::Reg::RegTensor<bfloat16_t> regBf;
+            AscendC::Reg::Cast<bfloat16_t, float, traitF32ToBf16Odd>(regBf, regSum[1], maskAll);
+            AscendC::Reg::Cast<bfloat16_t, float, traitF32ToBf16Even>(regBf, regSum[0], maskAll);
+            FloatSortConstCtx<bfloat16_t> bf16Ctx;
+            InitFloatSortConstCtx(bf16Ctx, maskAllB16);
+            AscendC::Reg::RegTensor<uint16_t> regKey;
+            FloatToSortableKey<bfloat16_t>(regKey, regBf, bf16Ctx, maskAllB16);
+            AscendC::Reg::StoreAlign<uint16_t, AscendC::Reg::StoreDist::DIST_NORM>(out0, regKey, maskAllB16);
+        }
     }
 }
 // mode=0: weight×qScale SIMD 预乘(单 s1 行, 64 lanes): 半精度 weight -> fp32
@@ -362,6 +457,168 @@ __simd_vf__ void MulWeightQScaleSIMD(__local_mem__ W_T* weight_, __local_mem__ f
     Reg::LoadAlign<float>(regQScale, qScale_);
     Reg::Mul(regW, regW, regQScale, maskAllB32);
     Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM>(dst_, regW, maskAllB32);
+}
+
+// int8: fp32 -> ×2^-10 -> fp16 round-trip -> fp32(自 v1 quant_lightning_indexer_vector1.h
+// L36-55 移植); ×2^-10 为纯指数运算无舍入, fp16 cast(CAST_RINT=RNE)单次舍入,
+// 与 arch22 fixpipe DEQF16(0x3a800000)/golden fp16_cast(qk/1024) 逐位一致
+__simd_callee__ inline void CastFP32ToFP16ToFP32(AscendC::Reg::RegTensor<float> (&regQK)[2],
+                                                 AscendC::Reg::RegTensor<half> (&regQKHalf)[2],
+                                                 AscendC::Reg::MaskReg& maskAllB32)
+{
+    AscendC::Reg::MaskReg maskAllB16 = AscendC::Reg::CreateMask<half, AscendC::Reg::MaskPattern::ALL>();
+    constexpr static Reg::CastTrait castTraitFP32ToFP16 = {Reg::RegLayout::ZERO, Reg::SatMode::NO_SAT,
+                                                           Reg::MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+    constexpr static Reg::CastTrait castTraitFP16ToFP32 = {Reg::RegLayout::ZERO, Reg::SatMode::UNKNOWN,
+                                                           Reg::MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
+    float mulsScalar = 1.0 / 1024;
+
+    Reg::Muls(regQK[0], regQK[0], mulsScalar, maskAllB32);
+    Reg::Muls(regQK[1], regQK[1], mulsScalar, maskAllB32);
+
+    Reg::Cast<half, float, castTraitFP32ToFP16>(regQKHalf[0], regQK[0], maskAllB32);
+    Reg::Cast<half, float, castTraitFP32ToFP16>(regQKHalf[1], regQK[1], maskAllB32);
+
+    Reg::Cast<float, half, castTraitFP16ToFP32>(regQK[0], regQKHalf[0], maskAllB16);
+    Reg::Cast<float, half, castTraitFP16ToFP32>(regQK[1], regQKHalf[1], maskAllB16);
+}
+
+// int8: weight(half)×q_descale(half) SIMD 预乘(单 s1 行, 64 lanes): 双 half ->
+// fp32 cast -> fp32 Mul -> fp16 round-trip -> 落 fp32 UB。half×half 积的尾数
+// ≤22bit, fp32 域乘积精确, 单次 RNE 舍入到 fp16 = half 硬件乘的正确舍入, 与
+// arch22 half Mul / golden fp16 预乘逐位一致; [gSize,64) 为越界读垃圾,
+// 消费端 BRC 只取 i<gSize(同 mode0 的做法)
+__simd_vf__ void MulWeightQScaleSIMDHalf(__local_mem__ half* weight_, __local_mem__ half* qScale_,
+                                         __local_mem__ float* dst_)
+{
+    Reg::MaskReg maskAllB32 = Reg::CreateMask<float, Reg::MaskPattern::ALL>();
+    Reg::MaskReg maskAllB16 = Reg::CreateMask<half, Reg::MaskPattern::ALL>();
+
+    Reg::RegTensor<half> regWHalf;
+    Reg::RegTensor<half> regQSHalf;
+    Reg::RegTensor<float> regW;
+    Reg::RegTensor<float> regQS;
+    Reg::RegTensor<half> regWTmpHalf;
+
+    constexpr static Reg::CastTrait castTraitHToFP32 = {Reg::RegLayout::ZERO, Reg::SatMode::UNKNOWN,
+                                                        Reg::MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
+    constexpr static Reg::CastTrait castTraitFP32ToH = {Reg::RegLayout::ZERO, Reg::SatMode::NO_SAT,
+                                                        Reg::MaskMergeMode::ZEROING, RoundMode::CAST_RINT};
+    Reg::LoadAlign<half, Reg::LoadDist::DIST_UNPACK_B16>(regWHalf, weight_);
+    Reg::LoadAlign<half, Reg::LoadDist::DIST_UNPACK_B16>(regQSHalf, qScale_);
+    Reg::Cast<float, half, castTraitHToFP32>(regW, regWHalf, maskAllB16);
+    Reg::Cast<float, half, castTraitHToFP32>(regQS, regQSHalf, maskAllB16);
+    Reg::Mul(regW, regW, regQS, maskAllB32);
+    Reg::Cast<half, float, castTraitFP32ToH>(regWTmpHalf, regW, maskAllB32);
+    Reg::Cast<float, half, castTraitHToFP32>(regW, regWTmpHalf, maskAllB16);
+    Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM>(dst_, regW, maskAllB32);
+}
+
+// int8 聚合版: qk 为 fixpipe 直达 UB 的 int32 精确点积, int32 -> fp32 Cast ->
+// CastFP32ToFP16ToFP32(×2^-10+round-trip) -> Relu(与 arch22 DEQF16 舍入后
+// reluPre 的硬件序一致) -> wq 加权累加 -> dk 后乘 -> qkScale'(=1024/sqrt(d), D4
+// 补偿折入 host) -> uint32 sortable key
+template <typename KEY_T>
+__aicore__ inline void MulWeightAndReduceSumWithScaleInt8(
+    const LocalTensor<KEY_T>& out,    // out    [S2Base]     [128   ]
+    const LocalTensor<int32_t>& qk,   // q*k^t  [G, S2Base]  [64 128] int32
+    const LocalTensor<float>& weight, // w*dq   [G]          [64    ] fp32 预乘
+    const LocalTensor<half>& kScale,  // kScale [S2Base]     [128   ] half
+    const int gSize,                  // G 64
+    const float scale)                // 1024/sqrt(headDim)
+{
+    __local_mem__ float* weight_ = (__local_mem__ float*)weight.GetPhyAddr();
+    __local_mem__ half* kScale_ = (__local_mem__ half*)kScale.GetPhyAddr();
+
+    constexpr uint32_t VL = 64; // vector length
+
+    auto qk0 = (__local_mem__ int32_t*)qk.GetPhyAddr();
+    auto qk1 = qk0 + VL;
+    auto out0 = (__local_mem__ KEY_T*)out.GetPhyAddr();
+    auto out1 = out0 + VL;
+    auto kScale0 = kScale_;
+    auto kScale1 = kScale_ + VL;
+
+    __VEC_SCOPE__
+    {
+        AscendC::Reg::RegTensor<float> regQK[2];
+        AscendC::Reg::RegTensor<half> regQKHalf[2];
+        AscendC::Reg::RegTensor<int32_t> regQKInt[2];
+        AscendC::Reg::RegTensor<float> regwBrc;
+        AscendC::Reg::RegTensor<half> regKScaleHalf[2];
+        AscendC::Reg::RegTensor<float> regKScale[2];
+        AscendC::Reg::RegTensor<float> regSum[2];
+        AscendC::Reg::RegTensor<float> regScale;
+
+        AscendC::Reg::MaskReg maskAll = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::ALL>();
+        AscendC::Reg::MaskReg maskAllB16 = AscendC::Reg::CreateMask<half, AscendC::Reg::MaskPattern::ALL>();
+
+        FloatSortConstCtx<float> fp32Ctx;
+        InitFloatSortConstCtx(fp32Ctx, maskAll);
+
+        constexpr static Reg::CastTrait castTraitInt32ToFP32 = {Reg::RegLayout::UNKNOWN, Reg::SatMode::NO_SAT,
+                                                                Reg::MaskMergeMode::ZEROING, RoundMode::CAST_ROUND};
+        constexpr static Reg::CastTrait castTraitFP16ToFP32 = {Reg::RegLayout::ZERO, Reg::SatMode::UNKNOWN,
+                                                               Reg::MaskMergeMode::ZEROING, RoundMode::UNKNOWN};
+
+        AscendC::Reg::Duplicate(regSum[0], 0.0f, maskAll);
+        AscendC::Reg::Duplicate(regSum[1], 0.0f, maskAll);
+
+        // k_descale(half) -> fp32(v2 LoadKScaleFP16 同款)
+        AscendC::Reg::LoadAlign<half, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(regKScaleHalf[0], kScale0);
+        AscendC::Reg::LoadAlign<half, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(regKScaleHalf[1], kScale1);
+        AscendC::Reg::Cast<float, half, castTraitFP16ToFP32>(regKScale[0], regKScaleHalf[0], maskAllB16);
+        AscendC::Reg::Cast<float, half, castTraitFP16ToFP32>(regKScale[1], regKScaleHalf[1], maskAllB16);
+
+        for (uint16_t i = (uint16_t)(0); i < (uint16_t)(gSize); ++i) {
+            AscendC::Reg::LoadAlign<int32_t>(regQKInt[0], qk0 + 128 * i);
+            AscendC::Reg::LoadAlign<int32_t>(regQKInt[1], qk1 + 128 * i);
+            AscendC::Reg::Cast<float, int32_t, castTraitInt32ToFP32>(regQK[0], regQKInt[0], maskAll);
+            AscendC::Reg::Cast<float, int32_t, castTraitInt32ToFP32>(regQK[1], regQKInt[1], maskAll);
+
+            CastFP32ToFP16ToFP32(regQK, regQKHalf, maskAll);
+            AscendC::Reg::Relu(regQK[0], regQK[0], maskAll);
+            AscendC::Reg::Relu(regQK[1], regQK[1], maskAll);
+
+            AscendC::Reg::LoadAlign<float, AscendC::Reg::LoadDist::DIST_BRC_B32>(regwBrc, weight_ + i);
+            AscendC::Reg::MulAddDst(regSum[0], regQK[0], regwBrc, maskAll);
+            AscendC::Reg::MulAddDst(regSum[1], regQK[1], regwBrc, maskAll);
+        }
+
+        // kScale(dk) 乘入聚合和(逐 s2 元素), 随后统一乘 qkScale'(1024/sqrt(d))
+        AscendC::Reg::Mul(regSum[0], regSum[0], regKScale[0], maskAll);
+        AscendC::Reg::Mul(regSum[1], regSum[1], regKScale[1], maskAll);
+
+        AscendC::Reg::Duplicate(regScale, scale, maskAll);
+        AscendC::Reg::Mul(regSum[0], regSum[0], regScale, maskAll);
+        AscendC::Reg::Mul(regSum[1], regSum[1], regScale, maskAll);
+
+        if constexpr (sizeof(KEY_T) == 4) {
+            AscendC::Reg::RegTensor<uint32_t> regOut[2];
+            FloatX2ToSortableKey<float>(regOut[0], regOut[1], regSum[0], regSum[1], fp32Ctx, maskAll);
+
+            AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out0, regOut[0], maskAll);
+            AscendC::Reg::StoreAlign<uint32_t, AscendC::Reg::StoreDist::DIST_NORM>(out1, regOut[1], maskAll);
+        } else {
+            // uint16 键: DeInterleave 预排 + 奇/偶 lane 压缩 cast -> bf16(RNE) 全宽可排序键
+            // (quant_lightning_indexer_v2 同款配方: ODD 先写 ZEROING, EVEN 后写 MERGING 保留奇槽)
+            (void)out1;
+            constexpr static Reg::CastTrait traitF32ToBf16Even = {Reg::RegLayout::ZERO, Reg::SatMode::NO_SAT,
+                                                                  Reg::MaskMergeMode::MERGING, RoundMode::CAST_ROUND};
+            constexpr static Reg::CastTrait traitF32ToBf16Odd = {Reg::RegLayout::ONE, Reg::SatMode::NO_SAT,
+                                                                 Reg::MaskMergeMode::ZEROING, RoundMode::CAST_ROUND};
+            AscendC::Reg::MaskReg maskAllB16 = AscendC::Reg::CreateMask<bfloat16_t, AscendC::Reg::MaskPattern::ALL>();
+            AscendC::Reg::DeInterleave(regSum[0], regSum[1], regSum[0], regSum[1]);
+            AscendC::Reg::RegTensor<bfloat16_t> regBf;
+            AscendC::Reg::Cast<bfloat16_t, float, traitF32ToBf16Odd>(regBf, regSum[1], maskAll);
+            AscendC::Reg::Cast<bfloat16_t, float, traitF32ToBf16Even>(regBf, regSum[0], maskAll);
+            FloatSortConstCtx<bfloat16_t> bf16Ctx;
+            InitFloatSortConstCtx(bf16Ctx, maskAllB16);
+            AscendC::Reg::RegTensor<uint16_t> regKey;
+            FloatToSortableKey<bfloat16_t>(regKey, regBf, bf16Ctx, maskAllB16);
+            AscendC::Reg::StoreAlign<uint16_t, AscendC::Reg::StoreDist::DIST_NORM>(out0, regKey, maskAllB16);
+        }
+    }
 }
 } // namespace vector1
 

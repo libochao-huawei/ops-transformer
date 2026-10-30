@@ -30,7 +30,7 @@ class PoolKeyIndexerServiceCube {
 public:
     using Q_T = typename LIT::queryType;
     using K_T = typename LIT::keyType;
-    using SCORE_T = uint32_t;
+    using SCORE_T = typename LIT::scoreType;
     // 非量化实例 SCALE_T=void(LocalTensor<void> 非法), scale buffer 以
     // bfloat16_t 占位(mxFP8 的 e8m0 也按 bf16 打包视图使用)
     using SCALE_T =
@@ -563,8 +563,17 @@ __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::ComputeL0c(uint64_t s1gL0
     mmadParams.k = constInfo_.headDim;
     mmadParams.cmatrixInitVal = true;
     mmadParams.cmatrixSource = false;
-    Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
-         keyL0_[(kl0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
+    if constexpr (LIT::isInt8) {
+        // int8: int8×int8→int32 精确累加, L0C 以 int32 视图落(v2 CL0_T 同款);
+        // |q̂k̂| ≤ 128·127² < 2^31 无溢出
+        Mmad(cL0_.ReinterpretCast<int32_t>()[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET],
+             queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
+             keyL0_[(kl0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
+    } else {
+        Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET],
+             queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
+             keyL0_[(kl0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
+    }
     if ((mmadParams.m / 16) * (mmadParams.n / 16) < 10) {
         PipeBarrier<PIPE_M>();
     }
@@ -578,7 +587,28 @@ __aicore__ inline void PoolKeyIndexerServiceCube<LIT>::Fixp(uint64_t s1gGmOffset
     SetFlag<HardEvent::M_FIX>(M_FIX_EVENT + l0BufIdx_ % L0_BUF_NUM);
     WaitFlag<HardEvent::M_FIX>(M_FIX_EVENT + l0BufIdx_ % L0_BUF_NUM);
 
-    if constexpr (std::is_same<SCORE_T, uint32_t>::value) {
+    if constexpr (LIT::isInt8) {
+        // int8: L0C int32 → 双 AIV 共享 UB int32(v2 Fixpipe<int32_t,int32_t>
+        // dualDst 通路逐参移植); 2^-10 缩放 + fp16 round-trip + ReLU 由 AIV 侧
+        // MulWeightAndReduceSumWithScaleInt8 完成, dst 偏移公式与非量化
+        // 同构(int32 与 float 同宽 4B, vector 读取零改动)
+        FixpipeParamsC310<CO2Layout::ROW_MAJOR> fixpipeParams;
+        // L0C 上的 mm1 结果矩阵 N 方向 size(同 mmadParams.n); 8 元素(32B)对齐
+        fixpipeParams.nSize = (s2L0RealSize + 7) >> 3 << 3;
+        // 有效数据不足 16 行, 只需输出部分行即可; M 方向 size 必须是偶数
+        fixpipeParams.mSize = (s1gL0RealSize + 1) >> 1 << 1;
+        fixpipeParams.srcStride = ((fixpipeParams.mSize + 15) / 16) * 16;
+        fixpipeParams.dstStride = constInfo_.s2BaseSize;
+        fixpipeParams.dualDstCtl = 1;
+        fixpipeParams.params.ndNum = 1;
+        fixpipeParams.params.srcNdStride = 0;
+        fixpipeParams.params.dstNdStride = 0;
+        Fixpipe<int32_t, int32_t, LI_CFG_ROW_MAJOR_UB>(
+            mm1ResUB_.ReinterpretCast<int32_t>()[(runInfo.loop % 2) * CeilDiv(constInfo_.mBaseSize, 2) *
+                                                     constInfo_.s2BaseSize +
+                                                 CeilDiv(s1gGmOffset, 2) * fixpipeParams.dstStride + s2GmOffset],
+            cL0_.ReinterpretCast<int32_t>()[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], fixpipeParams);
+    } else { // 非 int8: fp32 累加器 → UB(键宽解耦, 原 is_same<SCORE_T,uint32> 门控随开关失效)
         FixpipeParamsC310<CO2Layout::ROW_MAJOR> fixpipeParams;
         // L0C上的bmm1结果矩阵N方向的size大小；同mmadParams.n；8个元素（32B)对齐
         fixpipeParams.nSize = (s2L0RealSize + 7) >> 3 << 3;

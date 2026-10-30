@@ -24,13 +24,13 @@ namespace ge {
  * @par Inputs:
  * Inputs including:
  * @li query: The Query tensor used for pool score computation. \n
- *   - Data types: float16, bfloat16, float8_e4m3fn.
+ *   - Data types: float16, bfloat16, float8_e4m3fn, int8.
  *   - format: ND
  * @li pool_key: The pooled Key tensor used for pool score computation. \n
- *   - Data types: float16, bfloat16, float8_e4m3fn.
+ *   - Data types: float16, bfloat16, float8_e4m3fn, int8.
  *   - format: ND
  * @li weights: The multi-head weight projection matrix for score aggregation. \n
- *   - Data types: float16, bfloat16.
+ *   - Data types: float16, bfloat16. Must be float16 when quant_mode is 2.
  *   - format: ND
  * @li pool_tail_k: The number of valid tokens in the tail (incomplete) pool of each batch.
  *   Value range is [0, pool_size - 1]. \n
@@ -50,11 +50,13 @@ namespace ge {
  * @li block_table: Optional. The block mapping table used in PageAttention KV storage. \n
  *   - Data types: int32.
  *   - format: ND
- * @li q_descale: Optional. The dequantization scale of Query. \n
- *   - Data types: float32, float8_e8m0.
+ * @li q_descale: Optional. The dequantization scale of Query. Must be float16
+ *   when quant_mode is 2. \n
+ *   - Data types: float32, float8_e8m0, float16.
  *   - format: ND
- * @li k_descale: Optional. The dequantization scale of Key. \n
- *   - Data types: float32, float8_e8m0.
+ * @li k_descale: Optional. The dequantization scale of Key. Must be float16
+ *   when quant_mode is 2. \n
+ *   - Data types: float32, float8_e8m0, float16.
  *   - format: ND
 
  * @par Attributes:
@@ -75,6 +77,8 @@ namespace ge {
  *   - -1: no quantization (default)
  *   - 0: FP8 per-token-head quantization (scale stored as float32)
  *   - 1: MX-FP8 quantization (scale stored as float8_e8m0)
+ *   - 2: int8 quantization (query/pool_key stored as int8, weights and
+ *     dequantization scales stored as float16)
  * @li return_value: An optional bool attribute. Whether to output sparse_values.
  *   - false: do not output (default)
  *   - true: output sparse_values
@@ -97,28 +101,34 @@ namespace ge {
  *  - pool_size supports [1, 128]; topk supports [1, 2048] and 3072/4096/5120/6144/7168/8192.
  *  - pool_tail_k value range is [0, pool_size - 1].
  *  - head_dim supports 128; query head num (N1) supports [1, 64]; pool_key head num (N2) supports 1.
- *  - block_size must be a multiple of 16 and no greater than 1024.
+ *  - block_size must be a multiple of 16 and no greater than 2048.
  *  - Padding invalid data on S1/S2 of query/pool_key is not supported.
+ *  - When quant_mode is 2 (int8 quantization), query/pool_key must be int8 and
+ *    weights/q_descale/k_descale must be float16; q_descale/k_descale shapes are
+ *    the corresponding query/pool_key shapes with the head-dim axis removed;
+ *    scale elements must be positive.
  *  - pool_key supports non-contiguous input on axis 0 in the PA_BBND scenario
  *    (the actual stride must be passed via the key_stride0 attribute); all other
  *    axes must be contiguous. Other inputs do not support non-contiguous tensors.
  *  - Ascend 950PR&950DT products support FP8 (float8_e4m3fn) and MX-FP8 (float8_e8m0 scale)
- *    data types and quantization.
+ *    data types, and support quantization modes 0/1/2.
  *  - Atlas A3 products and Atlas A2 products
  *    do not support FLOAT8_E4M3FN and FLOAT8_E8M0 data types, and do not support
- *    quantization.
+ *    FP8 quantization (quant_mode 0/1); int8 quantization (quant_mode 2) is
+ *    supported with query/pool_key as int8 and weights/dequantization scales as
+ *    float16.
  * @endcode
  */
 REG_OP(PoolKeyIndexer)
-    .INPUT(query, TensorType({DT_FLOAT16, DT_BF16, DT_FLOAT8_E4M3FN}))
-    .INPUT(pool_key, TensorType({DT_FLOAT16, DT_BF16, DT_FLOAT8_E4M3FN}))
+    .INPUT(query, TensorType({DT_FLOAT16, DT_BF16, DT_FLOAT8_E4M3FN, DT_INT8}))
+    .INPUT(pool_key, TensorType({DT_FLOAT16, DT_BF16, DT_FLOAT8_E4M3FN, DT_INT8}))
     .INPUT(weights, TensorType({DT_FLOAT16, DT_BF16}))
     .INPUT(pool_tail_k, TensorType({DT_INT64}))
     .OPTIONAL_INPUT(actual_seq_q, TensorType({DT_INT64}))
     .OPTIONAL_INPUT(actual_seq_k, TensorType({DT_INT64}))
     .OPTIONAL_INPUT(block_table, TensorType({DT_INT32}))
-    .OPTIONAL_INPUT(q_descale, TensorType({DT_FLOAT, DT_FLOAT8_E8M0}))
-    .OPTIONAL_INPUT(k_descale, TensorType({DT_FLOAT, DT_FLOAT8_E8M0}))
+    .OPTIONAL_INPUT(q_descale, TensorType({DT_FLOAT, DT_FLOAT8_E8M0, DT_FLOAT16}))
+    .OPTIONAL_INPUT(k_descale, TensorType({DT_FLOAT, DT_FLOAT8_E8M0, DT_FLOAT16}))
     .OUTPUT(sparse_indices, TensorType({DT_INT32}))
     .OUTPUT(sparse_values, TensorType({DT_FLOAT}))
     .ATTR(topk, Int, 2048)
@@ -130,6 +140,7 @@ REG_OP(PoolKeyIndexer)
     .ATTR(return_value, Bool, false)
     .ATTR(key_stride0, Int, -1)
     .ATTR(k_descale_stride0, Int, -1)
+    .ATTR(sparse_indices_mode, Int, 0)
     .OP_END_FACTORY_REG(PoolKeyIndexer)
 } // namespace ge
 

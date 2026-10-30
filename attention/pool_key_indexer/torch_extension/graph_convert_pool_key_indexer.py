@@ -76,8 +76,27 @@ if _TORCHAIR_AVAILABLE:
         mask_mode: int = 3,
         quant_mode: int = -1,
         return_value: bool = False,
+        sparse_indices_mode: int = 0,
         meta_outputs: List[TensorSpec] = None,
     ):
+        # sparse_indices_mode(索引输出布局模式): 0=legacy(默认, 与历史布局逐比特一致);
+        # 1=compact(tail 紧跟有效展开, -1 全在行尾)。sparse_indices_mode 属性经 op_graph
+        # proto 声明可直接设置在 PoolKeyIndexer 节点上(单算子, 无需 V2 节点)。
+        attrs = {
+            "layout_q": attr.Str(layout_q),
+            "layout_k": attr.Str(layout_k),
+            "topk": attr.Int(topk),
+            "pool_size": attr.Int(pool_size),
+            "mask_mode": attr.Int(mask_mode),
+            "quant_mode": attr.Int(quant_mode),
+            "return_value": attr.Bool(return_value),
+            # PA_BBND 0-axis non-contiguous support (attr index 7/8, must be
+            # the last attrs to match the op_def registration order)
+            "key_stride0": attr.Int(_pool_key_stride0(pool_key)),
+            "k_descale_stride0": attr.Int(_pool_key_stride0(k_descale)),
+        }
+        if sparse_indices_mode == 1:
+            attrs["sparse_indices_mode"] = attr.Int(1)
         return torchair.ge.custom_op(
             "PoolKeyIndexer",
             inputs={
@@ -91,18 +110,6 @@ if _TORCHAIR_AVAILABLE:
                 "q_descale": q_descale,
                 "k_descale": k_descale,
             },
-            attrs={
-                "layout_q": attr.Str(layout_q),
-                "layout_k": attr.Str(layout_k),
-                "topk": attr.Int(topk),
-                "pool_size": attr.Int(pool_size),
-                "mask_mode": attr.Int(mask_mode),
-                "quant_mode": attr.Int(quant_mode),
-                "return_value": attr.Bool(return_value),
-                # PA_BBND 0-axis non-contiguous support (attr index 7/8, must be
-                # the last attrs to match the op_def registration order)
-                "key_stride0": attr.Int(_pool_key_stride0(pool_key)),
-                "k_descale_stride0": attr.Int(_pool_key_stride0(k_descale)),
-            },
+            attrs=attrs,
             outputs=["sparse_indices_out", "sparse_values_out"],
         )

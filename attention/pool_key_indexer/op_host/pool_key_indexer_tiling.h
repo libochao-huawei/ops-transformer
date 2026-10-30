@@ -52,6 +52,9 @@ constexpr uint32_t PKI_ATTR_QUANT_MODE = 5;
 constexpr uint32_t PKI_ATTR_RETURN_VALUE = 6;
 constexpr uint32_t PKI_ATTR_KEY_STRIDE0 = 7;
 constexpr uint32_t PKI_ATTR_K_DESCALE_STRIDE0 = 8;
+// sparse_indices_mode(索引输出布局模式, Version(2) 标记: 仅 aclnnPoolKeyIndexerV2 暴露;
+// V1 接口运行时属性容器可能不含该项, 读取须以 GetAttrNum/判空守护)
+constexpr uint32_t PKI_ATTR_SPARSE_INDICES_MODE = 9;
 
 // ------------------ Limits ------------------
 constexpr uint32_t PKI_HEAD_DIM = 128;
@@ -67,6 +70,8 @@ constexpr uint32_t PKI_TOPK_DEFAULT = 2048;
 constexpr int32_t PKI_QUANT_NONE = -1;
 constexpr int32_t PKI_QUANT_FP8_PER_TOKEN = 0;
 constexpr int32_t PKI_QUANT_MXFP8 = 1;
+// int8 对称量化: q/k=INT8, weights/q_descale/k_descale=FP16(三平台)
+constexpr int32_t PKI_QUANT_INT8 = 2;
 constexpr int32_t PKI_MASK_DEFAULT = 0;
 constexpr int32_t PKI_MASK_CAUSAL = 3;
 // mxFP8 scale 布局: 每 MX_SCALE_GROUP_SIZE 个 D 元素共享一个
@@ -76,6 +81,12 @@ constexpr uint32_t PKI_MX_E8M0_SCALE_PACK_NUM = 2; // E8M0 尾维打包数(2 个
 constexpr uint32_t PKI_MX_SCALE_SHAPE_ALIGN = 64;  // headDim 对齐约束(当前 headDim 恒为 128)
 
 // ------------------ Tiling Constants ------------------
+// ------------------ Index Output Layout Mode (尾块追加模式) ------------------
+// 0=legacy: tail 固定偏移 topk, 短序列 [expandTotal, topk) 为 -1 缝隙(历史布局)
+// 1=compact: tail 紧跟有效展开 token, -1 全部位于行尾(紧凑布局)
+// V1 op(PoolKeyIndexer)恒 legacy; V2 op(PoolKeyIndexerV2)按 sparse_indices_mode 属性选择
+constexpr uint32_t PKI_SPARSE_INDICES_MODE_LEGACY = 0U;
+constexpr uint32_t PKI_SPARSE_INDICES_MODE_COMPACT = 1U;
 // 以下 S1/S2/M 基本块常量为 arch35/host 侧口径; arch22 kernel 以自有硬编码覆盖, 不消费这些字段。
 constexpr uint32_t PKI_S1_BASE_SIZE = 4;
 constexpr uint32_t PKI_S1_BASE_SIZE_SMALL = 2;
@@ -85,7 +96,11 @@ constexpr uint32_t PKI_M_BASE_SIZE_SMALL = 128;
 constexpr uint32_t PKI_D_BASE_BLOCK = 128;
 constexpr uint32_t PKI_TOPK_6K = 6144;
 constexpr uint32_t PKI_GM_ALIGN_BYTES = 512;
-constexpr uint32_t PKI_SCORE_T_SIZE = 4; // sizeof(uint32_t) sortable key
+// arch35 uint16 score 键开关(host 侧影子, 必须与 kernel pool_key_indexer_common.h
+// 的 PKI_SCORE16 保持一致; arch22 分区不受影响, 其 scoreElemSize 在 tiling.cpp 单独算)
+constexpr bool PKI_SCORE16_HOST = true;
+constexpr uint32_t PKI_SCORE_T_SIZE_Q = PKI_SCORE16_HOST ? 2 : 4; // arch35 量化模式键宽
+constexpr uint32_t PKI_SCORE_T_SIZE = 4;                          // arch35 非量化/arch22 键宽
 
 // Trunk lengths for TopK
 constexpr uint32_t PKI_TRUNK_LEN_16K = 16384;
@@ -126,8 +141,12 @@ TILING_DATA_FIELD_DEF(uint64_t, wsOffScore)
 TILING_DATA_FIELD_DEF(uint64_t, wsOffLdScore)
 TILING_DATA_FIELD_DEF(uint64_t, wsOffLdIdx)
 TILING_DATA_FIELD_DEF(float, qkScale) // 1/sqrt(headDim), score 缩放系数
+// 索引输出布局模式: 0=legacy / 1=compact(见 ConstInfo::sparseIndicesMode)。
+// V1 tiling 恒填 0; V2 op 复用本结构体, 由 sparse_indices_mode 属性填充。
+TILING_DATA_FIELD_DEF(uint32_t, sparseIndicesMode)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(PoolKeyIndexer, PoolKeyIndexerTilingData)
+// 注: REGISTER_TILING_DATA_CLASS 在 tiling.cpp 内执行(与 infershape/tiling 的
+// 注册约定一致, 头文件仅保留结构体定义)
 
 // ------------------ CompileInfo ------------------
 // 图模式必需: 注册 TilingParse 后框架才生成 compile info JSON 供 FE 解析, 未注册图编译报错
@@ -172,6 +191,9 @@ struct PoolKeyIndexerTilingInfo {
     ge::DataType queryDtype = ge::DT_FLOAT16;
     ge::DataType keyDtype = ge::DT_FLOAT16;
     ge::DataType weightsDtype = ge::DT_FLOAT16;
+    // 索引输出布局模式(尾块追加模式): 0=legacy / 1=compact, 来自 sparse_indices_mode 属性
+    // (仅 V2 接口/图模式可设置; V1 缺省 legacy)
+    uint32_t sparseIndicesMode = PKI_SPARSE_INDICES_MODE_LEGACY;
 };
 
 // ------------------ Tiling Class ------------------
@@ -188,6 +210,10 @@ private:
     std::vector<uint32_t> keyStridesVec_;
     // k_descale 运行时 stride(PA 0 轴非连续支持, 与 keyStridesVec_ 同源时机捕获)
     std::vector<uint32_t> keyDequantScaleStridesVec_;
+    // pool_key 是否按"0 池"空张量编码(BSND dim1=0 / TND·PA dim0=0)。
+    // 在空张量形态校验处置位, 供后续 int8 k_descale 缺省校验使用
+    // (此时 info.s2Size 尚未解析, 不可用其判 0 池)
+    bool keyZeroPool_ = false;
 
     ge::graphStatus ParseAndCheckParams(PoolKeyIndexerTilingInfo& info);
     ge::graphStatus CalcTilingParams(PoolKeyIndexerTilingInfo& info);

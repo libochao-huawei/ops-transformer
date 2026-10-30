@@ -16,6 +16,10 @@
 using namespace AscendC;
 namespace PkiCommon {
 
+// arch35 score 键宽开关: 仅对量化模板生效(uint16 bf16 sortable key, 对齐 QLIV2 arch35);
+// 非量化(bf16/fp16)恒 uint32 位键, 保持逐比特口径(lightning_indexer_v2 非量化亦 uint32)。arch22 不受影响。
+static constexpr bool PKI_SCORE16 = true;
+
 // mxFP8 scale 布局: 每 32 个 D 元素共享一个 E8M0 scale, 2 个 E8M0 打包成 1 个 bf16 寻址单位
 constexpr uint32_t PKI_MX_SCALE_GROUP_SIZE = 32;
 constexpr uint32_t PKI_FP8_TWO = 2;
@@ -47,7 +51,13 @@ struct PkiType {
                                     std::is_same<SCALE_T, fp8_e8m0_t>::value;
     static constexpr bool isFp8PerToken = std::is_same<Q_T, fp8_e4m3fn_t>::value &&
                                           std::is_same<K_T, fp8_e4m3fn_t>::value && std::is_same<SCALE_T, float>::value;
-    static constexpr bool isQuant = isMxFp8 || isFp8PerToken;
+    // int8 对称量化(int8×int8→int32 精确累加 + descale FP16), 不复用 isFp8PerToken
+    // 以隔离 mode0/2 的 kernel 分支
+    static constexpr bool isInt8 =
+        std::is_same<Q_T, int8_t>::value && std::is_same<K_T, int8_t>::value && std::is_same<SCALE_T, half>::value;
+    static constexpr bool isQuant = isMxFp8 || isFp8PerToken || isInt8;
+    // score 键宽真源: 量化模板 uint16 / 非量化 uint32(PKI_SCORE16=false 时全 uint32)
+    using scoreType = std::conditional_t<PKI_SCORE16 && isQuant, uint16_t, uint32_t>;
 };
 
 struct RunInfo {
@@ -138,6 +148,11 @@ struct ConstInfo {
     bool isSparseCountOver2K = false;
     bool isLDOpen = false;
     bool splitMFlag = false;
+    // 索引输出布局模式(尾块追加模式): 0=legacy(tail 固定偏移 topk, 短序列
+    // [expandTotal, topk) 为 -1 缝隙, 与历史版本逐比特一致); 1=compact(tail
+    // 紧跟有效展开 token, -1 全部位于行尾)。V1 接口(aclnnPoolKeyIndexer)恒为 0;
+    // V2 接口(aclnnPoolKeyIndexerV2)由 sparse_indices_mode 属性指定。仅显式等于 1 走紧凑布局。
+    uint32_t sparseIndicesMode = 0;
 
     uint32_t actualLenQDims = 0U;
     uint32_t actualLenDims = 0U;

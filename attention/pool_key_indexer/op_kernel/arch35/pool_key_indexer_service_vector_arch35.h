@@ -29,6 +29,31 @@ constexpr uint32_t TRUNK_LEN_2K = 2048;
 constexpr uint32_t TOPK_LEN_7K = 7168;
 constexpr uint32_t TOPK_LEN_5K = 5120;
 
+// 多行 GM→UB 拷贝，UB 行距 dstPitch（元素）。DataCopyPad 的行间隙 dstStride 粒度为
+// 32B，行间隙 (dstPitch-rowElems)*sizeof(T) 非 32B 整数倍时（如 2B dtype 且
+// gSize 非 16 倍数）整除截断会破坏行距，退化为逐行拷贝；两种写法落盘行距一致
+// （dstPitch），对消费方透明。GM 侧行距恒 rowElems（行间连续）。
+template <typename T>
+__aicore__ inline void CopyGmToUbRowsPitched(LocalTensor<T> dst, uint32_t rows, uint32_t rowElems, uint32_t dstPitch,
+                                             GlobalTensor<T> src, int64_t srcOffset,
+                                             const DataCopyPadExtParams<T>& padParams)
+{
+    DataCopyExtParams params{};
+    params.blockLen = rowElems * sizeof(T);
+    params.srcStride = 0;
+    params.dstStride = 0;
+    if ((dstPitch - rowElems) * sizeof(T) % 32 == 0) {
+        params.blockCount = rows;
+        params.dstStride = (dstPitch - rowElems) * sizeof(T) / 32;
+        DataCopyPad(dst, src[srcOffset], params, padParams);
+        return;
+    }
+    params.blockCount = 1;
+    for (uint32_t rowIdx = 0; rowIdx < rows; rowIdx++) {
+        DataCopyPad(dst[rowIdx * dstPitch], src[srcOffset + rowIdx * rowElems], params, padParams);
+    }
+}
+
 template <typename Q_T, typename W_T = void>
 struct PkiTypeTraits {
     using weightsType = Q_T; // 默认：weightsType绑定Q_T
@@ -49,6 +74,12 @@ template <>
 struct PkiTypeTraits<fp8_e4m3fn_t> {
     using weightsType = half;
 };
+// int8 加固: 量化 weights 为 half(D2), 防止 PkiTypeTraits 默认推导出 int8_t
+// (与 arch22 侧偏特化双保险; entry 显式携带 half 时本推导不生效)
+template <>
+struct PkiTypeTraits<int8_t> {
+    using weightsType = half;
+};
 template <typename LIT>
 class PoolKeyIndexerServiceVector {
 public:
@@ -59,7 +90,7 @@ public:
     static constexpr bool DT_W_FLAG = LIT::weightsTypeFlag;
     using Q_T = typename LIT::queryType;
     using K_T = typename LIT::keyType;
-    using SCORE_T = uint32_t;
+    using SCORE_T = typename LIT::scoreType;
     // 量化场景: PkiType 显式携带 weightsType(half/bfloat16_t), 优先于推导;
     // 非量化(WEIGHTS_T=void)沿用 PkiTypeTraits 推导
     using W_DERIVED_T =
@@ -70,14 +101,27 @@ public:
     __aicore__ inline PoolKeyIndexerServiceVector(){};
     __aicore__ inline void ProcessVec1(const PkiCommon::RunInfo& info);
     __aicore__ inline void ProcessTopK(const PkiCommon::RunInfo& info);
+    // LD 段搬运——把 follower 核 scoreGm 区中本 AIV 半区各行的
+    // [segS2Lo, segS2Hi] 块列段搬至本核区同列(GM→UB→GM, 8KB staging 分块)
+    __aicore__ inline void CopyScoreSegFromCore(uint32_t coreIdx, uint32_t segS2Lo, uint32_t segS2Hi,
+                                                const PkiCommon::RunInfo& info);
     __aicore__ inline void InitBuffers(TPipe* pipe);
     __aicore__ inline void InitParams(const struct PkiCommon::ConstInfo& constInfo,
                                       const PoolKeyIndexerTilingData* __restrict tilingData);
-    __aicore__ inline void InitVecWorkspaceTensor(GlobalTensor<SCORE_T> scoreGm);
+    __aicore__ inline void InitVecWorkspaceTensor(GlobalTensor<SCORE_T> scoreGm, GlobalTensor<SCORE_T> ldTailGm);
     __aicore__ inline void InitVecInputTensor(GlobalTensor<W_T> weightsGm, GlobalTensor<int32_t> indiceOutGm,
                                               GlobalTensor<float> valueOutGm, GlobalTensor<int32_t> blockTableGm,
                                               GlobalTensor<float> qScaleGm = {}, GlobalTensor<float> kScaleGm = {});
-    __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
+    // int8: half scale 版重载(不改原 float 版签名, 分支隔离)
+    __aicore__ inline void InitVecInputTensor(GlobalTensor<W_T> weightsGm, GlobalTensor<int32_t> indiceOutGm,
+                                              GlobalTensor<float> valueOutGm, GlobalTensor<int32_t> blockTableGm,
+                                              GlobalTensor<half> qScaleGm, GlobalTensor<half> kScaleGm);
+    // 无效行清理(ps>1 支持尾块预写): tailVisible>0 时在 UB 铺 -1 之后、DataCopyPad
+    // 之前把 causal 可见尾 token 写入同一 UB 行缓冲(与主路径 ExpandAndAppendIndices
+    // 同款 V→S→MTE3 流水, 不做 GM 读改写, 不引入新事件)。
+    __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset, uint32_t tailPos = 0, int32_t tailVisible = 0,
+                                              int32_t tailFirstTok = 0);
+    __aicore__ inline void SaveLdTail(uint32_t s2Lo, uint32_t s2Hi, const PkiCommon::RunInfo& info);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
 
@@ -90,6 +134,9 @@ private:
     // dstOffset 为乒乓区内本 s2 块的段偏移, 与读取位置一致
     __aicore__ inline void GetKeyScale(LocalTensor<float> kScaleUB, uint64_t keyScaleGmOffset, int64_t batchId,
                                        int64_t startS2, int64_t getLen, uint32_t dstOffset = 0);
+    // int8: k_descale(FP16) 版搬运, 寻址逻辑与 GetKeyScale 同构, 仅 dtype 化
+    __aicore__ inline void GetKeyScaleHalf(LocalTensor<half> kScaleUB, uint64_t keyScaleGmOffset, int64_t batchId,
+                                           int64_t startS2, int64_t getLen, uint32_t dstOffset = 0);
 
     // arch35 标量(S pipe)与向量(V pipe)/MTE3 间必须显式硬同步,
     // PipeBarrier<PIPE_V> 不保证 S 侧读写顺序
@@ -111,9 +158,24 @@ private:
         SetFlag<HardEvent::S_MTE3>(eventID);
         WaitFlag<HardEvent::S_MTE3>(eventID);
     }
+    // LD 段搬运中转的跨搬运流水同步(MTE2 读 GM→UB 与 MTE3 写
+    // UB→GM 为不同 pipe, 无隐式有序性, 须显式硬同步)
+    __aicore__ inline void Mte2ToMte3Sync()
+    {
+        event_t eventID = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_MTE3));
+        SetFlag<HardEvent::MTE2_MTE3>(eventID);
+        WaitFlag<HardEvent::MTE2_MTE3>(eventID);
+    }
+    __aicore__ inline void Mte3ToMte2Sync()
+    {
+        event_t eventID = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+        SetFlag<HardEvent::MTE3_MTE2>(eventID);
+        WaitFlag<HardEvent::MTE3_MTE2>(eventID);
+    }
 
 protected:
     GlobalTensor<SCORE_T> scoreGm;
+    GlobalTensor<SCORE_T> ldTailGm_; // LD 跨核尾段暂存区基址(workspace, 按核分区)
     GlobalTensor<W_T> weightsGm;
     GlobalTensor<int32_t> indiceOutGm;
     GlobalTensor<float> valueOutGm;
@@ -121,6 +183,9 @@ protected:
     // mode=0 (FP8 per-token-head) scale GM(q/k_descale, float)
     GlobalTensor<float> qScaleGm;
     GlobalTensor<float> kScaleGm;
+    // int8 (quant_mode=2) scale GM(q/k_descale, half)
+    GlobalTensor<half> qScaleGmHalf;
+    GlobalTensor<half> kScaleGmHalf;
     // =================================常量区=================================
     static constexpr uint32_t VEC1_V_MTE2_EVENT = EVENT_ID0;
     static constexpr uint32_t VEC1_MTE2_V_EVENT = EVENT_ID1;
@@ -159,6 +224,13 @@ private:
     TBuf<TPosition::VECCALC> kScaleBuf_;
     LocalTensor<float> kScaleUB_;
 
+    // int8 (quant_mode=2) scale UB: qScale half 行距 gSizeAlign16(32B 对齐,
+    // dstStride 恒整); kScale half 16 轮乒乓(与 mode0 同构, 容量减半)
+    TBuf<TPosition::VECCALC> qScaleHalfBuf_;
+    LocalTensor<half> qScaleHalfUB_;
+    TBuf<TPosition::VECCALC> kScaleHalfBuf_;
+    LocalTensor<half> kScaleHalfUB_;
+
     // tmp buff for out
     TBuf<TPosition::VECCALC> outBuf_;
     LocalTensor<SCORE_T> vec1OutUB_;
@@ -184,6 +256,9 @@ private:
 
     TBuf<TPosition::VECCALC> topkSharedTmpBuf_;
     LocalTensor<uint32_t> topkSharedTmpLocal_;
+    // LD 段搬运 GM→UB→GM 中转区(仅 isLDOpen 分配, 固定 8KB)
+    TBuf<TPosition::VECCALC> ldStageBuf_;
+    LocalTensor<SCORE_T> ldStageLocal_;
     int32_t blockId_ = -1;
     int32_t groupInner_ = 0;
     int32_t globalTopkNum_ = 0;
@@ -235,6 +310,21 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::InitBuffers(TPipe* pipe
         SetFlag<HardEvent::V_MTE2>(KSCALE_S_MTE2_EVENT);
         WaitFlag<HardEvent::V_MTE2>(KSCALE_S_MTE2_EVENT);
     }
+    if constexpr (LIT::isInt8) {
+        // int8: 预乘输出缓冲与 mode0 同款(fp32, 行距 128 元素); qScale half 行距
+        // gSizeAlign16(行起点恒 32B 对齐, 越界读垃圾不消费); kScale half 16 轮乒乓
+        pipe->InitBuffer(weightScaleFp32Buf_, 2 * CeilDiv(s1BaseSize_, 2) * 128 * sizeof(float));
+        weightScaleFp32UB_ = weightScaleFp32Buf_.Get<float>();
+        pipe->InitBuffer(qScaleHalfBuf_,
+                         2 * CeilDiv(s1BaseSize_, 2) * PkiCommon::Align((uint64_t)gSize_, (uint64_t)16) * sizeof(half));
+        qScaleHalfUB_ = qScaleHalfBuf_.Get<half>();
+        pipe->InitBuffer(kScaleHalfBuf_, 2 * 16 * s2BaseSize_ * sizeof(half));
+        kScaleHalfUB_ = kScaleHalfBuf_.Get<half>();
+        // kScale 铺 0: 尾部未搬运区为垃圾值, 乘入会污染 TopK(0 与无效池语义一致)
+        Duplicate(kScaleHalfUB_, static_cast<half>(0.0f), 2 * 16 * s2BaseSize_);
+        SetFlag<HardEvent::V_MTE2>(KSCALE_S_MTE2_EVENT);
+        WaitFlag<HardEvent::V_MTE2>(KSCALE_S_MTE2_EVENT);
+    }
     pipe->InitBuffer(outBuf_, 2 * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ * sizeof(SCORE_T));
     vec1OutUB_ = outBuf_.Get<SCORE_T>(); // out
 
@@ -279,6 +369,13 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::InitBuffers(TPipe* pipe
     pipe->InitBuffer(topkSharedTmpBuf_, topkSharedTmpSize);
     topkSharedTmpLocal_ = topkSharedTmpBuf_.Get<uint32_t>();
     topkOp_.InitBuffers(topkSharedTmpLocal_, indicesOutLocal_);
+
+    // LD 段搬运中转区(仅切分启用时分配, 非启用路径 UB 布局零变化)
+    if (constInfo_.isLDOpen) {
+        constexpr uint32_t LD_STAGE_COLS = 2048; // 2048 * sizeof(SCORE_T) = 8KB
+        pipe->InitBuffer(ldStageBuf_, LD_STAGE_COLS * sizeof(SCORE_T));
+        ldStageLocal_ = ldStageBuf_.Get<SCORE_T>();
+    }
 }
 
 template <typename LIT>
@@ -326,10 +423,82 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::InitVecInputTensor(
     }
 }
 
+// int8: half scale 版(与 float 版仅 GM 视图类型不同, 原 float 版语句逐字不动)
 template <typename LIT>
-__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::InitVecWorkspaceTensor(GlobalTensor<SCORE_T> scoreGm)
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::InitVecInputTensor(
+    GlobalTensor<W_T> weightsGm, GlobalTensor<int32_t> indiceOutGm, GlobalTensor<float> valueOutGm,
+    GlobalTensor<int32_t> blockTableGm, GlobalTensor<half> qScaleGm, GlobalTensor<half> kScaleGm)
+{
+    this->weightsGm = weightsGm;
+    this->indiceOutGm = indiceOutGm;
+    this->valueOutGm = valueOutGm;
+    this->blockTableGm = blockTableGm;
+    if constexpr (LIT::isInt8) {
+        this->qScaleGmHalf = qScaleGm;
+        this->kScaleGmHalf = kScaleGm;
+    }
+}
+
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::InitVecWorkspaceTensor(GlobalTensor<SCORE_T> scoreGm,
+                                                                                GlobalTensor<SCORE_T> ldTailGm)
 {
     this->scoreGm = scoreGm; // resucesum*k
+    this->ldTailGm_ = ldTailGm;
+}
+
+// LD-fix: 本核区间起始组(s2Start>0)的跨核尾段分数转存至 ldTail 暂存区。
+// 必须在该组块处理完立即执行(后续组的 ProcessVec1 写入会按同列布局覆盖常规区),
+// 使段首核在 SyncAll 后能从 ldTail 读到未污染数据。行循环内逐行
+// MTE2 读入 staging -> 同步 -> MTE3 写出 -> 同步(与 CopyScoreSegFromCore 同构)。
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::SaveLdTail(uint32_t s2Lo, uint32_t s2Hi,
+                                                                    const PkiCommon::RunInfo& info)
+{
+    int64_t curS1Idx = info.gS1Idx * s1BaseSize_;
+    int64_t curS1ProcNum = curS1Idx + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
+    int64_t curAivS1ProcNum = (blockId_ % 2 == 0) ? CeilDiv(curS1ProcNum, 2) : curS1ProcNum / 2;
+    if (curAivS1ProcNum <= 0 || s2Hi < s2Lo) {
+        return;
+    }
+
+    // ProcessVec1 的 score 写(MTE3)按 pingpong 槽惰性等待(下一同槽块入口才 Wait),
+    // 组末 1-2 个块的写在块循环结束时仍在途; 转存前必须排空全部管线,
+    // 否则 MTE2 读到陈旧 GM 数据
+    PipeBarrier<PIPE_ALL>();
+
+    uint64_t kSeqSizeAlign = PkiCommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_);
+    uint64_t singleCoreScoreElems =
+        static_cast<uint64_t>(s1BaseSize_) * PkiCommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_);
+    uint64_t halfBase = static_cast<uint64_t>(blockId_ % 2) * CeilDiv(s1BaseSize_, 2) * kSeqSizeAlign;
+    uint64_t tailBase = static_cast<uint64_t>(blockId_ / 2) * singleCoreScoreElems;
+    uint64_t colLo = static_cast<uint64_t>(s2Lo) * s2BaseSize_;
+    uint64_t colNum = static_cast<uint64_t>(s2Hi - s2Lo + 1) * s2BaseSize_;
+
+    AscendC::DataCopyPadExtParams<SCORE_T> padParams{false, 0, 0, 0};
+    constexpr uint32_t LD_STAGE_COLS = 2048; // 与 InitBuffers 的 ldStageBuf_ 同宽(8KB)
+    for (uint64_t colDone = 0; colDone < colNum; colDone += LD_STAGE_COLS) {
+        uint32_t chunkCols = static_cast<uint32_t>(PkiCommon::Min(colNum - colDone, (uint64_t)LD_STAGE_COLS));
+        uint16_t chunkBytes = static_cast<uint16_t>(chunkCols * sizeof(SCORE_T));
+        AscendC::DataCopyExtParams copyInParams;
+        copyInParams.blockCount = 1;
+        copyInParams.blockLen = chunkBytes;
+        copyInParams.srcStride = 0;
+        copyInParams.dstStride = 0;
+        copyInParams.rsv = 0;
+        AscendC::DataCopyParams copyOutParams;
+        copyOutParams.blockCount = 1;
+        copyOutParams.blockLen = chunkBytes;
+        copyOutParams.srcStride = 0;
+        copyOutParams.dstStride = 0;
+        for (int64_t r = 0; r < curAivS1ProcNum; r++) {
+            uint64_t segOffset = halfBase + static_cast<uint64_t>(r) * kSeqSizeAlign + colLo + colDone;
+            AscendC::DataCopyPad(ldStageLocal_, scoreGm[segOffset], copyInParams, padParams);
+            Mte2ToMte3Sync();
+            AscendC::DataCopyPad(ldTailGm_[tailBase + segOffset], ldStageLocal_, copyOutParams);
+            Mte3ToMte2Sync();
+        }
+    }
 }
 
 // mode=0: k_descale GM->UB(每池 1 个 float scale); 非 PA 连续寻址,
@@ -370,6 +539,45 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::GetKeyScale(LocalTensor
     }
 }
 
+// int8: k_descale(FP16, 每池 1 个 half) GM->UB; 寻址逻辑与 GetKeyScale 同构
+// (PA 按 block_table×keyDequantScaleStride0 查物理块, 非 PA 线性偏移), 仅
+// dtype half 化
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::GetKeyScaleHalf(LocalTensor<half> kScaleUB,
+                                                                         uint64_t keyScaleGmOffset, int64_t batchId,
+                                                                         int64_t startS2, int64_t getLen,
+                                                                         uint32_t dstOffset)
+{
+    AscendC::DataCopyPadExtParams<half> padParams{false, 0, 0, 0};
+    AscendC::DataCopyExtParams copyInParams;
+    copyInParams.blockCount = 1;
+    copyInParams.srcStride = 0;
+    copyInParams.dstStride = 0;
+    copyInParams.rsv = 0;
+    if constexpr (PAGE_ATTENTION) {
+        // 按池号连续写入 UB 段, GM 源按物理块跳转; 段内偏移用相对本段
+        // 起点的池号, 与块边界解耦
+        int64_t written = 0; // 段内已写池数
+        while (written < getLen) {
+            int64_t absPool = startS2 + written; // batch 内绝对池号
+            int64_t s2BlkId = absPool / kCacheBlockSize_;
+            int64_t s2BlkOffset = absPool % kCacheBlockSize_;
+            int64_t blockId = blockTableGm.GetValue(batchId * maxBlockNumPerBatch_ + s2BlkId);
+            int64_t partLen = Min((int64_t)kCacheBlockSize_ - s2BlkOffset, getLen - written);
+            copyInParams.blockLen = partLen * sizeof(half);
+            SetFlag<HardEvent::S_MTE2>(KSCALE_S_MTE2_EVENT);
+            WaitFlag<HardEvent::S_MTE2>(KSCALE_S_MTE2_EVENT);
+            AscendC::DataCopyPad(kScaleUB[dstOffset + static_cast<uint32_t>(written)],
+                                 kScaleGmHalf[blockId * constInfo_.keyDequantScaleStride0 + s2BlkOffset], copyInParams,
+                                 padParams);
+            written += partLen;
+        }
+    } else {
+        copyInParams.blockLen = getLen * sizeof(half);
+        AscendC::DataCopyPad(kScaleUB[dstOffset], kScaleGmHalf[keyScaleGmOffset], copyInParams, padParams);
+    }
+}
+
 template <typename LIT>
 __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::AllocEventID()
 {
@@ -397,7 +605,8 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::FreeEventID()
 }
 
 template <typename LIT>
-__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::CleanInvalidOutput(int64_t invalidS1Offset)
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::CleanInvalidOutput(int64_t invalidS1Offset, uint32_t tailPos,
+                                                                            int32_t tailVisible, int32_t tailFirstTok)
 {
     // 无效行清理(与 ProcessVec1 无效行路径同构): Duplicate 铺 UB → V_MTE3 硬同步
     // → DataCopyPad 出 GM(行宽非 32B 对齐, 不可用普通 DataCopy/InitGlobalMemory)
@@ -410,6 +619,15 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::CleanInvalidOutput(int6
     WaitFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
     if (poolSize_ > 1) {
         Duplicate(expandOutLocal_, constInfo_.INVALID_IDX, PkiCommon::Align(outputLen_, (uint32_t)8));
+        if (tailVisible > 0) {
+            // V→S: 尾写入需在 -1 铺满落地后(与 ExpandAndAppendIndices 尾块同款次序)
+            VToSSync();
+            for (int32_t t = 0; t < tailVisible; t++) {
+                expandOutLocal_.SetValue(tailPos + t, tailFirstTok + t);
+            }
+            // SCALAR(SetValue) 写 UB 后由 MTE3(DataCopyPad) 读出, 需硬同步
+            SToMTE3Sync();
+        }
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         AscendC::DataCopyPad(indiceOutGm[invalidS1Offset], expandOutLocal_, copyOutParams);
@@ -451,14 +669,27 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
     uint32_t totalOut = topk + poolSize - 1;
     uint32_t alignedTotalOut = PkiCommon::Align(totalOut, (uint32_t)8);
 
-    // 尾块可见 token 数(两条路径共用)
+    // 索引输出布局模式(尾块追加模式): 1=compact(tail 写入位置 = 实际展开 token 数,
+    // 长序列时恰为 topk, 短序列时 tail 紧跟有效展开, -1 全部落在行尾, 消除缝隙);
+    // 其他(含 0)=legacy(tail 固定偏移 topk, 短序列 [expandTotal, topk) 为 -1 缝隙,
+    // 与历史版本逐比特一致)。V1 接口恒 legacy, V2 接口按 sparse_indices_mode 属性选择。
+    uint32_t expandRounds = PkiCommon::Min(validS2Len, sparseCount);
+    uint32_t tailPos = (constInfo_.sparseIndicesMode == 1U) ? (expandRounds * poolSize) : topk;
+
+    // 尾块可见 token 数(两条路径共用): 尾池在原始序列中的真实起点为
+    // seqTailStart = L_orig - poolTailK (= actualSeqK*poolSize), mask_mode!=0 时
+    // 按该起点对 query 全局位置因果截断。topk 为选池预算, 仅当
+    // actualSeqK==sparseCount 时才与 seqTailStart 相等, 不可混作尾池起点
+    // (短序列会漏合法尾 token, 长序列多 query 会追加未来 token)。
+    // mask_mode=0 分支保持全尾可见不变
     int32_t visibleTailK = 0;
     if (poolTailK > 0) {
         if (constInfo_.maskMode == 0) {
             visibleTailK = poolTailK;
         } else {
             int32_t globalPosQ = L_orig - static_cast<int32_t>(curS1Size) + static_cast<int32_t>(curS1Idx);
-            visibleTailK = PkiCommon::Max(0, PkiCommon::Min(poolTailK, globalPosQ - static_cast<int32_t>(topk) + 1));
+            int32_t seqTailStart = L_orig - poolTailK;
+            visibleTailK = PkiCommon::Max(0, PkiCommon::Min(poolTailK, globalPosQ - seqTailStart + 1));
         }
     }
 
@@ -469,7 +700,6 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
         PipeBarrier<PIPE_V>();
         if (validS2Len > 0) {
             // 展开轮数受 TopK 选池数截断, 多余可见池不展开(防越写 outputLen 污染尾区)
-            uint32_t expandRounds = PkiCommon::Min(validS2Len, sparseCount);
             uint32_t effExpand = expandRounds * poolSize;
             // gather 表为 TopK 向量写产物, 调用方已 PipeBarrier<PIPE_V>, V pipe 读可见
             pkiexpand::ExpandPow2PoolIndices(tokenIndices, poolIndices.ReinterpretCast<uint32_t>(), workBuf, effExpand,
@@ -489,8 +719,9 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
             }
             PipeBarrier<PIPE_V>();
         }
-        // 尾区 [topk, totalOut) 恒做 -1 清空(gather 尾块 lane 可能越 topk 写垃圾, 同走 mask Duplicate)
-        uint32_t tailPos = topk;
+        // 尾区 [tailPos, totalOut) 恒做 -1 清空(gather 尾块 lane 可能越 tailPos 写垃圾, 同走
+        // mask Duplicate); 紧凑布局下 tailPos 即有效展开 token 数, 与上方缝隙覆盖段
+        // [validExpand, topk) 拼接后恰覆盖 [tailPos, totalOut) 全部行尾 -1 区
         uint64_t mask[1];
         mask[0] = ~0;
         mask[0] = mask[0] << (tailPos % 8);
@@ -518,7 +749,6 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
         // V→S: -1 向量填充先落地, 同时保证 poolIndices 向量写对标量 GetValue 可见
         VToSSync();
         if (validS2Len > 0) {
-            uint32_t expandRounds = PkiCommon::Min(validS2Len, sparseCount);
             for (uint32_t k = 0; k < expandRounds; k++) {
                 int32_t base = poolIndices.GetValue(k) * static_cast<int32_t>(poolSize);
                 uint32_t off = k * poolSize;
@@ -527,8 +757,9 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
                 }
             }
         }
+        // 紧凑布局: tail 紧跟有效展开(标量写无对齐约束), 其余保持铺底 -1
         for (int32_t t = 0; t < visibleTailK; t++) {
-            tokenIndices.SetValue(topk + static_cast<uint32_t>(t), L_orig - poolTailK + t);
+            tokenIndices.SetValue(tailPos + static_cast<uint32_t>(t), L_orig - poolTailK + t);
         }
         // SCALAR(SetValue) 写 UB 后由 MTE3(DataCopyPad) 读出, 需硬同步
         SToMTE3Sync();
@@ -549,7 +780,6 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
 
         uint32_t outOff = 0;
         // 展开轮数受 TopK 选池数截断, 多余可见池不展开(防越写污染尾区/相邻行)
-        uint32_t expandRounds = PkiCommon::Min(validS2Len, sparseCount);
         for (uint32_t k = 0; k < expandRounds; k++) {
             int32_t base = poolIndices.GetValue(k) * static_cast<int32_t>(poolSize);
             Duplicate<int32_t>(tokenIndices[outOff], base, alignedPoolSize);
@@ -557,17 +787,12 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ExpandAndAppendIndices(
             Add<int32_t>(tokenIndices[outOff], tokenIndices[outOff], offsetTpl, alignedPoolSize);
             outOff += poolSize;
         }
-    }
-
-    uint32_t validExpand = validS2Len * poolSize;
-    if (validExpand < topk) {
-        PipeBarrier<PIPE_V>();
-        Duplicate<int32_t>(tokenIndices[validExpand], -1, PkiCommon::Align(topk - validExpand, (uint32_t)8));
-        PipeBarrier<PIPE_V>();
+        // 循环结束 outOff == expandRounds*poolSize == tailPos; 本路径 poolSize%8==0,
+        // 每轮恰写 poolSize 个, [tailPos, alignedTotalOut) 保持铺底 -1, 无需缝隙补填
     }
 
     if (visibleTailK > 0) {
-        uint32_t tailPos = topk;
+        // 紧凑布局: tailPos 为 poolSize 倍数且 ps%8==0 -> 32B 对齐成立;
         // 先按 8 对齐清空整个尾区, 再标量精确写尾 token(不可对齐写, 防越出尾区容量)
         Duplicate<int32_t>(tokenIndices[tailPos], -1, PkiCommon::Align(totalOut - tailPos, (uint32_t)8));
         // V→S: -1 向量填充必须先于标量 SetValue 落地
@@ -602,26 +827,25 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ProcessVec1(const PkiCo
     // weightsGm --> weightUB_
     uint64_t gSizeAlign16 = PkiCommon::Align((uint64_t)gSize_, (uint64_t)16);
     int64_t weightGmOffset = info.tensorWeightsOffset + curAivS1Idx * kHeadNum_ * gSize_;
-    DataCopyPadExtParams<W_T> padWeightsParams{true, 0, 0, 0};
-    DataCopyExtParams qwDataCopyExtParams;
-    qwDataCopyExtParams.blockCount = curAivS1ProcNum;
-    qwDataCopyExtParams.blockLen = gSize_ * sizeof(W_T);
-    qwDataCopyExtParams.srcStride = 0;
-    qwDataCopyExtParams.dstStride = (gSizeAlign16 - gSize_) * sizeof(W_T) / 32;
-    DataCopyPad(weightUB_[pingpong * CeilDiv(s1BaseSize_, 2) * gSizeAlign16], weightsGm[weightGmOffset],
-                qwDataCopyExtParams, padWeightsParams);
+    // 组级权重缓存: weights/q_descale 及 w⊙dq 预乘结果在段(同一 gS1 组)内恒定,
+    // 仅段首块刷新到固定槽(单区), 后续块直接复用; 反奇偶 VEC1 事件对保证重写不与上一块 V 竞争
+    if (info.isFirstS2InnerLoop) {
+        // 缓存重写保护: 上一块(反奇偶槽)V 消费完才允许 MTE2 重写(credit 来自上一块尾部
+        // 的 VEC1_V_MTE2 置位; 段首块尾部对同槽补置位一次维持计数平衡, 见函数尾)
+        WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT + (1U - pingpong));
+        DataCopyPadExtParams<W_T> padWeightsParams{true, 0, 0, 0};
+        CopyGmToUbRowsPitched(weightUB_[0], static_cast<uint32_t>(curAivS1ProcNum), static_cast<uint32_t>(gSize_),
+                              static_cast<uint32_t>(gSizeAlign16), weightsGm, weightGmOffset, padWeightsParams);
+    }
 
     if constexpr (LIT::isFp8PerToken) {
         // mode=0: q_descale 与 weights 同 pattern 同 GM 偏移(shape 同构),
-        // dst 行距 128 元素(512B bank 对齐)
-        DataCopyPadExtParams<float> padQScaleParams{true, 0, 0, 0};
-        DataCopyExtParams qScaleDataCopyExtParams;
-        qScaleDataCopyExtParams.blockCount = curAivS1ProcNum;
-        qScaleDataCopyExtParams.blockLen = gSize_ * sizeof(float);
-        qScaleDataCopyExtParams.srcStride = 0;
-        qScaleDataCopyExtParams.dstStride = (128 - gSize_) * sizeof(float) / 32;
-        DataCopyPad(qScaleUB_[pingpong * CeilDiv(s1BaseSize_, 2) * 128], qScaleGm[weightGmOffset],
-                    qScaleDataCopyExtParams, padQScaleParams);
+        // dst 行距 128 元素(512B bank 对齐); 段首随 weights 刷新
+        if (info.isFirstS2InnerLoop) {
+            DataCopyPadExtParams<float> padQScaleParams{true, 0, 0, 0};
+            CopyGmToUbRowsPitched(qScaleUB_[0], static_cast<uint32_t>(curAivS1ProcNum), static_cast<uint32_t>(gSize_),
+                                  128U, qScaleGm, weightGmOffset, padQScaleParams);
+        }
         // k_descale: 每 16 轮 s2BaseSize 乒乓搬运一次((s2Idx-s2Start)%16==0 时刷新),
         // 写入起点 = 乒乓区头 + 本块段偏移, 与读取位置一致
         if ((info.s2Idx - info.s2Start) % 16 == 0) {
@@ -640,6 +864,32 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ProcessVec1(const PkiCo
             kScaleLoop_++;
         }
     }
+    if constexpr (LIT::isInt8) {
+        // int8: q_descale(FP16) 与 weights 同 pattern 同 GM 偏移(shape 同构去 D 轴),
+        // dst 行距 gSizeAlign16(行起点恒 32B 对齐); 行间隙非 32B 整数倍时由
+        // CopyGmToUbRowsPitched 逐行拷贝兜底
+        if (info.isFirstS2InnerLoop) {
+            DataCopyPadExtParams<half> padQScaleHalfParams{true, 0, 0, 0};
+            CopyGmToUbRowsPitched(qScaleHalfUB_[0], static_cast<uint32_t>(curAivS1ProcNum),
+                                  static_cast<uint32_t>(gSize_), static_cast<uint32_t>(gSizeAlign16), qScaleGmHalf,
+                                  weightGmOffset, padQScaleHalfParams);
+        }
+        // k_descale(FP16): 每 16 轮 s2BaseSize 乒乓搬运一次(mode0 同构)
+        if ((info.s2Idx - info.s2Start) % 16 == 0) {
+            uint32_t kScalePingpong = (kScaleLoop_ % 2);
+            uint32_t kScaleBlkOff = ((info.s2Idx - info.s2Start) % 16) * s2BaseSize_;
+            uint32_t getLen = 16 * s2BaseSize_ > (info.actS2Size - info.s2Idx * s2BaseSize_) ?
+                                  (info.actS2Size - info.s2Idx * s2BaseSize_) :
+                                  16 * s2BaseSize_;
+            uint32_t capacity = 16 * s2BaseSize_ - kScaleBlkOff;
+            if (getLen > capacity) {
+                getLen = capacity;
+            }
+            GetKeyScaleHalf(kScaleHalfUB_[kScalePingpong * 16 * s2BaseSize_], info.tensorKeyScaleOffset, info.bIdx,
+                            curS2Idx, getLen, kScaleBlkOff);
+            kScaleLoop_++;
+        }
+    }
 
     SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT + pingpong);
     WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT + pingpong);
@@ -647,28 +897,61 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ProcessVec1(const PkiCo
 
     if constexpr (LIT::isFp8PerToken) {
         // mode=0: weight 半精度 -> fp32 cast × qScale 的 SIMD 向量预乘落 UB,
-        // 替代逐 g 标量循环; 行内 [gSize,64) 补 0(0 与无效 g 语义一致)
-        for (int64_t s1IdxTmp = 0; s1IdxTmp < curAivS1ProcNum; s1IdxTmp++) {
-            uint64_t dstOff = pingpong * CeilDiv(s1BaseSize_, 2) * 128 + s1IdxTmp * 128;
-            Duplicate<float>(weightScaleFp32UB_[dstOff], 0.0f, 128);
+        // 替代逐 g 标量循环; 行内 [gSize,64) 补 0(0 与无效 g 语义一致); 组级缓存仅段首执行
+        if (info.isFirstS2InnerLoop) {
+            for (int64_t s1IdxTmp = 0; s1IdxTmp < curAivS1ProcNum; s1IdxTmp++) {
+                uint64_t dstOff = s1IdxTmp * 128;
+                Duplicate<float>(weightScaleFp32UB_[dstOff], 0.0f, 128);
+            }
+            PipeBarrier<PIPE_V>();
+            for (int64_t s1IdxTmp = 0; s1IdxTmp < curAivS1ProcNum; s1IdxTmp++) {
+                uint64_t srcOff = s1IdxTmp * gSizeAlign16;
+                uint64_t dstOff = s1IdxTmp * 128;
+                // 独立 __simd_vf__ helper: bf16 Cast 需硬件展开,
+                // 内联到普通 __aicore__ 函数不被编译器支持
+                vector1::MulWeightQScaleSIMD((__local_mem__ W_T*)weightUB_[srcOff].GetPhyAddr(),
+                                             (__local_mem__ float*)qScaleUB_[dstOff].GetPhyAddr(),
+                                             (__local_mem__ float*)weightScaleFp32UB_[dstOff].GetPhyAddr());
+            }
+            // V 写落地后, WithScale 的向量 LoadAlign 才能读(同 pipe 有序性足够,
+            // 但跨 ForEachS1 循环保险起见显式 barrier)
+            PipeBarrier<PIPE_V>();
         }
-        PipeBarrier<PIPE_V>();
-        for (int64_t s1IdxTmp = 0; s1IdxTmp < curAivS1ProcNum; s1IdxTmp++) {
-            uint64_t srcOff = pingpong * CeilDiv(s1BaseSize_, 2) * gSizeAlign16 + s1IdxTmp * gSizeAlign16;
-            uint64_t dstOff = pingpong * CeilDiv(s1BaseSize_, 2) * 128 + s1IdxTmp * 128;
-            // 独立 __simd_vf__ helper: bf16 Cast 需硬件展开,
-            // 内联到普通 __aicore__ 函数不被编译器支持
-            vector1::MulWeightQScaleSIMD((__local_mem__ W_T*)weightUB_[srcOff].GetPhyAddr(),
-                                         (__local_mem__ float*)qScaleUB_[dstOff].GetPhyAddr(),
-                                         (__local_mem__ float*)weightScaleFp32UB_[dstOff].GetPhyAddr());
+    }
+    if constexpr (LIT::isInt8) {
+        // int8: weight(half) × q_descale(half) SIMD 预乘, fp16 round-trip 保证与
+        // 与 arch22 half Mul 逐位一致; [gSize,64) 越界读垃圾, BRC 消费端只取
+        // i<gSize, 行内 [64,128) 恒 0(0 与无效 g 语义一致)
+        if (info.isFirstS2InnerLoop) {
+            for (int64_t s1IdxTmp = 0; s1IdxTmp < curAivS1ProcNum; s1IdxTmp++) {
+                uint64_t dstOff = s1IdxTmp * 128;
+                Duplicate<float>(weightScaleFp32UB_[dstOff], 0.0f, 128);
+            }
+            PipeBarrier<PIPE_V>();
+            for (int64_t s1IdxTmp = 0; s1IdxTmp < curAivS1ProcNum; s1IdxTmp++) {
+                uint64_t srcOff = s1IdxTmp * gSizeAlign16;
+                uint64_t dstOff = s1IdxTmp * 128;
+                vector1::MulWeightQScaleSIMDHalf((__local_mem__ half*)weightUB_[srcOff].GetPhyAddr(),
+                                                 (__local_mem__ half*)qScaleHalfUB_[srcOff].GetPhyAddr(),
+                                                 (__local_mem__ float*)weightScaleFp32UB_[dstOff].GetPhyAddr());
+            }
+            PipeBarrier<PIPE_V>();
         }
-        // V 写落地后, WithScale 的向量 LoadAlign 才能读(同 pipe 有序性足够,
-        // 但跨 ForEachS1 循环保险起见显式 barrier)
-        PipeBarrier<PIPE_V>();
     }
 
     for (int64_t s1IdxTmp = 0; s1IdxTmp < curAivS1ProcNum; s1IdxTmp++) {
-        if constexpr (LIT::isFp8PerToken) {
+        if constexpr (LIT::isInt8) {
+            // int8: resMm1UB_ 为 fixpipe 直达的 int32(与 float 同宽 4B), int32 聚合
+            // + ×2^-10 round-trip + Relu + dk/qkScale' 后乘见 WithScaleInt8
+            uint32_t kScalePingpong = ((kScaleLoop_ - 1) % 2);
+            uint32_t kScaleBlkOff = ((info.s2Idx - info.s2Start) % 16) * s2BaseSize_;
+            vector1::MulWeightAndReduceSumWithScaleInt8(
+                vec1OutUB_[pingpong * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ + s1IdxTmp * s2BaseSize_],
+                resMm1UB_.ReinterpretCast<int32_t>()[pingpong * CeilDiv(constInfo_.mBaseSize, 2) * s2BaseSize_ +
+                                                     s1IdxTmp * gSize_ * s2BaseSize_],
+                weightScaleFp32UB_[s1IdxTmp * 128], kScaleHalfUB_[kScalePingpong * 16 * s2BaseSize_ + kScaleBlkOff],
+                gSize_, constInfo_.qkScale);
+        } else if constexpr (LIT::isFp8PerToken) {
             // mode=0: kScale 取本 s2 基本块对应的 float scale(逐 s2 元素;
             // 乒乓区起点 + 块内偏移 (s2Idx-s2Start)%16 * s2BaseSize)
             uint32_t kScalePingpong = ((kScaleLoop_ - 1) % 2);
@@ -676,15 +959,17 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ProcessVec1(const PkiCo
             vector1::MulWeightAndReduceSumWithScale(
                 vec1OutUB_[pingpong * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ + s1IdxTmp * s2BaseSize_],
                 resMm1UB_[pingpong * CeilDiv(constInfo_.mBaseSize, 2) * s2BaseSize_ + s1IdxTmp * gSize_ * s2BaseSize_],
-                weightScaleFp32UB_[pingpong * CeilDiv(s1BaseSize_, 2) * 128 + s1IdxTmp * 128],
-                kScaleUB_[kScalePingpong * 16 * s2BaseSize_ + kScaleBlkOff], gSize_, constInfo_.qkScale);
+                weightScaleFp32UB_[s1IdxTmp * 128], kScaleUB_[kScalePingpong * 16 * s2BaseSize_ + kScaleBlkOff], gSize_,
+                constInfo_.qkScale);
         } else {
             vector1::MulWeightAndReduceSum(
                 vec1OutUB_[pingpong * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ + s1IdxTmp * s2BaseSize_],
                 resMm1UB_[pingpong * CeilDiv(constInfo_.mBaseSize, 2) * s2BaseSize_ + s1IdxTmp * gSize_ * s2BaseSize_],
-                weightUB_[pingpong * CeilDiv(s1BaseSize_, 2) * gSizeAlign16 + s1IdxTmp * gSizeAlign16], gSize_,
-                constInfo_.qkScale);
+                weightUB_[s1IdxTmp * gSizeAlign16], gSize_, constInfo_.qkScale);
         }
+    }
+    if (info.isFirstS2InnerLoop) {
+        SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT + (1U - pingpong));
     }
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT + pingpong);
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
@@ -854,16 +1139,18 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ProcessTopK(const PkiCo
                     // 如果是tok > trunklen, 第一轮每调用topk，是直接拷贝的，所以不需要刷零
                     bool isZeroPadding = (topkCount_ > trunkLen_) ? (loopIdx > 1) : true;
                     if (topkCountAlign256_ != topkCount_ && isZeroPadding) {
+                        // masked Duplicate 单块粒度随键宽变化: u32=64 lane, u16=128 lane
+                        uint32_t dGran = (sizeof(SCORE_T) == 4) ? 64u : 128u;
                         uint64_t mask[1];
                         mask[0] = ~0;
-                        mask[0] = mask[0] << (topkCount_ % 64);
+                        mask[0] = mask[0] << (topkCount_ % dGran);
                         PipeBarrier<PIPE_V>();
-                        // 把topkCount_对齐到64刷0，此处由于duplicate的限制mask[0]刷64个数
-                        Duplicate(mrgValueLocal_[topkCount_ / 64 * 64], zero, mask, 1, 1, 0);
+                        // 把topkCount_对齐到dGran刷0，此处由于duplicate的限制mask[0]刷dGran个数
+                        Duplicate(mrgValueLocal_[topkCount_ / dGran * dGran], zero, mask, 1, 1, 0);
                         PipeBarrier<PIPE_V>();
                         // 把topk剩余对齐到256的部分刷0
-                        Duplicate(mrgValueLocal_[topkCount_ / 64 * 64 + 64], zero,
-                                  topkCountAlign256_ - (topkCount_ / 64 * 64 + 64));
+                        Duplicate(mrgValueLocal_[topkCount_ / dGran * dGran + dGran], zero,
+                                  topkCountAlign256_ - (topkCount_ / dGran * dGran + dGran));
                         SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
                         WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
                     }
@@ -963,6 +1250,74 @@ __aicore__ inline void PoolKeyIndexerServiceVector<LIT>::ProcessTopK(const PkiCo
                                  copyOutValueParams);
         }
         SetFlag<HardEvent::MTE3_V>(TOPK_MTE3_V_EVENT);
+    }
+}
+
+// LD 段搬运——follower 核在其 scoreGm 区行内列 [segS2Lo*s2BaseSize,
+// (segS2Hi+1)*s2BaseSize) 写有本段的 score(sortable key uint32); 列号全局一致,
+// 行→AIV 半区切分仅依赖 (gS1Idx, actS1Size) 逐核一致, 故同列同行为同一
+// (s1 行, s2 池) 的同一分数。本函数把它按 8KB 分块、逐行 GM→UB→GM 中转搬至
+// 本核区同列, 使本核 scoreGm 行与"整段单核计算"逐字节相同(逐位一致论证的
+// 落点)。
+template <typename LIT>
+__aicore__ inline void PoolKeyIndexerServiceVector<LIT>::CopyScoreSegFromCore(uint32_t coreIdx, uint32_t segS2Lo,
+                                                                              uint32_t segS2Hi,
+                                                                              const PkiCommon::RunInfo& info)
+{
+    int64_t curS1Idx = info.gS1Idx * s1BaseSize_;
+    int64_t curS1ProcNum = curS1Idx + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
+    int64_t curAivS1ProcNum = (blockId_ % 2 == 0) ? CeilDiv(curS1ProcNum, 2) : curS1ProcNum / 2;
+    if (curAivS1ProcNum <= 0 || segS2Hi < segS2Lo) {
+        return;
+    }
+
+    uint64_t kSeqSizeAlign = PkiCommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_);
+    // scoreGm 单核区尺寸(kernel Init 同式): [s1BaseSize * Align(kSeqSize, s2BaseSize)]
+    uint64_t singleCoreScoreElems =
+        static_cast<uint64_t>(s1BaseSize_) * PkiCommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_);
+    // 本 AIV 半区行基址(与 ProcessVec1 的 vec1OutGmOffset 同式)
+    uint64_t halfBase = static_cast<uint64_t>(blockId_ % 2) * CeilDiv(s1BaseSize_, 2) * kSeqSizeAlign;
+    uint64_t colLo = static_cast<uint64_t>(segS2Lo) * s2BaseSize_;
+    uint64_t colNum = static_cast<uint64_t>(segS2Hi - segS2Lo + 1) * s2BaseSize_;
+
+    // LD-fix: follower 的跨核尾段已在其区间起始组处理完后转存至 ldTail 暂存区
+    // (follower 常规 scoreGm 区按"组内列"复用, 其后续组写入/自身段首归并会覆盖
+    //  上一段数据, SyncAll 后读取必得到污染数据); 此处改读 ldTail[followerCore]
+    GlobalTensor<SCORE_T> followerGm;
+    // ldTailGm_ 为区域基地址(无本核偏移, 与 scoreGm 的每核视图不同),
+    // follower 槽位按绝对核号索引
+    followerGm.SetGlobalBuffer(
+        (__gm__ SCORE_T*)(ldTailGm_.GetPhyAddr() + static_cast<int64_t>(coreIdx) * singleCoreScoreElems));
+
+    AscendC::DataCopyPadExtParams<SCORE_T> padParams{false, 0, 0, 0};
+    constexpr uint32_t LD_STAGE_COLS = 2048; // 与 InitBuffers 的 ldStageBuf_ 同宽(8KB)
+    for (uint64_t colDone = 0; colDone < colNum; colDone += LD_STAGE_COLS) {
+        uint32_t chunkCols = static_cast<uint32_t>(PkiCommon::Min(colNum - colDone, (uint64_t)LD_STAGE_COLS));
+        uint16_t chunkBytes = static_cast<uint16_t>(chunkCols * sizeof(SCORE_T));
+        AscendC::DataCopyExtParams copyInParams;
+        copyInParams.blockCount = 1;
+        copyInParams.blockLen = chunkBytes;
+        copyInParams.srcStride = 0;
+        copyInParams.dstStride = 0;
+        copyInParams.rsv = 0;
+        AscendC::DataCopyParams copyOutParams;
+        copyOutParams.blockCount = 1;
+        copyOutParams.blockLen = chunkBytes;
+        copyOutParams.srcStride = 0;
+        copyOutParams.dstStride = 0;
+
+        // 检视 P0-1: staging 仅容一行 chunk, 同步必须落在行循环内——逐行
+        // MTE2 读入→同步→MTE3 写出→同步, 行 r+1 的 MTE2 才允许覆写 staging。
+        // (改前该两同步在行循环外: 依序执行的 MTE2 令 staging 只剩最后一行,
+        // MTE3 所有行写出同一份内容, 行 0 数据丢失——s1BaseSize=4 时每半区
+        // 2 行必现。每行两次事件同步开销可接受: 行数=2、chunk 数 ≤ S2/2048)
+        for (int64_t r = 0; r < curAivS1ProcNum; r++) {
+            uint64_t segOffset = halfBase + static_cast<uint64_t>(r) * kSeqSizeAlign + colLo + colDone;
+            AscendC::DataCopyPad(ldStageLocal_, followerGm[segOffset], copyInParams, padParams);
+            Mte2ToMte3Sync(); // staging(MTE2 写)对 MTE3 读可见
+            AscendC::DataCopyPad(scoreGm[segOffset], ldStageLocal_, copyOutParams);
+            Mte3ToMte2Sync(); // staging 可被下一行/下一 chunk 的 MTE2 覆写
+        }
     }
 }
 } // namespace PkiKernel

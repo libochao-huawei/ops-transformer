@@ -25,6 +25,8 @@ constexpr uint32_t ATTR_LAYOUT_K_INDEX = 3;
 constexpr uint32_t ATTR_MASK_MODE_INDEX = 4;
 constexpr uint32_t ATTR_QUANT_MODE_INDEX = 5;
 constexpr uint32_t ATTR_RETURN_VALUE_INDEX = 6;
+// sparse_indices_mode(索引输出布局模式, Version(2) 属性, 仅 aclnnPoolKeyIndexerV2 暴露)
+constexpr uint32_t ATTR_SPARSE_INDICES_MODE_INDEX = 9;
 
 // topk / poolSize constraints (ref aclnn doc)
 constexpr int64_t TOPK_MIN = 1;
@@ -87,9 +89,9 @@ static ge::graphStatus InferShapePoolKeyIndexer(gert::InferShapeContext* context
                                                       "mask_mode should be 0 or 3"),
                 return ge::GRAPH_FAILED);
 
-    OP_CHECK_IF(quantMode != -1 && quantMode != 0 && quantMode != 1,
+    OP_CHECK_IF(quantMode != -1 && quantMode != 0 && quantMode != 1 && quantMode != 2,
                 OP_LOGE_FOR_INVALID_VALUE_WITH_REASON("PoolKeyIndexer", "quant_mode", std::to_string(quantMode).c_str(),
-                                                      "quant_mode should be -1, 0 or 1"),
+                                                      "quant_mode should be -1, 0, 1 or 2"),
                 return ge::GRAPH_FAILED);
 
     // poolSize constraints: [1, 128]
@@ -112,6 +114,17 @@ static ge::graphStatus InferShapePoolKeyIndexer(gert::InferShapeContext* context
                 OP_LOGE_FOR_INVALID_VALUE_WITH_REASON("PoolKeyIndexer", "topk", std::to_string(topk).c_str(),
                                                       "topk must be divisible by pool_size"),
                 return ge::GRAPH_FAILED);
+
+    // sparse_indices_mode(索引输出布局模式, Version(2) 属性): 仅支持 0(legacy) / 1(compact)。
+    // V1 接口运行时属性容器可能不含该项(Version(2) 标记), 守护式读取, 缺省合法。
+    if (attrs->GetAttrNum() > ATTR_SPARSE_INDICES_MODE_INDEX) {
+        const int64_t* modePtr = attrs->GetInt(ATTR_SPARSE_INDICES_MODE_INDEX);
+        OP_CHECK_IF(modePtr != nullptr && *modePtr != 0 && *modePtr != 1,
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON("PoolKeyIndexer", "sparse_indices_mode",
+                                                          std::to_string(*modePtr).c_str(),
+                                                          "sparse_indices_mode should be 0 (legacy) or 1 (compact)"),
+                    return ge::GRAPH_FAILED);
+    }
 
     int64_t outLastDim = topk + poolSize - 1;
     int64_t valuesLastDim = topk / poolSize;

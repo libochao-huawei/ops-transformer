@@ -623,7 +623,7 @@ __aicore__ inline void LiTopKVF(const LocalTensor<uint32_t>& tmpIdxLocal, const 
                                 const LocalTensor<uint32_t>& histogramsLocal, const LocalTensor<uint32_t>& idx0Local,
                                 const LocalTensor<uint32_t>& idx1Local, const LocalTensor<uint32_t>& idx2Local,
                                 const LocalTensor<uint32_t>& idx3Local, const LocalTensor<uint32_t>& nkValueLocal,
-                                uint32_t topK, uint32_t validLen)
+                                uint32_t topK, uint32_t validLen, bool outValue = true)
 {
     __ubuf__ uint32_t* tmpIdxBuf = (__ubuf__ uint32_t*)tmpIdxLocal.GetPhyAddr();
     __ubuf__ uint32_t* outputValueBuf = (__ubuf__ uint32_t*)outputValueLocal.GetPhyAddr();
@@ -665,7 +665,10 @@ __aicore__ inline void LiTopKVF(const LocalTensor<uint32_t>& tmpIdxLocal, const 
     FindIdxEQOutputVFImpl(tmpIdxBuf, inputValueBuf, (uint32_t)(0), nkValueBuf, inputLoopNum);
 
     if constexpr (ISOUTVALUE) {
-        FindValueOutputVFImpl(outputValueBuf, inputValueBuf, tmpIdxBuf, topkLoopNum);
+        // 运行时 outValue: 多轮归并末轮在 return_value=0 时结果无人消费, 跳过 gather
+        if (outValue) {
+            FindValueOutputVFImpl(outputValueBuf, inputValueBuf, tmpIdxBuf, topkLoopNum);
+        }
     }
 }
 
