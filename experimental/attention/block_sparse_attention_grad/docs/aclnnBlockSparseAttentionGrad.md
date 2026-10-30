@@ -128,6 +128,7 @@ aclnnStatus aclnnBlockSparseAttentionGrad(
 ```
 
 ## aclnnBlockSparseAttentionGradGetWorkspaceSize
+
 ## 参数说明
 
 <table style="undefined;table-layout: fixed; width: 1550px">
@@ -486,13 +487,13 @@ aclnnStatus aclnnBlockSparseAttentionGrad(
   - 支持MQA、MHA、GQA场景。
 * actualSeqLengthsOptional与actualSeqLengthsKvOptional相关约束：
 
-  - 当qInputLayout或kvInputLayout 为 非"TND"时，会忽略这两个入参。
+  - 当qInputLayout或kvInputLayout 为非"TND"时，会忽略这两个入参。
 * PerBlockSizeMask（maskType=1）相关约束：
-  - attenMaskOptional 的 shape 必须严格为 [batch, headNum, maxBlockNum, 2]，dtype 必须为 INT32（kernel 按固定 stride 索引，shape/dtype 不一致会导致错误结果）。
-  - maxBlockNum = max(ceilDiv(maxQSeqLength, blockShapeX), ceilDiv(maxKvSeqLength, blockShapeY))，maxQSeqLength/maxKvSeqLength 为各 batch 序列长度最大值（非"TND"时即 shape 的 S 维度）。
-  - actualSizeX ∈ [0, blockShapeX]，actualSizeY ∈ [0, blockShapeY]；块内 [actualSize, blockShape) 视为 padding，actualSize=0 表示该块不参与计算。
-  - PerBlockSizeMask 仅在 blockSparseMaskOptional 对应块为 1 时生效（与块稀疏 mask 求 AND）。
-  - PerBlockSizeMask 路径仅在 ascend950 平台（arch35 实现）支持。
+  - attenMaskOptional的shape必须严格为 [batch, headNum, maxBlockNum, 2]，dtype必须为INT32（kernel 按固定stride索引，shape/dtype 不一致会导致错误结果）。
+  - maxBlockNum = max(ceilDiv(maxQSeqLength, blockShapeX), ceilDiv(maxKvSeqLength, blockShapeY))，maxQSeqLength/maxKvSeqLength为各batch序列长度最大值（非"TND"时即shape的S维度）。
+  - actualSizeX ∈ [0, blockShapeX]，actualSizeY ∈ [0, blockShapeY]；块内 [actualSize, blockShape) 视为padding，actualSize=0 表示该块不参与计算。
+  - PerBlockSizeMask仅在 blockSparseMaskOptional 对应块为 1 时生效（与块稀疏mask求AND）。
+  - PerBlockSizeMask路径仅在ascend950平台（arch35 实现）支持。
 
 * 不支持确定性计算场景。
 

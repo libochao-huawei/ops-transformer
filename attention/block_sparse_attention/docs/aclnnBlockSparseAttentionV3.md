@@ -34,17 +34,17 @@
 
   BlockSparseAttentionV3输入query、key、value的数据排布格式支持从多种维度排布解读，可通过qInputLayout和kvInputLayout传入。
 
-  - B：表示输入样本批量大小（Batch）
-  - T：B和S合轴紧密排列的长度（Total tokens）
-  - S：表示输入样本序列长度（Seq-Length）
-  - H：表示隐藏层的大小（Head-Size）
-  - N：表示多头数（Head-Num）
-  - D：表示隐藏层最小的单元尺寸，需满足D=H/N（Head-Dim）
+    - B：表示输入样本批量大小（Batch）
+    - T：B和S合轴紧密排列的长度（Total tokens）
+    - S：表示输入样本序列长度（Seq-Length）
+    - H：表示隐藏层的大小（Head-Size）
+    - N：表示多头数（Head-Num）
+    - D：表示隐藏层最小的单元尺寸，需满足D=H/N（Head-Dim）
 
   当前支持的布局：
 
-  - qInputLayout: "TND"、"BNSD"；"BSND"仅<term>Ascend 950PR&950DT系列产品</term>支持
-  - kvInputLayout: "TND"、"BNSD"；"BSND"仅<term>Ascend 950PR&950DT系列产品</term>支持
+    - qInputLayout: "TND"、"BNSD"；"BSND"仅<term>Ascend 950PR&950DT系列产品</term>支持
+    - kvInputLayout: "TND"、"BNSD"；"BSND"仅<term>Ascend 950PR&950DT系列产品</term>支持
 
 <!-- npu="950" id10 -->
 - **MXFP4/MXFP8特性说明(仅<term>Ascend 950PR&950DT系列产品</term>支持)**
@@ -308,7 +308,7 @@ aclnnStatus aclnnBlockSparseAttentionV3(
         当配置此输入时：
         <ul>
           <li>当quantMode=1, shape为[batch, headNum, ceilDiv(maxQSeqLength, 128), 1]。</li>
-  		   <li>quantMode=2/3/4, 约束见<a href="#MXFP4量化模式的量化缩放因子">MX量化模式的量化缩放因子。</a></li>
+          <li>quantMode=2/3/4, 约束见<a href="#MXFP4量化模式的量化缩放因子">MX量化模式的量化缩放因子。</a></li>
           <li>当quantMode=5时，必须传入FLOAT32类型的per-tensor反量化缩放因子，shape为[1]，所有batch、head及token共用一个缩放因子。</li>
         </ul>
       </td>
@@ -330,7 +330,7 @@ aclnnStatus aclnnBlockSparseAttentionV3(
         当配置此输入时：
         <ul>
           <li>当quantMode=1,shape为[batch, kvHeadNum, ceilDiv(maxKVSeqLength, 256), 1]或shape为[batch, kvHeadNum, ceilDiv(maxKVSeqLength, 512), 1]。</li>
-  		 <li>quantMode=2/3/4, 约束见<a href="#MXFP4量化模式的量化缩放因子">MX量化模式的量化缩放因子。</a></li>
+          <li>quantMode=2/3/4, 约束见<a href="#MXFP4量化模式的量化缩放因子">MX量化模式的量化缩放因子。</a></li>
           <li>当quantMode=5时，必须传入FLOAT32类型的per-tensor反量化缩放因子，shape为[1]，所有batch、head及token共用一个缩放因子。</li>
         </ul>
       </td>
@@ -482,7 +482,7 @@ aclnnStatus aclnnBlockSparseAttentionV3(
     <tr>
       <td>softmaxLseFlag（int64_t）</td>
       <td>输入</td>
-      <td>是否使能softmaxLse输出的标志位。</td>
+      <td>是否启动softmaxLse输出的标志位。</td>
       <td>
         当前只支持传0或1。
         <ul>

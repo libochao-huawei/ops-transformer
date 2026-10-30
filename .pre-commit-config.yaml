@@ -64,7 +64,7 @@ repos:
         entry: bash scripts/run_codespell.sh
         args: [
             "-L",
-            "CANN,cann,NNAL,nnal,ASCEND,ascend,EnQue,CopyIn,ArchType,AND,ND,tbe,copyin,alog,wIh,dout,indexs,inH,padD,outWeight",
+            "CANN,cann,NNAL,nnal,ASCEND,ascend,EnQue,CopyIn,ArchType,AND,ND,tbe,copyin,alog,wIh,dout,indexs,inH,padD,outWeight,nD,pRes,queryIn,QueryS,outOut",
           ]
 
   # 新增/重命名头文件 basename 重名拦截

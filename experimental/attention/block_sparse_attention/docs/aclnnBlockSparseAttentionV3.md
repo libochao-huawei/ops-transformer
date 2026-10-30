@@ -1,3 +1,5 @@
+# aclnnBlockSparseAttentionV3
+
 ## 产品支持情况
 
 <!-- npu="950" id1 -->
@@ -32,17 +34,18 @@
 
   BlockSparseAttentionV2输入query、key、value的数据排布格式支持从多种维度解读，可通过qInputLayout和kvInputLayout传入。
 
-  - B：表示输入样本批量大小（Batch）
-  - T：B和S合轴紧密排列的长度（Total tokens）
-  - S：表示输入样本序列长度（Seq-Length）
-  - H：表示隐藏层的大小（Head-Size）
-  - N：表示多头数（Head-Num）
-  - D：表示隐藏层最小的单元尺寸，需满足D=H/N（Head-Dim）
+      - B：表示输入样本批量大小（Batch）
+      - T：B和S合轴紧密排列的长度（Total tokens）
+      - S：表示输入样本序列长度（Seq-Length）
+      - H：表示隐藏层的大小（Head-Size）
+      - N：表示多头数（Head-Num）
+      - D：表示隐藏层最小的单元尺寸，需满足D=H/N（Head-Dim）
 
-  当前支持的布局：
+    当前支持的布局：
 
-  - qInputLayout: "TND" "BNSD" "BSND"
-  - kvInputLayout: "TND" "BNSD" "BSND"
+      - qInputLayout: "TND" "BNSD" "BSND"
+      - kvInputLayout: "TND" "BNSD" "BSND"
+
 - **MXFP4特性说明(仅Ascend 950PR&950DT系列产品支持)**
 
   本接口新增支持MXFP4数据类型(FLOAT4_E2M1)的输入，以提供计算效率并降低显存占用。当使用MXFP4输入时，需要提供相应的量化缩放因子用于反量化计算。
@@ -303,8 +306,8 @@ aclnnStatus aclnnBlockSparseAttentionV3(
         </ul>
         当配置此输入时：
         <ul>
-          <li>当quantMode=1, shape为[batch, headNum, ceilDiv(maxQSeqLength, 128), 1]。</li>
-  		   <li>quantMode=2/3, 约束见<a href="#MXFP4量化模式的量化缩放因子">MXFP4量化模式的量化缩放因子。</a></li>
+            <li>当quantMode=1, shape为[batch, headNum, ceilDiv(maxQSeqLength, 128), 1]。</li>
+            <li>quantMode=2/3, 约束见<a href="#MXFP4量化模式的量化缩放因子">MXFP4量化模式的量化缩放因子。</a></li>
         </ul>
       </td>
       <td>FLOAT32、FLOAT8_E8M0</td>
@@ -325,8 +328,8 @@ aclnnStatus aclnnBlockSparseAttentionV3(
         </ul>
         当配置此输入时：
         <ul>
-          <li>当quantMode=1,shape为[batch, kvHeadNum, ceilDiv(maxKVSeqLength, 256), 1]或shape为[batch, kvHeadNum, ceilDiv(maxKVSeqLength, 512), 1]。</li>
-  		 <li>quantMode=2/3, 约束见<a href="#MXFP4量化模式的量化缩放因子">MXFP4量化模式的量化缩放因子。</a></li>
+            <li>当quantMode=1,shape为[batch, kvHeadNum, ceilDiv(maxKVSeqLength, 256), 1]或shape为[batch, kvHeadNum, ceilDiv(maxKVSeqLength, 512), 1]。</li>
+            <li>quantMode=2/3, 约束见<a href="#MXFP4量化模式的量化缩放因子">MXFP4量化模式的量化缩放因子。</a></li>
         </ul>
       </td>
       <td>FLOAT32、FLOAT8_E8M0</td>
@@ -476,7 +479,7 @@ aclnnStatus aclnnBlockSparseAttentionV3(
     <tr>
       <td>softmaxLseFlag（int64_t）</td>
       <td>输入</td>
-      <td>是否使能softmaxLse输出的标志位。</td>
+      <td>是否启动softmaxLse输出的标志位。</td>
       <td>
         当前只支持传0或1。
         <ul>

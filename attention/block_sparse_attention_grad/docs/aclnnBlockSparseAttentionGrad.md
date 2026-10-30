@@ -29,8 +29,8 @@
 
 ## 功能说明
 
-* ​算子功能​：aclnnBlockSparseAttention稀疏注意力反向计算，支持灵活的块级稀疏模式，通过BlockSparseMask指定每个Q块选择的KV块，实现高效的稀疏注意力计算。
-* ​计算公式​：
+- ​算子功能​：aclnnBlockSparseAttention稀疏注意力反向计算，支持灵活的块级稀疏模式，通过BlockSparseMask指定每个Q块选择的KV块，实现高效的稀疏注意力计算。
+- ​计算公式​：
 
   稀疏块大小为 $blockShapeX×blockShapeY$，其中blockShapeX表示Q方向的稀疏粒度，blockShapeY表示KV方向的稀疏粒度。两个方向的粒度相互独立，可以配置为不同值。
 
@@ -89,17 +89,17 @@
 
 BlockSparseAttentionGrad输入dout、query、key、value, attentionOut的数据排布格式支持从多种维度排布解读，可通过qInputLayout和kvInputLayout传入。为了方便理解后续支持的具体排布格式（如 BNSD、TND 等），此处先对排布格式中各缩写字母所代表的维度含义进行统一说明：
 
-* B：表示输入样本批量大小（Batch）
-* T：B和S合轴紧密排列的长度（Total tokens）
-* S：表示输入样本序列长度（Seq-Length）
-* H：表示隐藏层的大小（Head-Size）
-* N：表示多头数（Head-Num）
-* D：表示隐藏层最小的单元尺寸，需满足D=H/N（Head-Dim）
+- B：表示输入样本批量大小（Batch）
+- T：B和S合轴紧密排列的长度（Total tokens）
+- S：表示输入样本序列长度（Seq-Length）
+- H：表示隐藏层的大小（Head-Size）
+- N：表示多头数（Head-Num）
+- D：表示隐藏层最小的单元尺寸，需满足D=H/N（Head-Dim）
 
 当前支持的布局：
 
-* qInputLayout: "TND" "BNSD" "BSND"
-* kvInputLayout: "TND" "BNSD" "BSND"
+- qInputLayout: "TND" "BNSD" "BSND"
+- kvInputLayout: "TND" "BNSD" "BSND"
 
 - <term>Atlas A2训练系列产品</term>、<term>Atlas A3训练系列产品</term>:
 不支持"BSND"。
@@ -419,7 +419,7 @@ aclnnStatus aclnnBlockSparseAttentionGrad(
   - <term>Ascend 950PR&950DT系列产品</term>：maskType不支持等于1；attenMaskOptional输入会被忽略，该输入应该传nullptr。
   <!-- end id9 -->
 
-* **返回值**：
+- **返回值**：
 
   aclnnStatus：返回状态码，具体参见[aclnn返回码](../../../docs/zh/context/aclnn_return_code.md)。
 
@@ -464,7 +464,7 @@ aclnnStatus aclnnBlockSparseAttentionGrad(
 
 ## aclnnBlockSparseAttentionGrad
 
-* **参数说明：**
+- **参数说明：**
 
   <table style="undefined;table-layout: fixed; width: 953px"><colgroup>
   <col style="width: 173px">
@@ -501,19 +501,19 @@ aclnnStatus aclnnBlockSparseAttentionGrad(
   </tbody>
   </table>
 
-* **返回值：**
+- **返回值：**
 
   aclnnStatus：返回状态码，具体参见[aclnn返回码](../../../docs/zh/context/aclnn_return_code.md)。
 
 ## 约束说明
 
-* 该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。
-* actualSeqLengthsOptional在qInputLayout为“TND”时必选；actualSeqLengthsKvOptional在kvInputLayout为“TND”时必选。
-* softmaxLse的layout需要与query的layout保持一致。如果query的layout为"BSND"时，softmaxLse的layout应传入"BNS1"。
-* HeadDim必须等于128。
-* blockShapeOptional中的blockShapeX和blockShapeY分别表示Q方向和KV方向的稀疏粒度。两者均必须大于等于16且为16的整数倍，可以配置为不同值；BlockSparseMask的Q块数和KV块数应分别按照对应方向的稀疏粒度计算。
-* 根据算子支持的输入 Layout，query 张量 Shape 中对应的 head 维度大小记为 N1，key 和 value 张量 Shape 中对应的 head 维度大小记为 N2。必须满足N1 % N2 == 0。 支持MQA、MHA、GQA场景。
-* actualSeqLengthsOptional与actualSeqLengthsKvOptional相关约束：当qInputLayout或kvInputLayout 为非"TND"时，会忽略这两个入参。
+- 该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。
+- actualSeqLengthsOptional在qInputLayout为“TND”时必选；actualSeqLengthsKvOptional在kvInputLayout为“TND”时必选。
+- softmaxLse的layout需要与query的layout保持一致。如果query的layout为"BSND"时，softmaxLse的layout应传入"BNS1"。
+- HeadDim必须等于128。
+- blockShapeOptional中的blockShapeX和blockShapeY分别表示Q方向和KV方向的稀疏粒度。两者均必须大于等于16且为16的整数倍，可以配置为不同值；BlockSparseMask的Q块数和KV块数应分别按照对应方向的稀疏粒度计算。
+- 根据算子支持的输入 Layout，query 张量 Shape 中对应的 head 维度大小记为 N1，key 和 value 张量 Shape 中对应的 head 维度大小记为 N2。必须满足N1 % N2 == 0。 支持MQA、MHA、GQA场景。
+- actualSeqLengthsOptional与actualSeqLengthsKvOptional相关约束：当qInputLayout或kvInputLayout 为非"TND"时，会忽略这两个入参。
 
 ## 调用示例
 

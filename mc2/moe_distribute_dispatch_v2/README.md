@@ -77,7 +77,7 @@ $$
 ・
 相较于`MoeDistributeDispatch`算子，该算子变更如下：
 
-- 输出了更详细的token信息辅助`CombineV2`系列算子高效地进行全卡同步，因此原算子中shape为(`BS` * `K`,)的`expandIdx`出参替换为shape为(`A` * 128,)的`assistInfoForCombineOut`参数；
+- 输出了更详细的token信息辅助`CombineV2`系列算子高效地进行全卡同步，因此原算子中shape为(`BS` * `K`,)的`expandIdx`出参替换为shape为(`A`* 128,)的`assistInfoForCombineOut`参数；
 - 新增`commAlg`入参，代替`HCCL_INTRA_PCIE_ENABLE`和`HCCL_INTRA_ROCE_ENABLE`环境变量。
 
 详细说明请参考以下参数说明。
@@ -378,7 +378,7 @@ $$
             - "hierarchy"：token数据经过跨机、机内两次发送，仅不同server同号卡之间使用RDMA通信，server内使用HCCS通信。
         - `epWorldSize`：依commAlg取值，"fullmesh"支持2、3、4、5、6、7、8、16、32、64、128、192、256、384；"hierarchy"支持16、32、64。
         - `moeExpertNum`：依commAlg取值，"fullmesh"支持(0, 1024]，"hierarchy"支持(0, 512]。
-        - `epRecvCountsOut`：要求shape为(`moeExpertNum` + 2 * `globalBs` * `K` * `serverNum`,)，前`moeExpertNum`个数表示从EP通信域各卡接收的token数，2 * `globalBs` * `K` * `serverNum`存储了机间机内做通信前combine可以提前做reduce的token个数和token在通信区中的偏移，`globalBs`传入0时在此处应当按照`BS` * `epWorldSize`计算。
+        - `epRecvCountsOut`：要求shape为(`moeExpertNum` + 2*`globalBs`* `K` *`serverNum`,)，前`moeExpertNum`个数表示从EP通信域各卡接收的token数，2* `globalBs` *`K`* `serverNum`存储了机间机内做通信前combine可以提前做reduce的token个数和token在通信区中的偏移，`globalBs`传入0时在此处应当按照`BS` * `epWorldSize`计算。
         - `performanceInfoOptional`：可选择传入有效数据或填空指针，传入空指针时表示不开启记录通信耗时功能；当传入有效数据时，要求是一个1D的Tensor，shape为(ep\_world\_size,)，数据类型支持int64；数据格式要求为ND。
     - `HCCL_INTRA_PCIE_ENABLE`和`HCCL_INTRA_ROCE_ENABLE`：不推荐使用该环境变量控制通信算法，原`HCCL_INTRA_PCIE_ENABLE`=1&&`HCCL_INTRA_ROCE_ENABLE`=0场景，下文均通过`commAlg` = "hierarchy"替代，默认场景使用`commAlg` = "fullmesh"替代。
     - `commAlg`配置"hierarchy"时，不支持`scalesOptional`、`xActiveMaskOptional`、`oriXOptional`、`zeroExpertNum`、`copyExpertNum`。

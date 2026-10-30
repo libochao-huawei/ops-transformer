@@ -1,0 +1,915 @@
+# aclnnMhcPreBackwardV2
+
+<!-- md-trans-meta sourceCommit=unknown translatedAt=2026-09-22T14:54:31.889Z -->
+
+## Applicable Products
+
+<!-- npu="950" id1 -->
+- <term>Ascend 950PR&950DT products</term>: Supported
+<!-- end id1 -->
+<!-- npu="A3" id2 -->
+- <term>Atlas A3 products</term>: Not supported
+<!-- end id2 -->
+<!-- npu="910b" id3 -->
+- <term>Atlas A2 products</term>: Not supported
+<!-- end id3 -->
+<!-- npu="310b" id4 -->
+- <term>Atlas 200I/500 A2 inference products</term>: Not supported
+<!-- end id4 -->
+<!-- npu="310p" id5 -->
+- <term>Atlas inference products</term>: Not supported
+<!-- end id5 -->
+<!-- npu="910" id6 -->
+- <term>Atlas training products</term>: Not supported
+<!-- end id6 -->
+
+## Function
+
+- Description: MhcPreBackward is the backward operator of MhcPre. Through a series of computations, the MhcPre operator obtains the $H^{res}$ and $H^{post}$ projection matrices in the mHC (Manifold-Constrained Hyper-Connections) architecture and the layer input matrix $h^{in}$ of the Atten or MLP layer.
+
+- Compared with [aclnnMhcPreBackward](aclnnMhcPreBackward_en.md), this API adds the `opImplMode` parameter to specify the computation mode of the MhcPreBackward operator:
+  - `opImplMode=0`: FP32 mode computation in the Cube.
+  - `opImplMode=1`: HF32 mode computation in the Cube.
+
+- Formula:
+
+  - Output combined gradient computation:
+
+    - Forward formula:
+
+      $$
+      H\_in = \sum_{i=1}^{N} x[{B,S,i,:}] · H\_pre_n[B,S,i]
+      $$
+
+    - Backward computation:
+
+      $$
+      \begin{aligned}
+      H\_pre\_grad &= \text{Reduce}\left(H\_in\_grad.\text{unsqueeze}(-2) \odot x, \text{dim}=-1\right) \quad ([B,S,N]) \\
+      x\_grad\_vec3 &= H\_in\_grad \times H\_pre \quad ([B,S,N,D])
+      \end{aligned}
+      $$
+
+  - Sigmoid gated backward (H_pre):
+    - Forward formula:
+
+      $$
+      H\_pre = \text{Sigmoid}(\alpha\_pre * H\_pre\_1 + bias\_pre) + hc\_eps
+      $$
+
+    - Backward computation:
+
+      $$
+      \begin{aligned}
+      s &= H\_pre - hc\_eps \\
+      H\_pre\_2\_grad &= H\_pre\_grad \odot s \odot (1 - s) \\
+      H\_pre\_1\_grad &= H\_pre\_2\_grad \cdot \alpha\_pre \\
+      \alpha\_pre\_grad &= \sum_{b,s,n}^{B,S,N} \left(H\_pre\_2\_grad \cdot H\_pre\_1\right) \\
+      bias\_pre\_grad &= \sum_{b,s}^{B,S} H\_pre\_2\_grad \quad ([N])
+      \end{aligned}
+      $$
+
+  - Sigmoid gating backward (H_post):
+    - Forward formula:
+
+      $$
+      H\_post = \text{Sigmoid}(\alpha\_post * H\_post\_1 + bias\_post) * 2
+      $$
+
+    - Backward computation:
+
+      $$
+      \begin{aligned}
+      H\_post\_2\_grad &= H\_post\_grad \odot \left(H\_post \cdot \left(1 - \frac{H\_post}{2}\right)\right) \\
+      H\_post\_1\_grad &= H\_post\_2\_grad \cdot \alpha_{post} \\
+      \alpha_{post\_grad} &= \sum_{b,s,n}^{B,S,N} \left(H\_post\_2\_grad \cdot H_{post\_1}\right) \\
+      bias\_post\_grad &= \sum_{b,s}^{B,S} H\_post\_2\_grad \quad ([N])
+      \end{aligned}
+      $$
+
+  - Residual connection backward (H_res):
+    - Forward formula:
+
+      $$
+      H\_res = \alpha\_res * H\_res\_1 + bias\_res
+      $$
+
+    - Backward computation:
+
+      $$
+      \begin{aligned}
+      H\_res\_2\_grad &= H\_res\_grad \cdot \alpha_{res} \quad ([B,S,N,N]) \\
+      \alpha\_res\_grad &= \sum_{b,s,i,j}^{B,S,N,N} \left(H\_res\_grad \cdot H\_res\_2\right) \\
+      bias\_res\_grad &= \sum_{b,s}^{B,S} H\_res\_grad \quad ([N,N]) \\
+      H\_res\_1\_grad &= \text{Reshape}(H\_res\_2\_grad) \quad ([B,S,N^2])
+      \end{aligned}
+      $$
+
+  - RMSNorm Fusion backward:
+    - Forward formula:
+
+      $$
+      H\_mix\_tmp = H\_mix * inv\_rms
+      $$
+
+    - Backward computation:
+
+      $$
+      \begin{aligned}
+      H\_mix\_tmp\_grad &= \text{Concat}(H\_pre\_1\_grad, H\_post\_1\_grad, H\_res\_1\_grad) \quad ([B,S,2N+N^2]) \\
+      H\_mix\_grad &= H\_mix\_tmp\_grad \cdot inv\_rms \\
+      inv\_rms_{grad} &= \sum_{\text{last\_dim}} \left(H\_mix\_tmp\_grad \cdot H\_mix\right) \quad ([B,S,1])
+      \end{aligned}
+      $$
+
+  - Matrix multiplication backward:
+    - Forward formula:
+
+      $$
+      H\_mix = x\_rs @ phi^T
+      $$
+
+      $$
+      x\_rs = x * gamma
+      $$
+
+    - Backward computation:
+
+      $$
+      \begin{aligned}
+      x\_rs\_grad &= H\_mix\_grad @ phi \quad ([B,S,ND]) \\
+      X &= \text{Reshape}(x\_rs, [B\cdot S, ND]) \\
+      G &= \text{Reshape}(H\_mix\_grad, [B\cdot S, 2N+N^2]) \\
+      phi_{grad} &= G^T @ X \quad ([2N+N^2, ND])
+      \end{aligned}
+      $$
+
+  - Feature scaling backward:
+    - Forward formula:
+
+      $$
+      x\_rs = x * gamma
+      $$
+
+    - Backward computation:
+
+      $$
+      \begin{aligned}
+      x\_grad\_mm &= x\_rs\_grad * gamma \\
+      gamma\_grad &= \sum_{b=1}^{B}\sum_{s=1}^{S} (x * x\_rs\_grad)\quad ([N,D])
+      \end{aligned}
+      $$
+
+  - RMS normalization gradient computation:
+    - Forward formula:
+
+      $$
+      inv\_rms = \frac{1}{\sqrt{\frac{1}{n}\sum_{i=1}^{n}x_i^2 + eps}}, \quad where \ n = N * D
+      $$
+
+    - Backward computation:
+
+      $$
+      \begin{aligned}
+      x\_rs\_grad\_inv &= - \left(\frac{inv\_rms\_grad \cdot {inv\_rms}^3}{N*D}\right) \cdot x\_rs \\
+      x\_rs\_grad &= x\_grad\_mm + x\_rs\_grad\_inv \\
+      x\_grad\_vec1 &= \text{Reshape}(x\_rs\_grad, [B,S,N,D]) \\
+      x\_grad &= x\_grad\_vec3 + x\_grad\_vec1
+      \end{aligned}
+      $$
+
+  - Fusion of the grad_x addition operation of mhc_post:
+
+    $$
+    \begin{aligned}
+    x\_grad &= x\_grad + grad\_x\_post
+    \end{aligned}
+    $$
+
+## Function Prototype
+
+Each operator uses a [two-phase API](../../../docs/en/context/two_phase_api.md). You must first call the "aclnnMhcPreBackwardV2GetWorkspaceSize" API to obtain the workspace size required for the computation and the executor that contains the computation process of the operator, and then call the "aclnnMhcPreBackwardV2" API to perform the computation.
+
+```cpp
+aclnnStatus aclnnMhcPreBackwardV2GetWorkspaceSize(
+    const aclTensor     *x,
+    const aclTensor     *phi,
+    const aclTensor     *alpha,
+    const aclTensor     *gradHIn,
+    const aclTensor     *gradHPost,
+    const aclTensor     *gradHRes,
+    const aclTensor     *invRms,
+    const aclTensor     *hMix,
+    const aclTensor     *hPre,
+    const aclTensor     *hPost,
+    const aclTensor     *gammaOptional,
+    const aclTensor     *gradXPostOptional,
+    float               hcEps,
+    int64_t             opImplMode,
+    const aclTensor     *gradX,
+    const aclTensor     *gradPhi,
+    const aclTensor     *gradAlpha,
+    const aclTensor     *gradBias,
+    const aclTensor     *gradGamma,
+    uint64_t            *workspaceSize,
+    aclOpExecutor       **executor)
+```
+
+```cpp
+aclnnStatus aclnnMhcPreBackwardV2(
+    void             *workspace,
+    uint64_t          workspaceSize,
+    aclOpExecutor    *executor,
+    aclrtStream       stream)
+```
+
+## aclnnMhcPreBackwardV2GetWorkspaceSize
+
+- **Parameters:**
+
+    <table style="undefined;table-layout: fixed; width: 1550px">
+        <colgroup>
+            <col style="width: 220px">
+            <col style="width: 120px">
+            <col style="width: 200px">
+            <col style="width: 400px">
+            <col style="width: 212px">
+            <col style="width: 100px">
+            <col style="width: 290px">
+            <col style="width: 145px">
+            </colgroup>
+        <thead>
+        <tr>
+            <th>Parameter</th>
+            <th>Input/Output</th>
+            <th>Description</th>
+            <th>Instruction</th>
+            <th>Data Type</th>
+            <th>Data Format</th>
+            <th>Dimension (shape)</th>
+            <th>Non-contiguous Tensor</th>
+        </tr></thead>
+        <tbody>
+        <tr>
+            <td>x (aclTensor*)</td>
+            <td>Input</td>
+            <td>Data to be computed, representing the mHC layer input data in the network.</td>
+            <td><ul><li>Does not support null tensors.</li><li>The shape is (B, S, N, D) or (T, N, D), where B supports generalization, S supports generalization, and T=B*S.</li></ul></td>
+            <td>BFLOAT16, FLOAT16</td>
+            <td>ND</td>
+            <td>3-4</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>phi (aclTensor*)</td>
+            <td>Input</td>
+            <td>Parameter matrix of mHC.</td>
+            <td><ul><li>Does not support null Tensor.</li><li>Shape is (2N+N*N, N*D) or (2N+N!, N*D), where N remains consistent with the N of `x`; D remains consistent with the D of `x`.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>alpha (aclTensor*)</td>
+            <td>Input</td>
+            <td>Scaling parameter alpha of mHC.</td>
+            <td><ul><li>Does not support null Tensor.</li><li>Shape is (3).</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>1</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>gradHIn (aclTensor*)</td>
+            <td>Input</td>
+            <td>hIn serves as the layer input of the Atten/MLP layer. Gradient corresponding to the forward output hIn.</td>
+            <td><ul><li>Does not support null tensors.</li><li>The shape is (B, S, D) or (T, D), where B remains consistent with B of `x`; S remains consistent with S of `x`; T=B*S; D remains consistent with D of `x`.</li></ul></td>
+            <td>BFLOAT16, FLOAT16</td>
+            <td>ND</td>
+            <td>2-3</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>gradHPost (aclTensor*)</td>
+            <td>Input</td>
+            <td>Corresponding gradient of the forward output hPost.</td>
+            <td><ul><li>Does not support null Tensor.</li><li>The shape is (B,S,N) or (T,N), where B, S, and N must remain consistent with those of `x`, and T=B*S.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2-3</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>gradHRes (aclTensor*)</td>
+            <td>Input</td>
+            <td>Gradient corresponding to the forward output hRes.</td>
+            <td><ul><li>Does not support null tensors.</li><li>The shape is (B, S, N, N), (T, N, N), (B, S, N!), or (T, N!), where B remains consistent with B in `x`; S remains consistent with S in `x`; T=B*S; and N remains consistent with N in `x`. N! denotes the number of permutations of N (for example, N!=24 when N=4).</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2-4</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>invRms (aclTensor*)</td>
+            <td>Input</td>
+            <td>invRms of the forward RmsNorm computation.</td>
+            <td><ul><li>Does not support null Tensor.</li><li>The shape is (B, S) or (T), where B remains consistent with the B of `x`, S remains consistent with the S of `x`, and T=B*S.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>1-2</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>hMix (aclTensor*)</td>
+            <td>Input</td>
+            <td>Result of x@phi on the forward computation stream.</td>
+            <td><ul><li>Does not support null Tensor.</li><li>The shape is (B, S, 2N+N*N), (B, S, 2N+N!), (T, 2N+N*N), or (T, 2N+N!), where B remains consistent with the B of `x`, S remains consistent with the S of `x`, T=B*S, and N remains consistent with the N of `x`. The last dimension must remain consistent with dimension 0 (fusionSize) of `phi`.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2-3</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>hPre (aclTensor*)</td>
+            <td>Input</td>
+            <td>hPre matrix after the forward sigmoid computation.</td>
+            <td><ul><li>Does not support null tensors.</li><li>The shape is (B, S, N) or (T, N), where B remains consistent with the B of `x`; S remains consistent with the S of `x`; T=B*S; and N remains consistent with the N of `x`.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2-3</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>hPost(aclTensor*)</td>
+            <td>Input</td>
+            <td>Forward hPost output.</td>
+            <td><ul><li>Does not support null Tensor.</li><li>The shape is (B, S, N) or (T, N), where B remains consistent with B of `x`, S remains consistent with S of `x`, T = B*S, and N remains consistent with N of `x`.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2-3</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>gammaOptional(aclTensor*)</td>
+            <td>Optional input</td>
+            <td>Scaling factor gamma of RmsNorm.</td>
+            <td><ul><li>Does not support null tensors.</li><li>If nullptr is passed in, it indicates an all-1 tensor.</li><li>The shape is (N, D), where N remains consistent with N of `x` and D remains consistent with D of `x`.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>gradXPostOptional (aclTensor*)</td>
+            <td>Optional input</td>
+            <td>gradX of the post backward output.</td>
+            <td><ul><li>Does not support null tensors.</li><li>If nullptr is passed in, it indicates an all-zero tensor.</li><li>The shape is (B, S, N, D) or (T, N, D), where B must remain consistent with the B of `x`; S must remain consistent with the S of `x`; T=B*S; N must remain consistent with the N of `x`; and D must remain consistent with the D of `x`.</li></ul></td>
+            <td>BFLOAT16, FLOAT16</td>
+            <td>ND</td>
+            <td>3-4</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>hcEps (float)</td>
+            <td>Optional input</td>
+            <td>eps parameter of HPre after sigmoid.</td>
+            <td>           <li>The recommended value is 1e-6.</li>
+            </td>
+            <td>FLOAT32</td>
+            <td>-</td>
+            <td>-</td>
+            <td>-</td>
+        </tr>
+        <tr>
+            <td>opImplMode (int64_t)</td>
+            <td>Input</td>
+            <td>Cube computation mode of the MhcPreBackward operator.</td>
+            <td><ul><li>If the value is 0, Cube uses FP32 mode computation.</li><li>If the value is 1, Cube uses HF32 mode computation.</li><li>Other values are not supported.</li></ul></td>
+            <td>INT64</td>
+            <td>-</td>
+            <td>-</td>
+            <td>-</td>
+        </tr>
+        <tr>
+            <td>gradX (aclTensor*)</td>
+            <td>Output</td>
+            <td>Corresponding gradient of x.</td>
+            <td><ul><li>Does not support null Tensor.</li><li>Dimensions and data type remain consistent with input x.</li><li>The shape is (B, S, N, D) or (T, N, D), where B remains consistent with B of `x`; S remains consistent with S of `x`; T=B*S; N remains consistent with N of `x`; and D remains consistent with D of `x`.</li></ul></td>
+            <td>BFLOAT16, FLOAT16</td>
+            <td>ND</td>
+            <td>3-4</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>gradPhi (aclTensor*)</td>
+            <td>Output</td>
+            <td>The corresponding gradient of phi.</td>
+            <td><ul><li>Does not support null Tensor.</li><li>Dimensions remain consistent with input phi.</li><li>The shape is (2N+N*N, N*D) or (2N+N!, N*D). N remains consistent with the N of `x`; D remains consistent with the D of `x`. The shape remains consistent with `phi`.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>gradAlpha (aclTensor*)</td>
+            <td>Output</td>
+            <td>The corresponding gradient of alpha.</td>
+            <td><ul><li>Does not support null tensors.</li><li>Remains consistent with the input alpha dimension.</li><li>The shape is (3).</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>1</td>
+            <td>√</td>
+        </tr>
+          <tr>
+            <td>gradBias (aclTensor*)</td>
+            <td>Output</td>
+            <td>Corresponding gradient of bias.</td>
+            <td><ul><li>Does not support null tensors.</li><li>The shape is (2N+N*N) or (2N+N!). Remains consistent with the 0th dimension (fusionSize) of `phi`.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>1</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>gradGamma(aclTensor*)</td>
+            <td>Optional input</td>
+            <td>Gradient corresponding to gamma.</td>
+            <td><ul><li>Does not support null tensors.</li><li>This variable is output only when the input gamma is not nullptr.</li><li>Shape dimensions remain consistent with input gamma.</li><li>shape is (N, D), where N remains consistent with the N of `x` and D remains consistent with the D of `x`.</li></ul></td>
+            <td>FLOAT32</td>
+            <td>ND</td>
+            <td>2</td>
+            <td>√</td>
+        </tr>
+        <tr>
+            <td>workspaceSize (uint64_t*)</td>
+            <td>Output</td>
+            <td>Returns the size of the Device-side-requested workspace.</td>
+            <td>-</td>
+            <td>-</td>
+            <td>-</td>
+            <td>-</td>
+            <td>-</td>
+        </tr>
+        <tr>
+            <td>executor (aclOpExecutor**)</td>
+            <td>Output</td>
+            <td>Returns the op executor containing the operator computation process.</td>
+            <td>-</td>
+            <td>-</td>
+            <td>-</td>
+            <td>-</td>
+            <td>-</td>
+        </tr>
+        </tbody>
+    </table>
+
+  <!-- npu="950" id7 -->
+  - <term>Ascend 950PR&950DT products</term>:
+    - The shape of parameter `phi` only supports (2N+N\*N, N\*D).
+    - The shape of parameter `gradHRes` only supports (B, S, N, N) and (T, N, N).
+    - The shape of parameter `hMix` only supports (B, S, 2N+N\*N) and (T, 2N+N\*N).
+    - The shape of parameter `gradPhi` only supports (2N+N\*N, N\*D).
+    - The shape of parameter `gradBias` only supports (2N+N\*N).
+  <!-- end id7 -->
+
+- **Return Value**
+
+  Returns an aclnnStatus status code. For details, see [aclnn Return Codes](../../../docs/en/context/aclnn_return_code.md).
+
+  The first-phase API performs input parameter validation and returns an error in the following scenarios:
+
+    <table style="undefined;table-layout: fixed;width: 1155px"><colgroup>
+    <col style="width: 319px">
+    <col style="width: 144px">
+    <col style="width: 671px">
+    </colgroup>
+        <thead>
+            <th>Return Value</th>
+            <th>Error Code</th>
+            <th>Description</th>
+        </thead>
+        <tbody>
+            <tr>
+                <td>ACLNN_ERR_PARAM_NULLPTR</td>
+                <td>161001</td>
+                <td>A required parameter or output is a null pointer.</td>
+            </tr>
+            <tr>
+                <td>ACLNN_ERR_PARAM_INVALID</td>
+                <td>161002</td>
+                <td>The data type or data format of the input variable is not in the supported range, or opImplMode is not 0 or 1.</td>
+            </tr>
+            <tr>
+                <td>ACLNN_ERR_RUNTIME_ERROR</td>
+                <td>361001</td>
+                <td>An exception occurs when the API calls an npu runtime API internally.</td>
+            </tr>
+        </tbody>
+    </table>
+
+## aclnnMhcPreBackwardV2
+
+- **Parameters:**
+
+    <table style="undefined;table-layout: fixed; width: 1155px"><colgroup>
+    <col style="width: 144px">
+    <col style="width: 125px">
+    <col style="width: 700px">
+    </colgroup>
+    <thead>
+        <tr>
+        <th>Parameter</th>
+        <th>Input/Output</th>
+        <th>Description</th>
+        </tr></thead>
+    <tbody>
+        <tr>
+        <td>workspace</td>
+        <td>Input</td>
+        <td>Device-side-requested workspace memory address.</td>
+        </tr>
+        <tr>
+        <td>workspaceSize</td>
+        <td>Input</td>
+        <td>Size of the Device-side-requested workspace, obtained by the first-phase API aclnnMhcPreBackwardV2GetWorkspaceSize.</td>
+        </tr>
+        <tr>
+        <td>executor</td>
+        <td>Input</td>
+        <td>Op executor, including the computation flow of the operator.</td>
+        </tr>
+        <tr>
+        <td>stream</td>
+        <td>Input</td>
+        <td>Stream for executing the task.</td>
+        </tr>
+    </tbody>
+    </table>
+
+- **Return Value**
+
+  Returns an aclnnStatus status code. For details, see [aclnn Return Codes](../../../docs/en/context/aclnn_return_code.md).
+
+## Constraints
+
+- Deterministic computation:
+  - aclnnMhcPreBackwardV2 defaults to a deterministic implementation.
+
+- Specification constraints
+  <!-- npu="950" id8 -->
+  - <term>Ascend 950PR&950DT products</term>:
+    <table style="undefined;table-layout: fixed; width: 600px"><colgroup>
+        <col style="width: 100px">
+        <col style="width: 500px">
+        </colgroup>
+        <thead>
+            <tr>
+                <th>Format</th>
+                <th>gradHRes shape</th>
+            </tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>BSNN</td>
+            <td>(B, S, N, N)</td>
+        </tr>
+        <tr>
+            <td>TNN</td>
+            <td>(T, N, N)</td>
+        </tr>
+        </tbody>
+    </table>
+
+    <table style="undefined;table-layout: fixed; width: 600px"><colgroup>
+        <col style="width: 100px">
+        <col style="width: 500px">
+        </colgroup>
+        <thead>
+            <tr>
+                <th>Item</th>
+                <th>Description</th>
+            </tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>N</td>
+            <td>N currently supports 4, 6, and 8.</td>
+        </tr>
+        <tr>
+            <td>D</td>
+            <td>D: range 1-16384. Requires 64-element alignment.</td>
+        </tr>
+        <tr>
+            <td>fusionSize</td>
+            <td>Only supports N*N+2N.</td>
+        </tr>
+        </tbody>
+    </table>
+  <!-- end id8 -->
+
+## Example
+
+The following sample code is for reference only. For details about compilation and execution, see [Compile and Run Samples](../../../docs/en/context/compile_and_run_sample.md).
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <numeric>
+#include "acl/acl.h"
+#include "aclnnop/aclnn_mhc_pre_backward_v2.h"
+
+#define CHECK_RET(cond, return_expr)                                                                                   \
+    do {                                                                                                               \
+        if (!(cond)) {                                                                                                 \
+            return_expr;                                                                                               \
+        }                                                                                                              \
+    } while (0)
+
+#define LOG_PRINT(message, ...)                                                                                        \
+    do {                                                                                                               \
+        printf(message, ##__VA_ARGS__);                                                                                \
+    } while (0)
+
+int64_t GetShapeSize(const std::vector<int64_t> &shape)
+{
+    int64_t shapeSize = 1;
+    for (auto i : shape) {
+        shapeSize *= i;
+    }
+    return shapeSize;
+}
+
+void PrintOutResult(std::vector<int64_t> &shape, void **deviceAddr, const char *name, size_t elemSize = sizeof(float))
+{
+    auto size = GetShapeSize(shape);
+    size_t copyBytes = size * elemSize;
+    if (elemSize == 2) {
+        // BF16: read raw bytes, convert to float for display
+        std::vector<uint16_t> rawData(size, 0);
+        auto ret = aclrtMemcpy(rawData.data(), copyBytes, *deviceAddr, copyBytes, ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return);
+        LOG_PRINT("%s result (first 10 elements):\n", name);
+        for (int64_t i = 0; i < std::min(size, (int64_t)10); i++) {
+            union {
+                uint32_t i;
+                float f;
+            } u;
+            u.i = (uint32_t)rawData[i] << 16;
+            LOG_PRINT("  [%ld] = %f\n", i, u.f);
+        }
+    } else {
+        // float32
+        std::vector<float> resultData(size, 0);
+        auto ret = aclrtMemcpy(resultData.data(), copyBytes, *deviceAddr, copyBytes, ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return);
+        LOG_PRINT("%s result (first 10 elements):\n", name);
+        for (int64_t i = 0; i < std::min(size, (int64_t)10); i++) {
+            LOG_PRINT("  [%ld] = %f\n", i, resultData[i]);
+        }
+    }
+}
+
+int Init(int32_t deviceId, aclrtContext *context, aclrtStream *stream)
+{
+    // Boilerplate, AscendCL initialization
+    auto ret = aclInit(nullptr);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclInit failed. ERROR: %d\n", ret); return ret);
+    ret = aclrtSetDevice(deviceId);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetDevice failed. ERROR: %d\n", ret); return ret);
+    ret = aclrtCreateContext(context, deviceId);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtCreateContext failed. ERROR: %d\n", ret); return ret);
+    ret = aclrtSetCurrentContext(*context);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetCurrentContext failed. ERROR: %d\n", ret); return ret);
+    ret = aclrtCreateStream(stream);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtCreateStream failed. ERROR: %d\n", ret); return ret);
+    return 0;
+}
+
+template <typename T>
+int CreateAclTensor(const std::vector<T> &hostData, const std::vector<int64_t> &shape, void **deviceAddr,
+                    aclDataType dataType, aclTensor **tensor)
+{
+    auto size = GetShapeSize(shape) * sizeof(T);
+    // Call aclrtMalloc to request device-side memory.
+    auto ret = aclrtMalloc(deviceAddr, size, ACL_MEM_MALLOC_HUGE_FIRST);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMalloc failed. ERROR: %d\n", ret); return ret);
+    // Call aclrtMemcpy to copy host-side data to device-side memory.
+    ret = aclrtMemcpy(*deviceAddr, size, hostData.data(), size, ACL_MEMCPY_HOST_TO_DEVICE);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMemcpy failed. ERROR: %d\n", ret); return ret);
+
+    // Calculate the strides of the contiguous tensor.
+    std::vector<int64_t> strides(shape.size(), 1);
+    for (int64_t i = shape.size() - 2; i >= 0; i--) {
+        strides[i] = shape[i + 1] * strides[i + 1];
+    }
+
+    // Call aclCreateTensor to create an aclTensor.
+    *tensor = aclCreateTensor(shape.data(), shape.size(), dataType, strides.data(), 0, aclFormat::ACL_FORMAT_ND,
+                              shape.data(), shape.size(), *deviceAddr);
+    return 0;
+}
+
+int main()
+{
+    // 1. (Boilerplate) Initialize device/context/stream. Refer to the list of AscendCL external APIs.
+    // Set deviceId based on the actual device.
+    int32_t deviceId = 0;
+    aclrtContext context;
+    aclrtStream stream;
+    auto ret = Init(deviceId, &context, &stream);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
+
+    // 2. Construct the input and output. Perform custom construction based on the API.
+    std::vector<int64_t> xShape = {1024, 4, 512};      // T, N, D
+    std::vector<int64_t> phiShape = {24, 2048};        // 2 * N + N * N, N * D
+    std::vector<int64_t> alphaShape = {3};             // Fixed size.
+    std::vector<int64_t> gradHInShape = {1024, 512};   // T, D
+    std::vector<int64_t> gradHPostShape = {1024, 4};   // T, N
+    std::vector<int64_t> gradHResShape = {1024, 4, 4}; // T, N, N
+    std::vector<int64_t> invRmsShape = {1024};         // T
+    std::vector<int64_t> hMixShape = {1024, 24};       // T, 2 * N + N * N
+    std::vector<int64_t> hPreShape = {1024, 4};        // T, N
+    std::vector<int64_t> hPostShape = {1024, 4};       // T, N
+    std::vector<int64_t> gammaShape = {4, 512};        // N, D
+    std::vector<int64_t> gradXShape = {1024, 4, 512};  // T, N, D
+    std::vector<int64_t> gradPhiShape = {24, 2048};    // 2 * N + N * N, N * D
+    std::vector<int64_t> gradAlphaShape = {3};         // Fixed size.
+    std::vector<int64_t> gradGammaShape = {4, 512};    // N, D
+    std::vector<int64_t> gradBiasShape = {24};         // 2*N+N*N
+    std::vector<int64_t> gradXPostOptionalShape = {1024, 4, 512};
+
+    void *xDeviceAddr = nullptr;
+    void *phiDeviceAddr = nullptr;
+    void *alphaDeviceAddr = nullptr;
+    void *gradHInDeviceAddr = nullptr;
+    void *gradHPostDeviceAddr = nullptr;
+    void *gradHResDeviceAddr = nullptr;
+    void *invRmsDeviceAddr = nullptr;
+    void *hMixDeviceAddr = nullptr;
+    void *hPreDeviceAddr = nullptr;
+    void *hPostDeviceAddr = nullptr;
+    void *gammaDeviceAddr = nullptr;
+    void *gradXDeviceAddr = nullptr;
+    void *gradPhiDeviceAddr = nullptr;
+    void *gradAlphaDeviceAddr = nullptr;
+    void *gradBiasDeviceAddr = nullptr;
+    void *gradGammaDeviceAddr = nullptr;
+    void *gradXPostOptionalDeviceAddr = nullptr;
+
+    aclTensor *x = nullptr;
+    aclTensor *phi = nullptr;
+    aclTensor *alpha = nullptr;
+    aclTensor *gradHIn = nullptr;
+    aclTensor *gradHPost = nullptr;
+    aclTensor *gradHRes = nullptr;
+    aclTensor *invRms = nullptr;
+    aclTensor *hMix = nullptr;
+    aclTensor *hPre = nullptr;
+    aclTensor *hPost = nullptr;
+    aclTensor *gamma = nullptr;
+    aclTensor *gradX = nullptr;
+    aclTensor *gradPhi = nullptr;
+    aclTensor *gradAlpha = nullptr;
+    aclTensor *gradBias = nullptr;
+    aclTensor *gradGamma = nullptr;
+    aclTensor *gradXPostOptional = nullptr;
+
+    std::vector<short> xHostData(1024 * 4 * 512, 1.0);
+    std::vector<float> phiHostData(24 * 2048, 1.0);
+    std::vector<float> alphaHostData(3, 1.0);
+    std::vector<short> gradHInHostData(1024 * 512, 1.0);
+    std::vector<float> gradHPostHostData(1024 * 4, 1.0);
+    std::vector<float> gradHResHostData(1024 * 4 * 4, 1.0);
+    std::vector<float> invRmsHostData(1024, 1.0);
+    std::vector<float> hMixHostData(1024 * 24, 1.0);
+    std::vector<float> hPreHostData(1024 * 4, 1.0);
+    std::vector<float> hPostHostData(1024 * 4, 1.0);
+    std::vector<float> gammaHostData(4 * 512, 1.0);
+    std::vector<short> gradXHostData(1024 * 4 * 512, 0);
+    std::vector<float> gradPhiHostData(24 * 2048, 0);
+    std::vector<float> gradAlphaHostData(3, 0);
+    std::vector<float> gradBiasHostData(24, 0);
+    std::vector<float> gradGammaHostData(4 * 512, 0);
+    std::vector<short> gradXPostOptionalHostData(1024 * 4 * 512, 0);
+
+    ret = CreateAclTensor(xHostData, xShape, &xDeviceAddr, aclDataType::ACL_BF16, &x);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(phiHostData, phiShape, &phiDeviceAddr, aclDataType::ACL_FLOAT, &phi);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(alphaHostData, alphaShape, &alphaDeviceAddr, aclDataType::ACL_FLOAT, &alpha);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradHInHostData, gradHInShape, &gradHInDeviceAddr, aclDataType::ACL_BF16, &gradHIn);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradHPostHostData, gradHPostShape, &gradHPostDeviceAddr, aclDataType::ACL_FLOAT, &gradHPost);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradHResHostData, gradHResShape, &gradHResDeviceAddr, aclDataType::ACL_FLOAT, &gradHRes);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(invRmsHostData, invRmsShape, &invRmsDeviceAddr, aclDataType::ACL_FLOAT, &invRms);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(hMixHostData, hMixShape, &hMixDeviceAddr, aclDataType::ACL_FLOAT, &hMix);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(hPreHostData, hPreShape, &hPreDeviceAddr, aclDataType::ACL_FLOAT, &hPre);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(hPostHostData, hPostShape, &hPostDeviceAddr, aclDataType::ACL_FLOAT, &hPost);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gammaHostData, gammaShape, &gammaDeviceAddr, aclDataType::ACL_FLOAT, &gamma);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradXHostData, gradXShape, &gradXDeviceAddr, aclDataType::ACL_BF16, &gradX);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradPhiHostData, gradPhiShape, &gradPhiDeviceAddr, aclDataType::ACL_FLOAT, &gradPhi);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradAlphaHostData, gradAlphaShape, &gradAlphaDeviceAddr, aclDataType::ACL_FLOAT, &gradAlpha);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradBiasHostData, gradBiasShape, &gradBiasDeviceAddr, aclDataType::ACL_FLOAT, &gradBias);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradGammaHostData, gradGammaShape, &gradGammaDeviceAddr, aclDataType::ACL_FLOAT, &gradGamma);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+    ret = CreateAclTensor(gradXPostOptionalHostData, gradXPostOptionalShape, &gradXPostOptionalDeviceAddr,
+                          aclDataType::ACL_BF16, &gradXPostOptional);
+    CHECK_RET(ret == ACL_SUCCESS, return ret);
+
+    float hc_eps = 1e-6;
+    int64_t opImplMode = 1;
+
+    // 3. Call the CANN operator library API. Replace the API name with the actual one.
+    uint64_t workspaceSize = 80 * 1024 * 1024;
+    aclOpExecutor *executor;
+
+    // Call the aclnnMhcPreBackwardV2 first-phase API.
+    ret = aclnnMhcPreBackwardV2GetWorkspaceSize(x, phi, alpha, gradHIn, gradHPost, gradHRes, invRms, hMix, hPre, hPost,
+                                              gamma, gradXPostOptional, hc_eps, opImplMode, gradX, gradPhi, gradAlpha, gradBias,
+                                              gradGamma, &workspaceSize, &executor);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMhcPreBackwardV2GetWorkspaceSize failed. ERROR: %d\n", ret);
+              return ret);
+
+    // Request device memory based on the workspaceSize calculated by the first-phase API.
+    void *workspaceAddr = nullptr;
+    if (workspaceSize > 0) {
+        ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
+    }
+
+    // Call the aclnnMhcPreBackwardV2 second-phase API.
+    ret = aclnnMhcPreBackwardV2(workspaceAddr, workspaceSize, executor, stream);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMhcPreBackwardV2 failed. ERROR: %d\n", ret); return ret);
+
+    // 4. (Boilerplate) Synchronize and wait for task execution to complete.
+    ret = aclrtSynchronizeStream(stream);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
+
+    // 5. Obtain the output values and copy the result on the device to the host. The code needs to be modified based on the actual API definition.
+    PrintOutResult(gradXShape, &gradXDeviceAddr, "gradX", sizeof(short));
+    PrintOutResult(gradPhiShape, &gradPhiDeviceAddr, "gradPhi");
+    PrintOutResult(gradAlphaShape, &gradAlphaDeviceAddr, "gradAlpha");
+    PrintOutResult(gradBiasShape, &gradBiasDeviceAddr, "gradBias");
+    PrintOutResult(gradGammaShape, &gradGammaDeviceAddr, "gradGamma");
+
+    // 6. Release aclTensor and aclScalar. The code needs to be modified based on the actual API definition.
+    aclDestroyTensor(x);
+    aclDestroyTensor(phi);
+    aclDestroyTensor(alpha);
+    aclDestroyTensor(gradHIn);
+    aclDestroyTensor(gradHPost);
+    aclDestroyTensor(gradHRes);
+    aclDestroyTensor(invRms);
+    aclDestroyTensor(hMix);
+    aclDestroyTensor(hPre);
+    aclDestroyTensor(hPost);
+    aclDestroyTensor(gamma);
+    aclDestroyTensor(gradX);
+    aclDestroyTensor(gradPhi);
+    aclDestroyTensor(gradAlpha);
+    aclDestroyTensor(gradBias);
+    aclDestroyTensor(gradGamma);
+    aclDestroyTensor(gradXPostOptional);
+
+    // 7. Release device resources.
+    aclrtFree(xDeviceAddr);
+    aclrtFree(phiDeviceAddr);
+    aclrtFree(alphaDeviceAddr);
+    aclrtFree(gradHInDeviceAddr);
+    aclrtFree(gradHPostDeviceAddr);
+    aclrtFree(gradHResDeviceAddr);
+    aclrtFree(invRmsDeviceAddr);
+    aclrtFree(hMixDeviceAddr);
+    aclrtFree(hPreDeviceAddr);
+    aclrtFree(hPostDeviceAddr);
+    aclrtFree(gammaDeviceAddr);
+    aclrtFree(gradXDeviceAddr);
+    aclrtFree(gradPhiDeviceAddr);
+    aclrtFree(gradAlphaDeviceAddr);
+    aclrtFree(gradBiasDeviceAddr);
+    aclrtFree(gradGammaDeviceAddr);
+    aclrtFree(gradXPostOptionalDeviceAddr);
+    if (workspaceSize > 0) {
+        aclrtFree(workspaceAddr);
+    }
+    aclrtDestroyStream(stream);
+    aclrtDestroyContext(context);
+    aclrtResetDevice(deviceId);
+    aclFinalize();
+
+    return 0;
+}
+```

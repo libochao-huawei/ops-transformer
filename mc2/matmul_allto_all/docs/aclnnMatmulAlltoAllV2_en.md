@@ -1,0 +1,818 @@
+# aclnnMatmulAlltoAllV2
+
+<!-- md-trans-meta sourceCommit=unknown translatedAt=2026-09-22T13:43:41.479Z -->
+
+## Applicable Products
+
+<!-- npu="950" id1 -->
+- <term>Ascend 950PR&950DT products</term>: Supported
+<!-- end id1 -->
+<!-- npu="A3" id2 -->
+- <term>Atlas A3 products</term>: Supported
+<!-- end id2 -->
+<!-- npu="910b" id3 -->
+- <term>Atlas A2 products</term>: Supported
+<!-- end id3 -->
+<!-- npu="310b" id4 -->
+- <term>Atlas 200I/500 A2 inference products</term>: Not supported
+<!-- end id4 -->
+<!-- npu="310p" id5 -->
+- <term>Atlas inference products</term>: Not supported
+<!-- end id5 -->
+<!-- npu="910" id6 -->
+- <term>Atlas training products</term>: Not supported
+<!-- end id6 -->
+
+## Function
+
+- Description: Fuses Matmul computation, Permute (to ensure contiguous addresses after communication), and AlltoAll communication. **Computation precedes communication.**
+
+- Formula: Assume the shape of x1 is (BS, H1), the shape of x2 is (H1, H2), and rankSize is the number of NPUs.
+
+  $$
+  computeOut = x1 @ x2 + bias \\
+  permutedOut = computeOut.view(BS, rankSize, H2/rankSize).permute(1, 0, 2) \\
+  output = AlltoAll(permutedOut).view(rankSize*BS, H2/rankSize)
+  $$
+
+Compared with the `aclnnMatmulAlltoAll` API, this API has the following changes:
+
+- Adds the `commMode` parameter, which allows users to specify the communication engine used by the chip.
+
+  <!-- npu="950" id7 -->
+  - <term>Ascend 950PR&950DT products</term>: `commMode` supports `ai_cpu` and `ccu`.
+  <!-- end id7 -->
+  <!-- npu="A3" id8 -->
+  - <term>Atlas A3 products</term>: No new features are added. `commMode` supports only `ai_cpu`.
+  <!-- end id8 -->
+  <!-- npu="910b" id9 -->
+  - <term>Atlas A2 products</term>: No new features are added. `commMode` supports only `aiv`.
+
+  <!-- end id9 -->
+
+## Function Prototype
+
+Each operator uses a [two-phase API](../../../docs/en/context/two_phase_api.md). You must first call the "aclnnMatmulAlltoAllV2GetWorkspaceSize" API to obtain the workspace size required for the computation and the executor containing the operator computation flow, and then call the "aclnnMatmulAlltoAllV2" API to perform the computation.
+
+```cpp
+aclnnStatus aclnnMatmulAlltoAllV2GetWorkspaceSize(
+  const aclTensor*   x1,
+  const aclTensor*   x2,
+  const aclTensor*   biasOptional,
+  const aclIntArray* alltoAllAxesOptional,
+  const char*        group,
+  const char*        commMode,
+  bool               transposeX1,
+  bool               transposeX2,
+  const aclTensor*   output,
+  uint64_t*          workspaceSize,
+  aclOpExecutor**    executor)
+```
+
+```cpp
+aclnnStatus aclnnMatmulAlltoAllV2(
+  void*          workspace,
+  uint64_t       workspaceSize,
+  aclOpExecutor* executor,
+  aclrtStream    stream)
+```
+
+## aclnnMatmulAlltoAllV2GetWorkspaceSize
+
+- **Parameters**:
+
+    <table style="undefined;table-layout: fixed; width: 1556px"> <colgroup>
+    <col style="width: 154px">
+    <col style="width: 123px">
+    <col style="width: 270px">
+    <col style="width: 325px">
+    <col style="width: 245px">
+    <col style="width: 120px">
+    <col style="width: 203px">
+    <col style="width: 116px">
+    </colgroup>
+    <thead>
+    <tr>
+    <th>Parameter</th>
+    <th>Input/Output</th>
+    <th>Description</th>
+    <th>Instruction</th>
+    <th>data type</th>
+    <th>data format</th>
+    <th>Dimension (shape)</th>
+    <th>non-contiguous tensor</th>
+    </tr></thead>
+    <tbody>
+    <tr>
+    <td>x1</td>
+    <td>Input</td>
+    <td>Left matrix input of the fused operator, corresponding to x1 in the formula.</td>
+    <td>This input serves as the left matrix for the MatMul computation.</td>
+    <td>FLOAT16, BFLOAT16</td>
+    <td>ND</td>
+    <td>2 dimensions, shape (BS, H1)</td>
+    <td>x</td>
+    </tr>
+    <tr>
+    <td>x2</td>
+    <td>Input</td>
+    <td>Right matrix input of the fused operator, which is also the right matrix for the MatMul computation.</td>
+    <td>Directly used as the right matrix input of the MatMul computation.</td>
+    <td>FLOAT16, BFLOAT16</td>
+    <td>ND</td>
+    <td>2 dims, shape (H1, H2)</td>
+    <td>Support varies by device model. See <a href="#constraints">Constraints</a>.</td>
+    </tr>
+    <tr>
+    <td>biasOptional</td>
+    <td>Input</td>
+    <td>Bias accumulated after the matmul computation, corresponding to bias in the formula.</td>
+    <td>Passing a null pointer is supported. Data type restrictions vary by device model. For details, see <a href="#constraints">Constraints</a>.</td>
+    <td>FLOAT16, BFLOAT16, FLOAT32</td>
+    <td>ND</td>
+    <td>1 dimension, shape (H2)</td>
+    <td>x</td>
+    </tr>
+    <tr>
+    <td>alltoAllAxesOptional</td>
+    <td>Input</td>
+    <td>Optional input. Specifies the direction of data exchange for AlltoAll and Permute.</td>
+    <td>Can be set to empty or [-1, -2]. If empty is passed, it is processed as [-1, -2] by default, which converts the input from (BS, H2) to (BS * rankSize, H2 / rankSize).</td>
+    <td>aclIntArray* (element type INT64)</td>
+    <td>-</td>
+    <td>1 dimension, shape (2)</td>
+    <td>-</td>
+    </tr>
+    <tr>
+    <td>group</td>
+    <td>Input</td>
+    <td>String identifying the column group, that is, the communicator name. Obtain commName through the Hccl API HcclGetCommName and use it as this parameter.</td>
+    <td>String length range: (0, 128).</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    </tr>
+    <tr>
+    <td>commMode</td>
+    <td>Input</td>
+    <td>Specifies the current communication type.</td>
+    <td>Supports "aiv", "ai_cpu", or "ccu".</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    </tr>
+    <tr>
+    <td>transposeX1</td>
+    <td>Input</td>
+    <td>Indicates whether the left matrix is transposed.</td>
+    <td>Setting this parameter to True is currently not supported.</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    </tr>
+    <tr>
+    <td>transposeX2</td>
+    <td>Input</td>
+    <td>Indicates whether the right matrix is transposed.</td>
+    <td>If this parameter is set to True, the shape of the right matrix is (H2, H1).</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    </tr>
+    <tr>
+    <td>Output</td>
+    <td>Output</td>
+    <td>Final computation result.</td>
+    <td>Data type is the same as that of input x1.</td>
+    <td>FLOAT16, BFLOAT16</td>
+    <td>ND</td>
+    <td>2D, shape (BS*rankSize, H2/rankSize)</td>
+    <td>x</td>
+    </tr>
+    <tr>
+    <td>workspaceSize</td>
+    <td>Output</td>
+    <td>Size of the workspace to be allocated on the Device.</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    </tr>
+    <tr>
+    <td>executor</td>
+    <td>Output</td>
+    <td>Returns the op executor, which contains the computation process of the operator.</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    </tr>
+    </tbody></table>
+
+- **Return Value**
+
+  aclnnStatus: return status code. For details, see [aclnn Return Codes](../../../docs/en/context/aclnn_return_code.md).
+
+  The first-phase API performs input parameter validation and returns an error in the following scenarios:
+
+    <table style="undefined;table-layout: fixed; width: 1149px"><colgroup>
+    <col style="width: 282px">
+    <col style="width: 120px">
+    <col style="width: 747px">
+    </colgroup>
+    <thead>
+     <tr>
+       <th>Return Value</th>
+       <th>Error Code</th>
+       <th>Description</th>
+     </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td>ACLNN_ERR_PARAM_NULLPTR</td>
+      <td>161001</td>
+      <td>A required input or output tensor parameter is a null pointer.</td>
+    </tr>
+    <tr>
+        <td rowspan="7">ACLNN_ERR_PARAM_INVALID</td>
+        <td rowspan="7">161002</td>
+        <td>The data type of the input or output is not within the supported range.</td>
+    </tr>
+    <tr>
+        <td>The input tensor is an empty tensor.</td>
+    </tr>
+    <tr>
+        <td>alltoAllAxesOptional is invalid.</td>
+    </tr>
+    <tr>
+        <td>transposeX1 is true.</td>
+    </tr>
+    <tr>
+        <td>The communicator length is invalid.</td>
+    </tr>
+    <tr>
+        <td>The dimensions of the input and output tensors are invalid.</td>
+    </tr>
+    <tr>
+        <td>The input and output formats are private formats.</td>
+    </tr>
+      </tbody>
+  </table>
+
+## aclnnMatmulAlltoAllV2
+
+- **Parameters:**
+
+    <table style="undefined;table-layout: fixed; width: 1150px"><colgroup>
+    <col style="width: 168px">
+    <col style="width: 128px">
+    <col style="width: 854px">
+    </colgroup>
+    <thead>
+    <tr>
+        <th>Parameter</th>
+        <th>Input/Output</th>
+        <th>Description</th>
+    </tr></thead>
+    <tbody>
+    <tr>
+        <td>workspace</td>
+        <td>Input</td>
+        <td>Workspace memory address allocated on the Device.</td>
+    </tr>
+    <tr>
+        <td>workspaceSize</td>
+        <td>Input</td>
+        <td>Workspace size allocated on the Device, obtained by the first-phase API aclnnMatmulAlltoAllV2GetWorkspaceSize.</td>
+    </tr>
+    <tr>
+        <td>executor</td>
+        <td>Input</td>
+        <td>Op executor that contains the operator computation process.</td>
+    </tr>
+    <tr>
+        <td>stream</td>
+        <td>Input</td>
+        <td>Specifies the Stream for executing tasks.</td>
+    </tr>
+    </tbody>
+    </table>
+
+- **Return value**
+
+  aclnnStatus: return status code. For details, see [aclnn Return Codes](../../../docs/en/context/aclnn_return_code.md).
+
+## Constraints
+
+- aclnnMatmulAlltoAllV2 supports deterministic computation by default.
+- Number of NPU cards (rankSize) varies by device model:
+
+  <!-- npu="910b" id10 -->
+  - <term>Atlas A2 products</term>: Supports 2, 4, or 8 cards.
+  <!-- end id10 -->
+  <!-- npu="A3" id11 -->
+  - <term>Atlas A3 products</term>: supports 2, 4, 8, and 16 devices.
+  <!-- end id11 -->
+  <!-- npu="950" id12 -->
+  - <term>Ascend 950PR&950DT products</term>: Supports 2, 4, 8, or 16 cards.
+  <!-- end id12 -->
+
+- The variable H2 used in the shape in Parameters must be divisible by the number of NPU cards.
+- The H1 range supports only [1, 65535].
+- The value of BS*rankSize and H2 must not exceed 2147483647 (INT32_MAX). The value of BS must not be less than 0, and the value of H2 must not be less than 2.
+- The support for empty tensors varies by device model:
+
+  <!-- npu="910b" id13 -->
+  - <term>Atlas A2 products</term>: No empty tensors are supported.
+  <!-- end id13 -->
+  <!-- npu="A3" id14 -->
+  - <term>Atlas A3 products</term>: Do not support any empty tensor.
+  <!-- end id14 -->
+  <!-- npu="950" id15 -->
+  - <term>Ascend 950PR&950DT products</term>: Only empty tensors where the first dimension (BS) of input x1 is 0 are supported. Other empty tensors are not supported.
+  <!-- end id15 -->
+
+- Support for non-contiguous tensors varies by device model:
+
+  <!-- npu="910b" id16 -->
+  - <term>Atlas A2 products</term>: No non-contiguous tensors are supported.
+  <!-- end id16 -->
+  <!-- npu="A3" id17 -->
+  - <term>Atlas A3 products</term>: Non-contiguous tensors are not supported.
+  <!-- end id17 -->
+  <!-- npu="950" id18 -->
+  - <term>Ascend 950PR&950DT products</term>: Only x2 is supported as a non-contiguous tensor. Other non-contiguous tensors are not supported.
+  <!-- end id18 -->
+
+- The data types of the x1 and x2 compute inputs must be consistent with the data type of the output compute output. The x1, x2, and output passed in must not be null pointers.
+- The data type of biasOptional has different restrictions depending on the device model:
+
+  <!-- npu="910b" id19 -->
+  - <term>Atlas A2 products</term>: When the data type of the output compute output is FLOAT16, the data type of the biasOptional compute input supports FLOAT16. When the data type of the output compute output is BFLOAT16, the data type of the biasOptional compute input supports FLOAT32.
+  <!-- end id19 -->
+  <!-- npu="A3" id20 -->
+  - <term>Atlas A3 products</term>: If the data type of the x1/x2 input is FLOAT16, the data type of the biasOptional input can be FLOAT16; if the data type of the x1/x2 input is BFLOAT16, the data type of the biasOptional input can be FLOAT32.
+  <!-- end id20 -->
+  <!-- npu="950" id21 -->
+  - <term>Ascend 950PR&950DT products</term>: When the data type of x1/x2 Compute Input is FLOAT16, the data type of biasOptional Compute Input supports FLOAT16 and FLOAT32. When the data type of x1/x2 Compute Input is BFLOAT16, the data type of biasOptional Compute Input supports BFLOAT16 and FLOAT32.
+  <!-- end id21 -->
+
+- The communication-computation fusion operator does not support concurrent calls, and different communication-computation fusion operators also do not support concurrent calls.
+- Cross-supernode communication is not supported. Only intra-supernode communication is supported.
+- The communication engine parameter commMode has different restrictions depending on the device model:
+
+   <!-- npu="910b" id22 -->
+   - <term>Atlas A2 products</term>: Only `aiv` is supported.
+   <!-- end id22 -->
+   <!-- npu="A3" id23 -->
+   - <term>Atlas A3 products</term>: Only `ai_cpu` is supported.
+   <!-- end id23 -->
+   <!-- npu="950" id24 -->
+   - <term>Ascend 950PR&950DT products</term>: `ai_cpu` and `ccu` are supported.
+   <!-- end id24 -->
+
+- Communication engine constraints:
+
+   <!-- npu="910b" id25 -->
+   - <term>Atlas A2 products</term>: MTE communication is supported.
+   <!-- end id25 -->
+   <!-- npu="A3" id26 -->
+   - <term>Atlas A3 products</term>: AI_CPU communication is supported.
+   <!-- end id26 -->
+   <!-- npu="950" id27 -->
+   - <term>Ascend 950PR&950DT products</term>:
+      - Supports CCU communication and AI_CPU communication.
+      - CCU supports interconnection only within the UB domain of a single machine, while AI_CPU supports interconnection across machines within the UB domain.
+      - Communicator constraint: only one communication mode can be used within the same communicator.
+
+   <!-- end id27 -->
+
+## Example
+
+The following is sample code for reference only. For details about compilation and execution, see Compile and Run Samples.
+
+Note: This sample code calls some HCCL collective communication library APIs: HcclGetCommName, HcclCommInitAll, and HcclCommDestroy. See [*HCCL API (C)*](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/hcclug/docs/en/api_ref/comm_mgr_c/data_type_definition/HcclResult.md).
+
+<!-- npu="910b" id28 -->
+- <term>Atlas A2 products</term>:
+
+    ```Cpp
+    #include <thread>
+    #include <iostream>
+    #include <string>
+    #include <cstring>
+    #include <vector>
+    #include <acl/acl.h>
+    #include <hccl/hccl.h>
+    #include "aclnn/opdev/fp16_t.h"
+    #include "aclnnop/aclnn_matmul_allto_all_v2.h"
+
+    int ndev = 2;
+
+    #define CHECK_RET(cond, return_expr) \
+    do {                               \
+        if (!(cond)) {                   \
+        return_expr;                   \
+        }                                \
+    } while (0)
+
+    #define LOG_PRINT(message, ...)     \
+    do {                              \
+        printf(message, ##__VA_ARGS__); \
+    } while (0)
+
+    int64_t GetShapeSize(const std::vector<int64_t> &shape) {
+        int64_t shapeSize = 1;
+        for (auto i: shape) {
+            shapeSize *= i;
+        }
+        return shapeSize;
+    }
+
+    template<typename T>
+    int CreateAclTensor(const std::vector<T> &hostData, const std::vector<int64_t> &shape, void **deviceAddr,
+                        aclDataType dataType, aclTensor **tensor) {
+        auto size = GetShapeSize(shape) * sizeof(T);
+        // Call aclrtMalloc to allocate device-side memory.
+        auto ret = aclrtMalloc(deviceAddr, size, ACL_MEM_MALLOC_HUGE_FIRST);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMalloc failed. ERROR: %d\n", ret); return ret);
+        // Call aclrtMemcpy to copy host-side data to device-side memory.
+        ret = aclrtMemcpy(*deviceAddr, size, hostData.data(), size, ACL_MEMCPY_HOST_TO_DEVICE);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMemcpy failed. ERROR: %d\n", ret); return ret);
+        // Compute the strides of the contiguous tensor.
+        std::vector<int64_t> strides(shape.size(), 1);
+        for (int64_t i = shape.size() - 2; i >= 0; i--) {
+            strides[i] = shape[i + 1] * strides[i + 1];
+        }
+        // Call the aclCreateTensor API to create an aclTensor.
+        *tensor = aclCreateTensor(shape.data(), shape.size(), dataType, strides.data(), 0, aclFormat::ACL_FORMAT_ND,
+                                shape.data(), shape.size(), *deviceAddr);
+        return 0;
+    }
+
+    struct Args {
+        uint32_t rankId;
+        HcclComm hcclComm;
+        aclrtStream stream;
+        aclrtContext context;
+    };
+
+    int launchOneThreadMatmulAlltoAllV2(Args &args) {
+        int ret;
+        ret = aclrtSetCurrentContext(args.context);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetCurrentContext failed. ERROR: %d\n", ret); return ret);
+        char hcom_name[128];
+        ret = HcclGetCommName(args.hcclComm, hcom_name);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("[ERROR] HcclGetCommName failed. ret = %d \n", ret); return -1);
+        LOG_PRINT("[INFO] rank %d hcom: %s stream: %p, context : %p\n", args.rankId, hcom_name, args.stream,
+                args.context);
+
+        std::vector<int64_t> x1Shape = {32, 64};
+        std::vector<int64_t> x2Shape = {64, 128};
+        std::vector<int64_t> biasShape = {128};
+        std::vector<int64_t> outShape = {64, 64};
+        void *x1DeviceAddr = nullptr;
+        void *x2DeviceAddr = nullptr;
+        void *biasDeviceAddr = nullptr;
+        void *outDeviceAddr = nullptr;
+        aclTensor *x1 = nullptr;
+        aclTensor *x2 = nullptr;
+        aclTensor *bias = nullptr;
+        aclTensor *out = nullptr;
+
+        int64_t a2aAxes[2] = {-1, -2};
+        aclIntArray* alltoAllAxesOptional = aclCreateIntArray(a2aAxes, static_cast<uint64_t>(2));
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor;
+        void *workspaceAddr = nullptr;
+
+        long long x1ShapeSize = GetShapeSize(x1Shape);
+        long long x2ShapeSize = GetShapeSize(x2Shape);
+        long long biasShapeSize = GetShapeSize(biasShape);
+        long long outShapeSize = GetShapeSize(outShape);
+        std::vector<op::fp16_t> x1HostData(x1ShapeSize, 1);
+        std::vector<op::fp16_t> x2HostData(x2ShapeSize, 1);
+        std::vector<op::fp16_t> biasHostData(biasShapeSize, 1);
+        std::vector<op::fp16_t> outHostData(outShapeSize, 0);
+        // Create a tensor.
+        ret = CreateAclTensor(x1HostData, x1Shape, &x1DeviceAddr, aclDataType::ACL_FLOAT16, &x1);
+        CHECK_RET(ret == ACL_SUCCESS, return ret);
+        ret = CreateAclTensor(x2HostData, x2Shape, &x2DeviceAddr, aclDataType::ACL_FLOAT16, &x2);
+        CHECK_RET(ret == ACL_SUCCESS, return ret);
+        ret = CreateAclTensor(biasHostData, biasShape, &biasDeviceAddr, aclDataType::ACL_FLOAT16, &bias);
+        CHECK_RET(ret == ACL_SUCCESS, return ret);
+        ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT16, &out);
+        CHECK_RET(ret == ACL_SUCCESS, return ret);
+        // Call the first-phase API.
+        ret = aclnnMatmulAlltoAllV2GetWorkspaceSize(x1, x2, bias, alltoAllAxesOptional, hcom_name, "aiv", false, false,
+                                                out, &workspaceSize, &executor);
+        CHECK_RET(ret == ACL_SUCCESS,
+                LOG_PRINT("aclnnMatmulAlltoAllV2GetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
+        // Allocate device memory based on the workspaceSize calculated by the first-phase API.
+        if (workspaceSize > 0) {
+            ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
+        }
+        // Call the second-phase API.
+        ret = aclnnMatmulAlltoAllV2(workspaceAddr, workspaceSize, executor, args.stream);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulAlltoAllV2 failed. ERROR: %d\n", ret); return ret);
+        // (Boilerplate) Synchronize and wait for the task execution to complete.
+        ret = aclrtSynchronizeStreamWithTimeout(args.stream, 10000);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
+        LOG_PRINT("device%d aclnnMatmulAlltoAllV2 execute success \n", args.rankId);
+        // Release device resources. Modify them based on the specific API definition.
+        if (x1 != nullptr) {
+            aclDestroyTensor(x1);
+        }
+        if (x2 != nullptr) {
+            aclDestroyTensor(x2);
+        }
+        if (bias != nullptr) {
+            aclDestroyTensor(bias);
+        }
+        if (out != nullptr) {
+            aclDestroyTensor(out);
+        }
+        if (x1DeviceAddr != nullptr) {
+            aclrtFree(x1DeviceAddr);
+        }
+        if (x2DeviceAddr != nullptr) {
+            aclrtFree(x2DeviceAddr);
+        }
+        if (biasDeviceAddr != nullptr) {
+            aclrtFree(biasDeviceAddr);
+        }
+        if (outDeviceAddr != nullptr) {
+            aclrtFree(outDeviceAddr);
+        }
+        if (workspaceSize > 0) {
+            aclrtFree(workspaceAddr);
+        }
+        aclrtDestroyStream(args.stream);
+        HcclCommDestroy(args.hcclComm);
+        aclrtDestroyContext(args.context);
+        aclrtResetDevice(args.rankId);
+        return 0;
+    }
+
+    int main(int argc, char *argv[])
+    {
+        // This sample is implemented based on Atlas A2 and must run on Atlas A2.
+        int ret;
+        int32_t devices[ndev];
+        for (int i = 0; i < ndev; i++) {
+            devices[i] = i;
+        }
+        HcclComm comms[128];
+        ret = aclInit(nullptr);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclInit failed. ERROR: %d\n", ret); return ret);
+        // Initialize the communicator.
+        for (int i = 0; i < ndev; i++) {
+            ret = aclrtSetDevice(devices[i]);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetDevice failed. ERROR: %d\n", ret); return ret);
+        }
+        ret = HcclCommInitAll(ndev, devices, comms);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("HcclCommInitAll failed. ERROR: %d\n", ret); return ret);
+        Args args[ndev];
+        aclrtStream stream[ndev];
+        aclrtContext context[ndev];
+        for (uint32_t rankId = 0; rankId < ndev; rankId++) {
+            ret = aclrtSetDevice(rankId);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetDevice failed. ERROR: %d\n", ret); return ret);
+            ret = aclrtCreateContext(&context[rankId], rankId);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtCreateContext failed. ERROR: %d\n", ret); return ret);
+            ret = aclrtCreateStream(&stream[rankId]);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtCreateStream failed. ERROR: %d\n", ret); return ret);
+        }
+        // Start multiple threads.
+        std::vector<std::unique_ptr<std::thread>> threads(ndev);
+        for (uint32_t rankId = 0; rankId < ndev; rankId++) {
+            args[rankId].rankId = rankId;
+            args[rankId].hcclComm = comms[rankId];
+            args[rankId].stream = stream[rankId];
+            args[rankId].context = context[rankId];
+            threads[rankId].reset(new(std::nothrow) std::thread(&launchOneThreadMatmulAlltoAllV2, std::ref(args[rankId])));
+        }
+        for (uint32_t rankId = 0; rankId < ndev; rankId++) {
+            threads[rankId]->join();
+        }
+        aclFinalize();
+        return 0;
+    }
+    ```
+
+<!-- end id28 -->
+<!-- npu="950" id29 -->
+- <term>Ascend 950PR&950DT products</term>:
+
+    ```Cpp
+    #include <thread>
+    #include <iostream>
+    #include <string>
+    #include <cstring>
+    #include <vector>
+    #include <acl/acl.h>
+    #include <hccl/hccl.h>
+    #include "aclnnop/aclnn_matmul_allto_all_v2.h"
+
+    int ndev = 2;
+
+    #define CHECK_RET(cond, return_expr) \
+    do {                               \
+        if (!(cond)) {                   \
+        return_expr;                   \
+        }                                \
+    } while (0)
+
+    #define LOG_PRINT(message, ...)     \
+    do {                              \
+        printf(message, ##__VA_ARGS__); \
+    } while (0)
+
+    int64_t GetShapeSize(const std::vector<int64_t> &shape) {
+        int64_t shapeSize = 1;
+        for (auto i: shape) {
+            shapeSize *= i;
+        }
+        return shapeSize;
+    }
+
+    template<typename T>
+    int CreateAclTensor(const std::vector<T> &hostData, const std::vector<int64_t> &shape, void **deviceAddr,
+                        aclDataType dataType, aclTensor **tensor) {
+        auto size = GetShapeSize(shape) * sizeof(T);
+        // Call aclrtMalloc to allocate device-side memory.
+        auto ret = aclrtMalloc(deviceAddr, size, ACL_MEM_MALLOC_HUGE_FIRST);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMalloc failed. ERROR: %d\n", ret); return ret);
+        // Call aclrtMemcpy to copy host-side data to device-side memory.
+        ret = aclrtMemcpy(*deviceAddr, size, hostData.data(), size, ACL_MEMCPY_HOST_TO_DEVICE);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMemcpy failed. ERROR: %d\n", ret); return ret);
+        // Calculate the strides of the contiguous tensor.
+        std::vector<int64_t> strides(shape.size(), 1);
+        for (int64_t i = shape.size() - 2; i >= 0; i--) {
+            strides[i] = shape[i + 1] * strides[i + 1];
+        }
+        // Call the aclCreateTensor API to create an aclTensor.
+        *tensor = aclCreateTensor(shape.data(), shape.size(), dataType, strides.data(), 0, aclFormat::ACL_FORMAT_ND,
+                                shape.data(), shape.size(), *deviceAddr);
+        return 0;
+    }
+
+    struct Args {
+        uint32_t rankId;
+        HcclComm hcclComm;
+        aclrtStream stream;
+        aclrtContext context;
+    };
+
+    int launchOneThreadMatmulAlltoAllV2(Args &args) {
+        int ret;
+        ret = aclrtSetCurrentContext(args.context);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetCurrentContext failed. ERROR: %d\n", ret); return ret);
+        char hcom_name[128];
+        ret = HcclGetCommName(args.hcclComm, hcom_name);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("[ERROR] HcclGetCommName failed. ret = %d \n", ret); return -1);
+        LOG_PRINT("[INFO] rank %d hcom: %s stream: %p, context : %p\n", args.rankId, hcom_name, args.stream,
+                args.context);
+
+        std::vector<int64_t> x1Shape = {32, 64};
+        std::vector<int64_t> x2Shape = {64, 128};
+        std::vector<int64_t> biasShape = {128};
+        std::vector<int64_t> outShape = {64, 64};
+        void *x1DeviceAddr = nullptr;
+        void *x2DeviceAddr = nullptr;
+        void *biasDeviceAddr = nullptr;
+        void *outDeviceAddr = nullptr;
+        aclTensor *x1 = nullptr;
+        aclTensor *x2 = nullptr;
+        aclTensor *bias = nullptr;
+        aclTensor *out = nullptr;
+
+        int64_t a2aAxes[2] = {-1, -2};
+        aclIntArray* alltoAllAxesOptional = aclCreateIntArray(a2aAxes, static_cast<uint64_t>(2));
+        uint64_t workspaceSize = 0;
+        aclOpExecutor *executor;
+        void *workspaceAddr = nullptr;
+
+        long long x1ShapeSize = GetShapeSize(x1Shape);
+        long long x2ShapeSize = GetShapeSize(x2Shape);
+        long long biasShapeSize = GetShapeSize(biasShape);
+        long long outShapeSize = GetShapeSize(outShape);
+        std::vector<int16_t> x1HostData(x1ShapeSize, 1);
+        std::vector<int16_t> x2HostData(x2ShapeSize, 1);
+        std::vector<int16_t> biasHostData(biasShapeSize, 1);
+        std::vector<int16_t> outHostData(outShapeSize, 0);
+        // Create a tensor.
+        ret = CreateAclTensor(x1HostData, x1Shape, &x1DeviceAddr, aclDataType::ACL_FLOAT16, &x1);
+        CHECK_RET(ret == ACL_SUCCESS, return ret);
+        ret = CreateAclTensor(x2HostData, x2Shape, &x2DeviceAddr, aclDataType::ACL_FLOAT16, &x2);
+        CHECK_RET(ret == ACL_SUCCESS, return ret);
+        ret = CreateAclTensor(biasHostData, biasShape, &biasDeviceAddr, aclDataType::ACL_FLOAT16, &bias);
+        CHECK_RET(ret == ACL_SUCCESS, return ret);
+        ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT16, &out);
+        CHECK_RET(ret == ACL_SUCCESS, return ret);
+        // Call the first-phase API.
+        ret = aclnnMatmulAlltoAllV2GetWorkspaceSize(x1, x2, bias, alltoAllAxesOptional, hcom_name, "ai_cpu", false, false,
+                                                out, &workspaceSize, &executor);
+        CHECK_RET(ret == ACL_SUCCESS,
+                LOG_PRINT("aclnnMatmulAlltoAllV2GetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
+        // Allocate device memory using the workspaceSize calculated by the first-phase API.
+        if (workspaceSize > 0) {
+            ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
+        }
+        // Call the second-phase API.
+        ret = aclnnMatmulAlltoAllV2(workspaceAddr, workspaceSize, executor, args.stream);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMatmulAlltoAllV2 failed. ERROR: %d\n", ret); return ret);
+        // (boilerplate) Synchronously wait for the task execution to complete.
+        ret = aclrtSynchronizeStreamWithTimeout(args.stream, 10000);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
+        LOG_PRINT("device%d aclnnMatmulAlltoAllV2 execute success \n", args.rankId);
+        // Release device resources. Modify as required by the specific API definition.
+        if (x1 != nullptr) {
+            aclDestroyTensor(x1);
+        }
+        if (x2 != nullptr) {
+            aclDestroyTensor(x2);
+        }
+        if (bias != nullptr) {
+            aclDestroyTensor(bias);
+        }
+        if (out != nullptr) {
+            aclDestroyTensor(out);
+        }
+        if (x1DeviceAddr != nullptr) {
+            aclrtFree(x1DeviceAddr);
+        }
+        if (x2DeviceAddr != nullptr) {
+            aclrtFree(x2DeviceAddr);
+        }
+        if (biasDeviceAddr != nullptr) {
+            aclrtFree(biasDeviceAddr);
+        }
+        if (outDeviceAddr != nullptr) {
+            aclrtFree(outDeviceAddr);
+        }
+        if (workspaceSize > 0) {
+            aclrtFree(workspaceAddr);
+        }
+        aclrtDestroyStream(args.stream);
+        HcclCommDestroy(args.hcclComm);
+        aclrtDestroyContext(args.context);
+        aclrtResetDevice(args.rankId);
+        return 0;
+    }
+
+    int main(int argc, char *argv[])
+    {
+        // This sample is implemented based on <term>Ascend 950PR&950DT products</term> and must run on <term>Ascend 950PR&950DT products</term>.
+        int ret;
+        int32_t devices[ndev];
+        for (int i = 0; i < ndev; i++) {
+            devices[i] = i;
+        }
+        HcclComm comms[128];
+        ret = aclInit(nullptr);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclInit failed. ERROR: %d\n", ret); return ret);
+        // Initialize the communicator.
+        for (int i = 0; i < ndev; i++) {
+            ret = aclrtSetDevice(devices[i]);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetDevice failed. ERROR: %d\n", ret); return ret);
+        }
+        ret = HcclCommInitAll(ndev, devices, comms);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("HcclCommInitAll failed. ERROR: %d\n", ret); return ret);
+        Args args[ndev];
+        aclrtStream stream[ndev];
+        aclrtContext context[ndev];
+        for (uint32_t rankId = 0; rankId < ndev; rankId++) {
+            ret = aclrtSetDevice(rankId);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetDevice failed. ERROR: %d\n", ret); return ret);
+            ret = aclrtCreateContext(&context[rankId], rankId);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtCreateContext failed. ERROR: %d\n", ret); return ret);
+            ret = aclrtCreateStream(&stream[rankId]);
+            CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtCreateStream failed. ERROR: %d\n", ret); return ret);
+        }
+        // Start multithreading.
+        std::vector<std::unique_ptr<std::thread>> threads(ndev);
+        for (uint32_t rankId = 0; rankId < ndev; rankId++) {
+            args[rankId].rankId = rankId;
+            args[rankId].hcclComm = comms[rankId];
+            args[rankId].stream = stream[rankId];
+            args[rankId].context = context[rankId];
+            threads[rankId].reset(new(std::nothrow) std::thread(&launchOneThreadMatmulAlltoAllV2, std::ref(args[rankId])));
+        }
+        for (uint32_t rankId = 0; rankId < ndev; rankId++) {
+            threads[rankId]->join();
+        }
+        aclFinalize();
+        return 0;
+    }
+    ```
+
+<!-- end id29 -->

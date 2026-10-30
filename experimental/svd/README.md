@@ -9,55 +9,55 @@ This catalog contains custom operators for ShadowKV method, based on the cann-op
 **Low-rank SVD components：**
 
 ```mermaid
-stateDiagram-v2
-	Active: Low-rank SVD
-	Gauss: Gauss matrix
-	Jacobi: Jacobi SVD<br>fp32
-	MatMul1: Y = A @ G
-	MatMul2: A' = Q<sup>T</sup> @ A
-	MatMul3: U = Q @ U`
-	MatMul4: Calculation Q<br>fp32
+	stateDiagram-v2
+		Active: Low-rank SVD
+		Gauss: Gauss matrix
+		Jacobi: Jacobi SVD<br>fp32
+		MatMul1: Y = A @ G
+		MatMul2: A' = Q<sup>T</sup> @ A
+		MatMul3: U = Q @ U`
+		MatMul4: Calculation Q<br>fp32
 
-	classDef ActiveState font-size:18pt,font-weight:bold,font-style:italic,color:black,fill:white
-	classDef TSQRState font-size:16pt,font-weight:bold,color:black,fill:white,stroke-width:2px,stroke:#b0d89c
-	classDef CUBState font-size:14pt,font-weight:bold,color:black,fill:#dd80aa,stroke:#dd80aa
-	classDef VECState font-size:14pt,font-weight:bold,color:black,fill:#94dae2,stroke:#94dae2
+		classDef ActiveState font-size:18pt,font-weight:bold,font-style:italic,color:black,fill:white
+		classDef TSQRState font-size:16pt,font-weight:bold,color:black,fill:white,stroke-width:2px,stroke:#b0d89c
+		classDef CUBState font-size:14pt,font-weight:bold,color:black,fill:#dd80aa,stroke:#dd80aa
+		classDef VECState font-size:14pt,font-weight:bold,color:black,fill:#94dae2,stroke:#94dae2
 
-	state TSQR {
-		HouseholderQR: Householder QR<br>fp32
-		MatMul4 --> HouseholderQR
-		HouseholderQR --> MatMul4
-	}
-	TSQR: TSQR fp32
-    state Active {
-		direction LR
-		[*] --> MatMul1: A{B,S,D}
-		Gauss --> MatMul1: G{D,R}
-		MatMul1 --> TSQR: Y{B,S,R}
-		TSQR --> MatMul2: Q{B,S,R}
-		[*] --> MatMul2: A{B,S,D}
-		MatMul2 --> Jacobi: A'{B,R,D}
-		TSQR --> MatMul3: Q{B,S,R}
-		Jacobi --> MatMul3: U`{B,R,R}
-		Jacobi --> [*]: S{B,R}<br>V<sup>T</sup>{B,D,R}
-		MatMul3 --> [*]: U{B,S,R}
-		MatMul: CUB
-		Vector: VEC
-	}
+		state TSQR {
+			HouseholderQR: Householder QR<br>fp32
+			MatMul4 --> HouseholderQR
+			HouseholderQR --> MatMul4
+		}
+		TSQR: TSQR fp32
+		state Active {
+			direction LR
+			[*] --> MatMul1: A{B,S,D}
+			Gauss --> MatMul1: G{D,R}
+			MatMul1 --> TSQR: Y{B,S,R}
+			TSQR --> MatMul2: Q{B,S,R}
+			[*] --> MatMul2: A{B,S,D}
+			MatMul2 --> Jacobi: A'{B,R,D}
+			TSQR --> MatMul3: Q{B,S,R}
+			Jacobi --> MatMul3: U`{B,R,R}
+			Jacobi --> [*]: S{B,R}<br>V<sup>T</sup>{B,D,R}
+			MatMul3 --> [*]: U{B,S,R}
+			MatMul: CUB
+			Vector: VEC
+		}
 
-	class Active ActiveState
-	class MatMul1, MatMul2, MatMul3, MatMul4, MatMul CUBState
-	class Gauss, Jacobi, HouseholderQR, Vector VECState
-	class TSQR TSQRState
+		class Active ActiveState
+		class MatMul1, MatMul2, MatMul3, MatMul4, MatMul CUBState
+		class Gauss, Jacobi, HouseholderQR, Vector VECState
+		class TSQR TSQRState
 ```
 
 ## Custom Kernel Input/Output (I/O)
 
-**Parameters description:**  
-B: batch size is zero or more batch dimensions  
-S: sequence length (127 < S < 8M)  
-D: hidden dimension (31 < D < 2K)  
-R: SVD rank size (15 < R < D)  
+**Parameters description:**
+B: batch size is zero or more batch dimensions
+S: sequence length (127 < S < 8M)
+D: hidden dimension (31 < D < 2K)
+R: SVD rank size (15 < R < D)
 
 **Input**
 
@@ -83,7 +83,7 @@ There are 4 linear algebra operators npu_linalg are the core implementation modu
 | Jacobi        | torch.linalg.svd(A) | torch.ops.npu_linalg.svd(A) | Jacobi rotation SVD                 |
 | SvdLowrank    | torch.svd_lowrank(A, q=6, niter=2) | torch.ops.npu_linalg.svd_lowrank(A, q=6, niter=2) | Low-rank SVD |
 
-**Directory structure**  
+**Directory structure**
 
 ```
 ├── svd                   # Linear algebra components for ShadowKV SVD
