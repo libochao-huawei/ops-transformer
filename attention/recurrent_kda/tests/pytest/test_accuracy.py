@@ -361,6 +361,23 @@ def run_invalid_state_stride_case(desc, stride_kind):
 def test_recurrent_kda_accuracy():
     results = [
         run_case(
+            "BSND K128 FP32 V-first state without cu_seqlens",
+            {
+                "layout": "BSND",
+                "batch": 1,
+                "seq_len": 1,
+                "h": 2,
+                "hv": 2,
+                "kdim": 128,
+                "vdim": 128,
+                "seed": 0,
+                "state_dtype": torch.float32,
+                "state_v_first": True,
+            },
+            {"state_v_first": True},
+            use_cu_seqlens=False,
+        ),
+        run_case(
             "BSND raw gate, safe_gate=False, beta sigmoid",
             {"layout": "BSND", "batch": 2, "seq_len": 2, "seed": 1},
             {

@@ -530,363 +530,281 @@ aclnnStatus aclnnRecurrentKda(
 示例代码如下，仅供参考，具体编译和执行过程请参考[编译与运行样例](../../../docs/zh/context/compile_and_run_sample.md)。
 
 ```Cpp
-#include <iostream>
-#include <vector>
+#include <cerrno>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include "securec.h"
+#include <limits>
+#include <vector>
 #include "acl/acl.h"
 #include "aclnnop/aclnn_recurrent_kda.h"
 
-using namespace std;
+#define CHECK_RET(cond, returnExpr) \
+    do { \
+        if (!(cond)) { \
+            returnExpr; \
+        } \
+    } while (0)
 
 namespace {
+constexpr int64_t BATCH = 1;
+constexpr int64_t SEQ_LEN = 2;
+constexpr int64_t KEY_HEADS = 2;
+constexpr int64_t VALUE_HEADS = 4;
+constexpr int64_t KEY_DIM = 128;
+constexpr int64_t VALUE_DIM = 128;
+constexpr int64_t PRINT_COUNT = 5;
+constexpr float TOLERANCE = 1.0e-6F;
 
-#define CHECK_RET(cond) ((cond) ? true :(false))
+struct TensorResource {
+    void* deviceAddr = nullptr;
+    aclTensor* tensor = nullptr;
+};
 
-#define LOG_PRINT(message, ...)     \
-  do {                              \
-    (void)printf(message, ##__VA_ARGS__); \
-  } while (0)
+struct Resources {
+    int32_t deviceId = 0;
+    bool aclInitialized = false;
+    bool deviceInitialized = false;
+    aclrtContext context = nullptr;
+    aclrtStream stream = nullptr;
+    void* workspaceAddr = nullptr;
+    std::vector<TensorResource> tensors;
 
-int64_t GetShapeSize(const std::vector<int64_t>& shape) {
-  int64_t shapeSize = 1;
-  for (auto i : shape) {
-    shapeSize *= i;
-  }
-  return shapeSize;
+    ~Resources()
+    {
+        if (stream != nullptr) {
+            (void)aclrtSynchronizeStream(stream);
+        }
+        for (const auto& tensor : tensors) {
+            if (tensor.tensor != nullptr) {
+                (void)aclDestroyTensor(tensor.tensor);
+            }
+            if (tensor.deviceAddr != nullptr) {
+                (void)aclrtFree(tensor.deviceAddr);
+            }
+        }
+        if (workspaceAddr != nullptr) {
+            (void)aclrtFree(workspaceAddr);
+        }
+        if (stream != nullptr) {
+            (void)aclrtDestroyStream(stream);
+        }
+        if (context != nullptr) {
+            (void)aclrtDestroyContext(context);
+        }
+        if (deviceInitialized) {
+            (void)aclrtResetDevice(deviceId);
+        }
+        if (aclInitialized) {
+            (void)aclFinalize();
+        }
+    }
+};
+
+bool CheckAcl(aclError ret, const char* operation)
+{
+    if (ret == ACL_SUCCESS) {
+        return true;
+    }
+    const char* message = aclGetRecentErrMsg();
+    std::printf("%s failed. ERROR: %d. %s\n", operation, ret, message == nullptr ? "" : message);
+    return false;
 }
 
-int Init(int32_t deviceId, aclrtStream* stream) {
-  auto ret = aclInit(nullptr);
-  if (!CHECK_RET(ret == ACL_SUCCESS)) {
-    LOG_PRINT("aclInit failed. ERROR: %d\n", ret);
-    return ret;
-  }
-  ret = aclrtSetDevice(deviceId);
-  if (!CHECK_RET(ret == ACL_SUCCESS)) {
-    LOG_PRINT("aclrtSetDevice failed. ERROR: %d\n", ret);
-    return ret;
-  }
-  ret = aclrtCreateStream(stream);
-  if (!CHECK_RET(ret == ACL_SUCCESS)) {
-    LOG_PRINT("aclrtCreateStream failed. ERROR: %d\n", ret);
-    return ret;
-  }
-  return 0;
+int64_t GetShapeSize(const std::vector<int64_t>& shape)
+{
+    int64_t size = 1;
+    for (auto dim : shape) {
+        size *= dim;
+    }
+    return size;
+}
+
+// The example values 0, 1/16 and 1 are represented exactly by BF16.
+uint16_t FloatToBfloat16(float value)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return static_cast<uint16_t>(bits >> 16U);
+}
+
+float Bfloat16ToFloat(uint16_t value)
+{
+    uint32_t bits = static_cast<uint32_t>(value) << 16U;
+    float result = 0.0F;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+bool Init(Resources& resources)
+{
+    CHECK_RET(CheckAcl(aclInit(nullptr), "aclInit"), return false);
+    resources.aclInitialized = true;
+    CHECK_RET(CheckAcl(aclrtSetDevice(resources.deviceId), "aclrtSetDevice"), return false);
+    resources.deviceInitialized = true;
+    CHECK_RET(CheckAcl(aclrtCreateContext(&resources.context, resources.deviceId), "aclrtCreateContext"), return false);
+    CHECK_RET(CheckAcl(aclrtSetCurrentContext(resources.context), "aclrtSetCurrentContext"), return false);
+    CHECK_RET(CheckAcl(aclrtCreateStream(&resources.stream), "aclrtCreateStream"), return false);
+    return true;
 }
 
 template <typename T>
-int CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& shape, void** deviceAddr,
-                    aclDataType dataType, aclTensor** tensor) {
-  auto size = GetShapeSize(shape) * sizeof(T);
-  auto ret = aclrtMalloc(deviceAddr, size, ACL_MEM_MALLOC_HUGE_FIRST);
-  if (!CHECK_RET(ret == ACL_SUCCESS)) {
-    LOG_PRINT("aclrtMalloc failed. ERROR: %d\n", ret);
-    return ret;
-  }
-
-  ret = aclrtMemcpy(*deviceAddr, size, hostData.data(), size, ACL_MEMCPY_HOST_TO_DEVICE);
-  if (!CHECK_RET(ret == ACL_SUCCESS)) {
-    LOG_PRINT("aclrtMemcpy failed. ERROR: %d\n", ret);
-    return ret;
-  }
-
-  std::vector<int64_t> strides(shape.size(), 1);
-  for (int64_t i = shape.size() - 2; i >= 0; i--) {
-    strides[i] = shape[i + 1] * strides[i + 1];
-  }
-
-  *tensor = aclCreateTensor(shape.data(), shape.size(), dataType, strides.data(), 0, aclFormat::ACL_FORMAT_ND,
-                            shape.data(), shape.size(), *deviceAddr);
-  return 0;
+bool CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& shape, aclDataType dataType,
+                     Resources& resources, TensorResource& result)
+{
+    CHECK_RET(static_cast<int64_t>(hostData.size()) == GetShapeSize(shape), return false);
+    resources.tensors.emplace_back();
+    auto& tensor = resources.tensors.back();
+    const size_t bytes = hostData.size() * sizeof(T);
+    CHECK_RET(CheckAcl(aclrtMalloc(&tensor.deviceAddr, bytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc"), return false);
+    CHECK_RET(CheckAcl(aclrtMemcpy(tensor.deviceAddr, bytes, hostData.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+                       "aclrtMemcpy H2D"),
+              return false);
+    std::vector<int64_t> strides(shape.size(), 1);
+    for (size_t i = shape.size() - 1; i > 0; --i) {
+        strides[i - 1] = strides[i] * shape[i];
+    }
+    tensor.tensor = aclCreateTensor(shape.data(), shape.size(), dataType, strides.data(), 0, ACL_FORMAT_ND,
+                                    shape.data(), shape.size(), tensor.deviceAddr);
+    CHECK_RET(tensor.tensor != nullptr, std::printf("aclCreateTensor failed.\n"); return false);
+    result = tensor;
+    return true;
 }
 
-struct TensorResources {
-    void* queryDeviceAddr = nullptr;
-    void* keyDeviceAddr = nullptr;
-    void* valueDeviceAddr = nullptr;
-    void* gateDeviceAddr = nullptr;
-    void* betaDeviceAddr = nullptr;
-    void* initialStateDeviceAddr = nullptr;
-    void* outDeviceAddr = nullptr;
-    void* finalStateDeviceAddr = nullptr;
-
-    aclTensor* queryTensor = nullptr;
-    aclTensor* keyTensor = nullptr;
-    aclTensor* valueTensor = nullptr;
-    aclTensor* gateTensor = nullptr;
-    aclTensor* betaTensor = nullptr;
-    aclTensor* initialStateTensor = nullptr;
-    aclTensor* outTensor = nullptr;
-    aclTensor* finalStateTensor = nullptr;
-};
-
-int InitializeTensors(TensorResources& resources) {
-    // BSND layout: q/k [B,T,H_k,K], v [B,T,H_v,V], gate [B,T,H_v,K], beta [B,T,H_v]
-    // state [seq_num,H_v,V,K]
-    int64_t B = 1;
-    int64_t T = 1;
-    int64_t Hk = 2;
-    int64_t Hv = 2;
-    int64_t K = 128;
-    int64_t V = 128;
-
-    std::vector<int64_t> queryShape = {B, T, Hk, K};
-    std::vector<int64_t> keyShape = {B, T, Hk, K};
-    std::vector<int64_t> valueShape = {B, T, Hv, V};
-    std::vector<int64_t> gateShape = {B, T, Hv, K};
-    std::vector<int64_t> betaShape = {B, T, Hv};
-    std::vector<int64_t> initialStateShape = {B, Hv, V, K};
-    std::vector<int64_t> outShape = {B, T, Hv, V};
-    std::vector<int64_t> finalStateShape = {B, Hv, V, K};
-
-    int64_t querySize = GetShapeSize(queryShape);
-    int64_t keySize = GetShapeSize(keyShape);
-    int64_t valueSize = GetShapeSize(valueShape);
-    int64_t gateSize = GetShapeSize(gateShape);
-    int64_t betaSize = GetShapeSize(betaShape);
-    int64_t initialStateSize = GetShapeSize(initialStateShape);
-    int64_t outSize = GetShapeSize(outShape);
-    int64_t finalStateSize = GetShapeSize(finalStateShape);
-
-    std::vector<aclBfloat16> queryHostData(querySize, 0);
-    std::vector<aclBfloat16> keyHostData(keySize, 0);
-    std::vector<aclBfloat16> valueHostData(valueSize, 0);
-    std::vector<float> gateHostData(gateSize, 0);
-    std::vector<float> betaHostData(betaSize, 0);
-    std::vector<float> initialStateHostData(initialStateSize, 0);
-    std::vector<aclBfloat16> outHostData(outSize, 0);
-    std::vector<float> finalStateHostData(finalStateSize, 0);
-
-    // Create query aclTensor.
-    int ret = CreateAclTensor(queryHostData, queryShape, &resources.queryDeviceAddr,
-                             aclDataType::ACL_BF16, &resources.queryTensor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-      return ret;
-    }
-
-    // Create key aclTensor.
-    ret = CreateAclTensor(keyHostData, keyShape, &resources.keyDeviceAddr,
-                         aclDataType::ACL_BF16, &resources.keyTensor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-      return ret;
-    }
-
-    // Create value aclTensor.
-    ret = CreateAclTensor(valueHostData, valueShape, &resources.valueDeviceAddr,
-                         aclDataType::ACL_BF16, &resources.valueTensor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-      return ret;
-    }
-
-    // Create gate aclTensor.
-    ret = CreateAclTensor(gateHostData, gateShape, &resources.gateDeviceAddr,
-                         aclDataType::ACL_FLOAT, &resources.gateTensor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-      return ret;
-    }
-
-    // Create beta aclTensor.
-    ret = CreateAclTensor(betaHostData, betaShape, &resources.betaDeviceAddr,
-                         aclDataType::ACL_FLOAT, &resources.betaTensor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-      return ret;
-    }
-
-    // Create initialState aclTensor.
-    ret = CreateAclTensor(initialStateHostData, initialStateShape, &resources.initialStateDeviceAddr,
-                         aclDataType::ACL_FLOAT, &resources.initialStateTensor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-      return ret;
-    }
-
-    // Create out aclTensor.
-    ret = CreateAclTensor(outHostData, outShape, &resources.outDeviceAddr,
-                         aclDataType::ACL_BF16, &resources.outTensor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-      return ret;
-    }
-
-    // Create finalState aclTensor.
-    ret = CreateAclTensor(finalStateHostData, finalStateShape, &resources.finalStateDeviceAddr,
-                         aclDataType::ACL_FLOAT, &resources.finalStateTensor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-      return ret;
-    }
-
-    return ACL_SUCCESS;
+template <typename T>
+bool CopyToHost(const TensorResource& tensor, std::vector<T>& result)
+{
+    const size_t bytes = result.size() * sizeof(T);
+    return CheckAcl(aclrtMemcpy(result.data(), bytes, tensor.deviceAddr, bytes, ACL_MEMCPY_DEVICE_TO_HOST),
+                    "aclrtMemcpy D2H");
 }
 
-int ExecuteRecurrentKda(TensorResources& resources, aclrtStream stream,
-                        void** workspaceAddr, uint64_t* workspaceSize) {
-    constexpr const char layoutStr[] = "BSND";
-    double scale = 1.0 / sqrt(128.0);
-    bool outputFinalState = true;
-    bool inplaceFinalState = true;
-    bool useQkL2normInKernel = false;
-    bool useGateInKernel = false;
-    bool useBetaSigmoidInKernel = false;
-    bool allowNegEigval = false;
-    bool safeGate = false;
-    double lowerBound = -5.0;
-    bool stateVFirst = true;
-    aclOpExecutor* executor;
+bool CheckResults(const TensorResource& out, const TensorResource& finalState, const TensorResource& initialState)
+{
+    const int64_t valuesPerToken = VALUE_HEADS * VALUE_DIM;
+    const int64_t stateSize = BATCH * VALUE_HEADS * VALUE_DIM * KEY_DIM;
+    std::vector<uint16_t> outData(BATCH * SEQ_LEN * valuesPerToken);
+    std::vector<float> finalStateData(stateSize);
+    std::vector<float> initialStateData(stateSize);
+    CHECK_RET(CopyToHost(out, outData), return false);
+    CHECK_RET(CopyToHost(finalState, finalStateData), return false);
+    CHECK_RET(CopyToHost(initialState, initialStateData), return false);
 
-    int ret = aclnnRecurrentKdaGetWorkspaceSize(
-        resources.queryTensor, resources.keyTensor, resources.valueTensor,
-        resources.gateTensor, resources.betaTensor, resources.initialStateTensor,
-        nullptr, nullptr, nullptr, nullptr, nullptr,
-        layoutStr, scale, outputFinalState, inplaceFinalState, useQkL2normInKernel, useGateInKernel,
-        useBetaSigmoidInKernel, allowNegEigval, safeGate, lowerBound, stateVFirst,
-        resources.outTensor, resources.finalStateTensor, workspaceSize, &executor);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-        LOG_PRINT("aclnnRecurrentKdaGetWorkspaceSize failed. ERROR: %d\n", ret);
-        return ret;
-    }
-
-    if (*workspaceSize > 0ULL) {
-        ret = aclrtMalloc(workspaceAddr, *workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
-        if (!CHECK_RET(ret == ACL_SUCCESS)) {
-            LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret);
-            return ret;
+    // S0=0, k=q=1/16, v=1, gate=0, beta=1/2, scale=1.
+    // S1=1/32, S2=7/128; o1=1/4, o2=7/16 for every head and value element.
+    const float expectedOut[SEQ_LEN] = {0.25F, 0.4375F};
+    const float expectedState = 0.0546875F;
+    for (size_t i = 0; i < outData.size(); ++i) {
+        const float actual = Bfloat16ToFloat(outData[i]);
+        const int64_t token = (i / valuesPerToken) % SEQ_LEN;
+        if (!std::isfinite(actual) || std::fabs(actual - expectedOut[token]) > TOLERANCE) {
+            std::printf("out[%zu] mismatch: actual=%f, expected=%f\n", i, actual, expectedOut[token]);
+            return false;
         }
     }
-
-    ret = aclnnRecurrentKda(*workspaceAddr, *workspaceSize, executor, stream);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-        LOG_PRINT("aclnnRecurrentKda failed. ERROR: %d\n", ret);
-        return ret;
+    for (size_t i = 0; i < finalStateData.size(); ++i) {
+        if (!std::isfinite(finalStateData[i]) || !std::isfinite(initialStateData[i]) ||
+            std::fabs(finalStateData[i] - expectedState) > TOLERANCE ||
+            std::fabs(initialStateData[i] - expectedState) > TOLERANCE) {
+            std::printf("state[%zu] mismatch: final=%f, inplace=%f, expected=%f\n", i, finalStateData[i],
+                        initialStateData[i], expectedState);
+            return false;
+        }
     }
-
-    return ACL_SUCCESS;
+    for (int64_t token = 0; token < SEQ_LEN; ++token) {
+        for (int64_t i = 0; i < PRINT_COUNT; ++i) {
+            std::printf("out token[%ld] result[%ld] is: %f\n", token, i,
+                        Bfloat16ToFloat(outData[token * valuesPerToken + i]));
+        }
+    }
+    for (int64_t i = 0; i < PRINT_COUNT; ++i) {
+        std::printf("finalState result[%ld] is: %.7f\n", i, finalStateData[i]);
+    }
+    std::printf("RecurrentKda example passed: out, finalState and inplace state match expected values.\n");
+    return true;
 }
 
-int PrintOutResult(std::vector<int64_t> &shape, void** deviceAddr) {
-  auto size = GetShapeSize(shape);
-  std::vector<aclBfloat16> resultData(size, 0);
-  auto ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]),
-                         *deviceAddr, size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
-  if (!CHECK_RET(ret == ACL_SUCCESS)) {
-        LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret);
-        return ret;
-  }
-  for (int64_t i = 0; i < size; i++) {
-    LOG_PRINT("mean result[%ld] is: %f\n", i, aclBfloat16ToFloat(resultData[i]));
-  }
-  return ACL_SUCCESS;
+bool RunExample(Resources& resources)
+{
+    // BSND: q/k [B,T,Hk,K], value/out [B,T,Hv,V], gate [B,T,Hv,K], beta [B,T,Hv].
+    // stateVFirst=true: state [B,Hv,V,K]. Hv/Hk=2 demonstrates shared query/key heads.
+    const std::vector<int64_t> qkShape = {BATCH, SEQ_LEN, KEY_HEADS, KEY_DIM};
+    const std::vector<int64_t> valueShape = {BATCH, SEQ_LEN, VALUE_HEADS, VALUE_DIM};
+    const std::vector<int64_t> gateShape = {BATCH, SEQ_LEN, VALUE_HEADS, KEY_DIM};
+    const std::vector<int64_t> betaShape = {BATCH, SEQ_LEN, VALUE_HEADS};
+    const std::vector<int64_t> stateShape = {BATCH, VALUE_HEADS, VALUE_DIM, KEY_DIM};
+    const std::vector<uint16_t> qkData(GetShapeSize(qkShape), FloatToBfloat16(0.0625F));
+    const std::vector<uint16_t> valueData(GetShapeSize(valueShape), FloatToBfloat16(1.0F));
+    const std::vector<float> gateData(GetShapeSize(gateShape), 0.0F);
+    const std::vector<float> betaData(GetShapeSize(betaShape), 0.5F);
+    const std::vector<float> stateData(GetShapeSize(stateShape), 0.0F);
+    const std::vector<uint16_t> outData(GetShapeSize(valueShape), FloatToBfloat16(0.0F));
+    TensorResource query, key, value, gate, beta, initialState, out, finalState;
+    CHECK_RET(CreateAclTensor(qkData, qkShape, ACL_BF16, resources, query), return false);
+    CHECK_RET(CreateAclTensor(qkData, qkShape, ACL_BF16, resources, key), return false);
+    CHECK_RET(CreateAclTensor(valueData, valueShape, ACL_BF16, resources, value), return false);
+    CHECK_RET(CreateAclTensor(gateData, gateShape, ACL_FLOAT, resources, gate), return false);
+    CHECK_RET(CreateAclTensor(betaData, betaShape, ACL_FLOAT, resources, beta), return false);
+    CHECK_RET(CreateAclTensor(stateData, stateShape, ACL_FLOAT, resources, initialState), return false);
+    CHECK_RET(CreateAclTensor(outData, valueShape, ACL_BF16, resources, out), return false);
+    CHECK_RET(CreateAclTensor(stateData, stateShape, ACL_FLOAT, resources, finalState), return false);
+
+    // 1. First phase: validate inputs and obtain the workspace size and executor.
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    const char layout[] = "BSND";
+    const double scale = 1.0;
+    const bool outputFinalState = true;
+    const bool inplaceFinalState = true;
+    const bool useQkL2normInKernel = false;
+    const bool useGateInKernel = false;
+    const bool useBetaSigmoidInKernel = false;
+    const bool allowNegEigval = false;
+    const bool safeGate = false;
+    const double lowerBound = -5.0;
+    const bool stateVFirst = true;
+    auto ret = aclnnRecurrentKdaGetWorkspaceSize(
+        query.tensor, key.tensor, value.tensor, gate.tensor, beta.tensor, initialState.tensor, nullptr, nullptr,
+        nullptr, nullptr, nullptr, layout, scale, outputFinalState, inplaceFinalState, useQkL2normInKernel,
+        useGateInKernel, useBetaSigmoidInKernel, allowNegEigval, safeGate, lowerBound, stateVFirst, out.tensor,
+        finalState.tensor, &workspaceSize, &executor);
+    CHECK_RET(CheckAcl(ret, "aclnnRecurrentKdaGetWorkspaceSize"), return false);
+    if (workspaceSize > 0) {
+        CHECK_RET(CheckAcl(aclrtMalloc(&resources.workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST),
+                           "allocate workspace"),
+                  return false);
+    }
+
+    // 2. Second phase: launch the operator and wait for completion before reading results.
+    ret = aclnnRecurrentKda(resources.workspaceAddr, workspaceSize, executor, resources.stream);
+    CHECK_RET(CheckAcl(ret, "aclnnRecurrentKda"), return false);
+    CHECK_RET(CheckAcl(aclrtSynchronizeStream(resources.stream), "aclrtSynchronizeStream"), return false);
+    return CheckResults(out, finalState, initialState);
 }
-
-void CleanupResources(TensorResources& resources, void* workspaceAddr,
-                     aclrtStream stream, int32_t deviceId) {
-    if (resources.queryTensor) {
-      aclDestroyTensor(resources.queryTensor);
-    }
-    if (resources.keyTensor) {
-      aclDestroyTensor(resources.keyTensor);
-    }
-    if (resources.valueTensor) {
-      aclDestroyTensor(resources.valueTensor);
-    }
-    if (resources.gateTensor) {
-      aclDestroyTensor(resources.gateTensor);
-    }
-    if (resources.betaTensor) {
-      aclDestroyTensor(resources.betaTensor);
-    }
-    if (resources.initialStateTensor) {
-      aclDestroyTensor(resources.initialStateTensor);
-    }
-    if (resources.outTensor) {
-      aclDestroyTensor(resources.outTensor);
-    }
-    if (resources.finalStateTensor) {
-      aclDestroyTensor(resources.finalStateTensor);
-    }
-
-    if (resources.queryDeviceAddr) {
-      aclrtFree(resources.queryDeviceAddr);
-    }
-    if (resources.keyDeviceAddr) {
-      aclrtFree(resources.keyDeviceAddr);
-    }
-    if (resources.valueDeviceAddr) {
-      aclrtFree(resources.valueDeviceAddr);
-    }
-    if (resources.gateDeviceAddr) {
-      aclrtFree(resources.gateDeviceAddr);
-    }
-    if (resources.betaDeviceAddr) {
-      aclrtFree(resources.betaDeviceAddr);
-    }
-    if (resources.initialStateDeviceAddr) {
-      aclrtFree(resources.initialStateDeviceAddr);
-    }
-    if (resources.outDeviceAddr) {
-      aclrtFree(resources.outDeviceAddr);
-    }
-    if (resources.finalStateDeviceAddr) {
-      aclrtFree(resources.finalStateDeviceAddr);
-    }
-
-    if (workspaceAddr) {
-      aclrtFree(workspaceAddr);
-    }
-    if (stream) {
-      aclrtDestroyStream(stream);
-    }
-
-    aclrtResetDevice(deviceId);
-    aclFinalize();
-}
-
 } // namespace
 
-int main() {
-
-    int32_t deviceId = 0;
-    aclrtStream stream = nullptr;
-    TensorResources resources = {};
-    void* workspaceAddr = nullptr;
-    uint64_t workspaceSize = 0;
-    std::vector<int64_t> outShape = {1, 1, 2, 128};
-    int ret = ACL_SUCCESS;
-
-    // 1. Initialize device and stream
-    ret = Init(deviceId, &stream);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-        LOG_PRINT("Init acl failed. ERROR: %d\n", ret);
-        return ret;
+int main(int argc, char* argv[])
+{
+    Resources resources;
+    if (argc > 2) {
+        std::printf("Usage: %s [deviceId]\n", argv[0]);
+        return 1;
     }
-
-    // 2. Initialize tensors
-    ret = InitializeTensors(resources);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-        CleanupResources(resources, workspaceAddr, stream, deviceId);
-        return ret;
+    if (argc == 2) {
+        char* end = nullptr;
+        errno = 0;
+        const long deviceId = std::strtol(argv[1], &end, 10);
+        if (errno != 0 || end == argv[1] || *end != '\0' || deviceId < 0 ||
+            deviceId > std::numeric_limits<int32_t>::max()) {
+            std::printf("Invalid deviceId: %s\n", argv[1]);
+            return 1;
+        }
+        resources.deviceId = static_cast<int32_t>(deviceId);
     }
-
-    // 3. Execute the operation
-    ret = ExecuteRecurrentKda(resources, stream, &workspaceAddr, &workspaceSize);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-        CleanupResources(resources, workspaceAddr, stream, deviceId);
-        return ret;
-    }
-
-    // 4. Synchronize stream
-    ret = aclrtSynchronizeStream(stream);
-    if (!CHECK_RET(ret == ACL_SUCCESS)) {
-        LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret);
-        CleanupResources(resources, workspaceAddr, stream, deviceId);
-        return ret;
-    }
-
-    // 5. Process results
-    printf("-----------out输出-----------\n");
-    PrintOutResult(outShape, &resources.outDeviceAddr);
-
-    // 6. Cleanup resources
-    CleanupResources(resources, workspaceAddr, stream, deviceId);
+    CHECK_RET(Init(resources), return 1);
+    CHECK_RET(RunExample(resources), return 1);
     return 0;
 }
 ```

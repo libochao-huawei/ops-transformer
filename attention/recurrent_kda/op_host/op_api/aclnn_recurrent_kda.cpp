@@ -101,6 +101,34 @@ static bool SameShape(const aclTensor* lhs, const aclTensor* rhs)
     return true;
 }
 
+static bool SameViewStrides(const aclTensor* lhs, const aclTensor* rhs)
+{
+    const auto& lhsStrides = lhs->GetViewStrides();
+    const auto& rhsStrides = rhs->GetViewStrides();
+    if (lhsStrides.size() != rhsStrides.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhsStrides.size(); ++i) {
+        if (lhsStrides[i] != rhsStrides[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool SameTensorView(const aclTensor* lhs, const aclTensor* rhs)
+{
+    if (lhs == rhs) {
+        return true;
+    }
+    void* lhsStorage = lhs->GetStorageAddr();
+    if (lhsStorage == nullptr || lhsStorage != rhs->GetStorageAddr()) {
+        return false;
+    }
+    return lhs->GetStorageOffset() == rhs->GetStorageOffset() && lhs->GetViewOffset() == rhs->GetViewOffset() &&
+           SameShape(lhs, rhs) && SameViewStrides(lhs, rhs);
+}
+
 static bool ParseLayout(const char* layout, RecurrentKdaLayout& parsed)
 {
     if (layout == nullptr || std::strcmp(layout, "BSND") == 0) {
@@ -442,8 +470,12 @@ aclnnStatus aclnnRecurrentKdaGetWorkspaceSize(
                                      params.allowNegEigval, params.safeGate, params.lowerBound, params.stateVFirst,
                                      params.attnOut, finalStateForKernel, executorPtr);
     CHECK_RET(result[0] != nullptr && result[1] != nullptr && result[2] != nullptr, ACLNN_ERR_INNER_NULLPTR);
-    if (params.inplaceFinalState && params.outputFinalState && params.finalState != params.initialStateRef) {
-        CHECK_RET(l0op::ViewCopy(result[1], params.finalState, executorPtr) != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    if (params.inplaceFinalState && params.outputFinalState &&
+        !SameTensorView(params.finalState, params.initialStateRef)) {
+        // ViewCopy requires a contiguous source even for a state pool with padded outer strides.
+        auto updatedState = l0op::Contiguous(result[1], executorPtr);
+        CHECK_RET(updatedState != nullptr, ACLNN_ERR_INNER_NULLPTR);
+        CHECK_RET(l0op::ViewCopy(updatedState, params.finalState, executorPtr) != nullptr, ACLNN_ERR_INNER_NULLPTR);
     }
 
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();
