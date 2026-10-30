@@ -188,12 +188,12 @@ TEST_F(MoeGatingTopKBackwardTiling, moe_gating_top_k_backward_tiling_fail_empty_
     gert::TilingContextPara tilingContextPara(
         "MoeGatingTopKBackward",
         {
-            {{{0}, {0}}, ge::DT_FLOAT, ge::FORMAT_ND},
-            {{{2048, 8}, {2048, 8}}, ge::DT_FLOAT, ge::FORMAT_ND},
-            {{{2048, 8}, {2048, 8}}, ge::DT_INT32, ge::FORMAT_ND},
+            {{{0, 256}, {0, 256}}, ge::DT_FLOAT, ge::FORMAT_ND},
+            {{{0, 8}, {0, 8}}, ge::DT_FLOAT, ge::FORMAT_ND},
+            {{{0, 8}, {0, 8}}, ge::DT_INT32, ge::FORMAT_ND},
         },
         {
-            {{{2048, 256}, {2048, 256}}, ge::DT_FLOAT, ge::FORMAT_ND},
+            {{{0, 256}, {0, 256}}, ge::DT_FLOAT, ge::FORMAT_ND},
         },
         {
             {"renorm", Ops::Transformer::AnyValue::CreateFrom<int64_t>(0)},
@@ -215,7 +215,7 @@ TEST_F(MoeGatingTopKBackwardTiling, moe_gating_top_k_backward_tiling_fail_empty_
         "MoeGatingTopKBackward",
         {
             {{{2048, 256}, {2048, 256}}, ge::DT_FLOAT, ge::FORMAT_ND},
-            {{{0}, {0}}, ge::DT_FLOAT, ge::FORMAT_ND},
+            {{{2048, 0}, {2048, 0}}, ge::DT_FLOAT, ge::FORMAT_ND},
             {{{2048, 8}, {2048, 8}}, ge::DT_INT32, ge::FORMAT_ND},
         },
         {
@@ -242,7 +242,7 @@ TEST_F(MoeGatingTopKBackwardTiling, moe_gating_top_k_backward_tiling_fail_empty_
         {
             {{{2048, 256}, {2048, 256}}, ge::DT_FLOAT, ge::FORMAT_ND},
             {{{2048, 8}, {2048, 8}}, ge::DT_FLOAT, ge::FORMAT_ND},
-            {{{}, {}}, ge::DT_INT32, ge::FORMAT_ND},
+            {{{0, 0}, {0, 0}}, ge::DT_INT32, ge::FORMAT_ND},
         },
         {
             {{{2048, 256}, {2048, 256}}, ge::DT_FLOAT, ge::FORMAT_ND},
@@ -271,7 +271,7 @@ TEST_F(MoeGatingTopKBackwardTiling, moe_gating_top_k_backward_tiling_fail_empty_
             {{{2048, 8}, {2048, 8}}, ge::DT_INT32, ge::FORMAT_ND},
         },
         {
-            {{{}, {}}, ge::DT_FLOAT, ge::FORMAT_ND},
+            {{{0, 256}, {0, 256}}, ge::DT_FLOAT, ge::FORMAT_ND},
         },
         {
             {"renorm", Ops::Transformer::AnyValue::CreateFrom<int64_t>(0)},

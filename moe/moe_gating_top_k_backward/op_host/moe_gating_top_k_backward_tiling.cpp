@@ -156,6 +156,10 @@ ge::graphStatus MoeGatingTopKBackwardTiling::CheckXNorm()
     OP_CHECK_IF(xNormDimSize != X_NORM_INPUT_DIMS,
                 OP_LOGE(context_, "xNorm: Rank must be 2, but got %lu.", xNormDimSize), return ge::GRAPH_FAILED);
 
+    OP_CHECK_IF(
+        xNormShapePtr->GetOriginShape().GetDim(DIM_ZERO) == 0 || xNormShapePtr->GetOriginShape().GetDim(DIM_ONE) == 0,
+        OP_LOGE(context_, "xNorm: Empty tensor is not supported."), return ge::GRAPH_FAILED);
+
     tokenCount_ = xNormShapePtr->GetOriginShape().GetDim(DIM_ZERO);
     expertCount_ = xNormShapePtr->GetOriginShape().GetDim(DIM_ONE);
     OP_CHECK_IF(
@@ -181,6 +185,10 @@ ge::graphStatus MoeGatingTopKBackwardTiling::CheckGradY()
     auto gradYDimSize = gradYShapePtr->GetOriginShape().GetDimNum();
     OP_CHECK_IF(gradYDimSize != GRAD_Y_INPUT_DIMS,
                 OP_LOGE(context_, "gradY: Rank must be 2, but got %lu.", gradYDimSize), return ge::GRAPH_FAILED);
+
+    OP_CHECK_IF(
+        gradYShapePtr->GetOriginShape().GetDim(DIM_ZERO) == 0 || gradYShapePtr->GetOriginShape().GetDim(DIM_ONE) == 0,
+        OP_LOGE(context_, "gradY: Empty tensor is not supported."), return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(gradYShapePtr->GetOriginShape().GetDim(DIM_ZERO) != tokenCount_,
                 OP_LOGE(context_, "gradY: Must match xNorm on dimension 0, but got %ld vs %ld.",
@@ -216,6 +224,10 @@ ge::graphStatus MoeGatingTopKBackwardTiling::CheckExpertIdx()
                 OP_LOGE(context_, "expertIdx: Rank must be 2, but got %lu.", expertIdxDimSize),
                 return ge::GRAPH_FAILED);
 
+    OP_CHECK_IF(expertIdxShapePtr->GetOriginShape().GetDim(DIM_ZERO) == 0 ||
+                    expertIdxShapePtr->GetOriginShape().GetDim(DIM_ONE) == 0,
+                OP_LOGE(context_, "expertIdx: Empty tensor is not supported."), return ge::GRAPH_FAILED);
+
     OP_CHECK_IF(expertIdxShapePtr->GetOriginShape().GetDim(DIM_ZERO) != tokenCount_,
                 OP_LOGE(context_, "expertIdx: Must match xNorm on dimension 0, but got %ld vs %ld.",
                         expertIdxShapePtr->GetOriginShape().GetDim(DIM_ZERO), tokenCount_),
@@ -246,6 +258,9 @@ ge::graphStatus MoeGatingTopKBackwardTiling::CheckAttr()
         renorm_ = *renormPtr;
     }
     OP_LOGI(context_, "Attr renorm: %ld.", renorm_);
+
+    OP_CHECK_IF(renorm_ != 0 && renorm_ != 1, OP_LOGE(context_, "Attr renorm: expected 0 or 1, but got %ld.", renorm_),
+                return ge::GRAPH_FAILED);
 
     const int64_t* normTypePtr = attrs->GetAttrPointer<int64_t>(NORM_TYPE_ATTR_INDEX);
     if (normTypePtr != nullptr) {
@@ -305,6 +320,10 @@ ge::graphStatus MoeGatingTopKBackwardTiling::CheckOutShape()
     auto gradXDimSize = gradXShapePtr->GetOriginShape().GetDimNum();
     OP_CHECK_IF(gradXDimSize != GRAD_Y_INPUT_DIMS,
                 OP_LOGE(context_, "gradX: Rank must be 2, but got %lu.", gradXDimSize), return ge::GRAPH_FAILED);
+
+    OP_CHECK_IF(
+        gradXShapePtr->GetOriginShape().GetDim(DIM_ZERO) == 0 || gradXShapePtr->GetOriginShape().GetDim(DIM_ONE) == 0,
+        OP_LOGE(context_, "gradX: Empty tensor is not supported."), return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(gradXShapePtr->GetOriginShape().GetDim(DIM_ZERO) != tokenCount_,
                 OP_LOGE(context_, "gradX: Must match xNorm on dimension 0, but got %ld vs %ld.",
