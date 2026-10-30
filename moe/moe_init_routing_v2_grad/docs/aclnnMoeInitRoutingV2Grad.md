@@ -229,6 +229,8 @@ aclnnStatus aclnnMoeInitRoutingV2Grad(
     </tbody>
   </table>
 
+  > 说明：空tensor为例外。当gradExpandedX、expandedRowIdx或out为空tensor时，不校验该tensor自身的数据类型，也不会因其数据类型不在支持范围内返回161002。
+
 ## aclnnMoeInitRoutingV2Grad
 
 - **参数说明：**
