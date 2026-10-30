@@ -32,7 +32,7 @@ ge::graphStatus MoeFinalizeRoutingTilingV2::GetPlatformInfo()
                     "Required platformInfo metadata is null; context_->GetPlatformInfo() must provide a valid object."),
                 return ge::GRAPH_FAILED);
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
-    socVersion_ = ascendcPlatform.GetSocVersion();
+    npuArch_ = ascendcPlatform.GetCurNpuArch();
     return DoGetPlatformInfo();
 }
 

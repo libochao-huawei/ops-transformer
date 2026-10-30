@@ -15,6 +15,7 @@
 #ifndef AIR_CXX_RUNTIME_V2_OP_IMPL_MOE_GATING_TOP_K_SOFTMAX_V2_H_
 #define AIR_CXX_RUNTIME_V2_OP_IMPL_MOE_GATING_TOP_K_SOFTMAX_V2_H_
 #include <cstdint>
+#include "op_host/util/op_const_def.h"
 #include <vector>
 #include "register/tilingdata_base.h"
 #include "tiling/tiling_api.h"
@@ -223,7 +224,7 @@ protected:
     int32_t k;
     int32_t renorm;
     int32_t softmaxFlag;
-    platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
+    NpuArch npuArch = Ops::Base::DAV_2201;
 };
 
 inline uint32_t CeilDiv(uint32_t value, uint32_t factor)

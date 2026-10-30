@@ -159,7 +159,7 @@ protected:
 protected:
     // platform info
     std::string nodeName_ = "";
-    platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
+    NpuArch npuArch_ = Ops::Base::DAV_2201;
     uint32_t blockSize_ = 32U;
     uint64_t vlFp32_ = 0;
 

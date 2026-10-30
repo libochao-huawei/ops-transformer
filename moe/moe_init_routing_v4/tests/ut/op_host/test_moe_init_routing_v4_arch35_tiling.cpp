@@ -9,6 +9,7 @@
  */
 
 #include <vector>
+#include "op_host/util/op_const_def.h"
 #include <string>
 #include <cstdint>
 #include <limits>
@@ -364,7 +365,7 @@ void RunV4Testcase(int64_t N, int64_t H, int64_t K, int64_t expertCapacity, int6
                    ge::DataType expandedXDtypeOverride, bool hasActiveNum, int64_t activeNumVal, bool hasTopkWeight,
                    ge::graphStatus expectResult, uint64_t expectTilingKey = SKIP_TILING_KEY_VALIDATION)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     gert::TilingContextPara tilingContextPara = MakeV4TilingContextPara(
         N, H, K, expertCapacity, dropPadMode, expertTokensNumType, expertTokensNumFlag, quantMode, xDataType,
         aciveExpertRange, rowIdxType, scaleShape, scaleDtype, offsetShape, offsetDtype, expandedXDtypeOverride,
@@ -394,7 +395,7 @@ struct V4TilingDataCase {
 
 void ExpectV4TilingData(const V4TilingDataCase& testCase, bool expertTokensNumFlag = true)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     gert::TilingContextPara tilingContextPara = MakeV4TilingContextPara(
         testCase.n, testCase.h, testCase.k, testCase.expertCapacity, testCase.dropPadMode, testCase.expertTokensNumType,
         expertTokensNumFlag, testCase.quantMode, testCase.xDataType, testCase.activeExpertRange, testCase.rowIdxType,
@@ -910,7 +911,7 @@ TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_mxfp8_active_topkweigh
 TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_topk_weight_invalid_dtype)
 {
     int64_t h = 83;
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     int64_t n = 1;
     int64_t k = 27;
     int64_t totalLength = n * k;
@@ -928,7 +929,7 @@ TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_topk_weight_invalid_dt
 TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_topk_weight_1d)
 {
     int64_t h = 83;
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     int64_t n = 1;
     int64_t k = 27;
     int64_t totalLength = n * k;
@@ -947,7 +948,7 @@ TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_topk_weight_1d)
 TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_topk_weight_inconsistent)
 {
     int64_t h = 83;
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     int64_t n = 1;
     int64_t k = 27;
     int64_t totalLength = n * k;
@@ -965,7 +966,7 @@ TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_topk_weight_inconsiste
 TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_active_num_invalid_dtype)
 {
     int64_t h = 83;
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     int64_t n = 1;
     int64_t k = 27;
     int64_t totalLength = n * k;
@@ -990,7 +991,7 @@ TEST_F(MoeInitRoutingV4Tiling, hif4_tiling_scale_alg_on_ascend960dt)
     constexpr int64_t k = 2;
     constexpr int64_t rows = n * k;
     // CompileInfo 的 socVersion 字段本算子 tiling 未使用，平台由 TilingContextPara 的 socVersion 字符串决定
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     auto inputDesc = BuildV4Inputs(n, h, k, ge::DT_BF16, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT, false, 0, false, rows);
     auto outputDesc =
         BuildV4Outputs(rows, h, ge::DT_HIFLOAT4, {16}, {{rows, h / 64}, ge::DT_FLOAT}, false, n, k, 0, EXPERT_NUM, -1);
@@ -1015,7 +1016,7 @@ TEST_F(MoeInitRoutingV4Tiling, hif4_rejected_on_a5)
     constexpr int64_t n = 2;
     constexpr int64_t h = 128;
     constexpr int64_t k = 2;
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     auto inputDesc = BuildV4Inputs(n, h, k, ge::DT_BF16, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT, false, 0, false, n * k);
     auto outputDesc = BuildV4Outputs(n * k, h, ge::DT_HIFLOAT4, {16}, {{n * k, h / 64}, ge::DT_FLOAT}, false, n, k, 0,
                                      EXPERT_NUM, -1);
@@ -1032,7 +1033,7 @@ TEST_F(MoeInitRoutingV4Tiling, scale_alg_rejects_invalid_values_and_other_modes)
     constexpr int64_t n = 2;
     constexpr int64_t h = 128;
     constexpr int64_t k = 2;
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     auto inputDesc = BuildV4Inputs(n, h, k, ge::DT_FLOAT16, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT, false, 0, false, n * k);
     auto outputDesc =
         BuildV4Outputs(n * k, h, ge::DT_FLOAT16, {16}, MakePerTokenScaleDesc(n * k), false, n, k, 0, EXPERT_NUM, -1);
@@ -1090,7 +1091,7 @@ TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_false_accepts_unused_c
     const std::vector<std::vector<int64_t>> shapes = {{1}, {256}, {0, 2}, {0}};
     for (size_t index = 0; index < shapes.size(); ++index) {
         SCOPED_TRACE(index);
-        optiling::MoeInitRoutingV3CompileInfo info = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+        optiling::MoeInitRoutingV3CompileInfo info = {40, 262144, Ops::Base::DAV_3510};
         auto inputs = BuildV4Inputs(4, 16, 2, ge::DT_FLOAT16, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT, false, 0, true, 8);
         auto outputs =
             BuildV4Outputs(8, 16, ge::DT_FLOAT16, shapes[index], {{8}, ge::DT_FLOAT}, true, 4, 2, 0, EXPERT_NUM, 0);
@@ -1125,7 +1126,7 @@ TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_false_quantized_topkwe
 
 TEST_F(MoeInitRoutingV4Tiling, moe_init_routing_v4_tiling_false_empty_topkweight_rejects_wrong_second_dimension)
 {
-    optiling::MoeInitRoutingV3CompileInfo info = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo info = {40, 262144, Ops::Base::DAV_3510};
     auto inputs = BuildV4Inputs(0, 16, 2, ge::DT_FLOAT16, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT, false, 0, true, 0);
     auto outputs = BuildV4Outputs(0, 16, ge::DT_FLOAT16, {0}, {{0}, ge::DT_FLOAT}, true, 0, 2, 0, EXPERT_NUM, 0);
     outputs[4] = gert::TilingContextPara::TensorDescription(MakeStorageShape({0, 2}), ge::DT_FLOAT, ge::FORMAT_ND);

@@ -42,7 +42,7 @@ static ge::graphStatus TilingPrepareForMoeInitRoutingV4(gert::TilingParseContext
     uint64_t ubSize;
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     compileInfo->ubSize = static_cast<int64_t>(ubSize);
-    compileInfo->socVersion = ascendcPlatform.GetSocVersion();
+    compileInfo->npuArch = ascendcPlatform.GetCurNpuArch();
     OP_CHECK_IF((compileInfo->ubSize <= 0),
                 OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context->GetNodeName(), "ubSize",
                                                       std::to_string(compileInfo->ubSize), "failed to get ub size"),

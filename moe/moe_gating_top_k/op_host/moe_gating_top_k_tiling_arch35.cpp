@@ -165,7 +165,7 @@ private:
     int64_t inputDtypeSize_;
     const char* opName_ = "";
     MoeGatingTopKRegbaseTilingData moeGatingTopKTilingData_;
-    platform_ascendc::SocVersion socVersion;
+    NpuArch npuArch;
 };
 
 ge::graphStatus MoeGatingTopKTilingRegbase::CheckInputShape4Hash()
@@ -571,7 +571,7 @@ ge::graphStatus MoeGatingTopKTilingRegbase::GetPlatformInfo()
                 return ge::GRAPH_FAILED);
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
     aicoreParams_.numBlocks = ascendcPlatform.GetCoreNumAiv();
-    socVersion = ascendcPlatform.GetSocVersion();
+    npuArch = ascendcPlatform.GetCurNpuArch();
     uint64_t ubSizePlatForm;
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSizePlatForm);
     aicoreParams_.ubSize = ubSizePlatForm;

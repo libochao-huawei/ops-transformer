@@ -10,7 +10,7 @@
 
 /*!
  * \file moe_fused_topk_arch35_tiling_def.h
- * \brief Ascend950 tiling data for MoeFusedTopk.
+ * \brief DAV_3510 tiling data for MoeFusedTopk.
  */
 
 #ifndef ASCENDC_MOE_FUSED_TOPK_ARCH35_TILING_DEF_H_

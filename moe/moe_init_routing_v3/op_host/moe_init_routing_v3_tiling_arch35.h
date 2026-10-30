@@ -17,6 +17,7 @@
 #define MOE_INIT_ROUTING_V3_TILING_ARCH35_H
 
 #include <cmath>
+#include "op_host/util/op_const_def.h"
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -299,7 +300,7 @@ protected:
     int64_t aivCoreNum_ = 0LL;
     int64_t totalUbSize_ = 0LL;
     int64_t availUbSize_ = 0LL;
-    platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
+    NpuArch npuArch_ = Ops::Base::DAV_2201;
 
     // important values
     int64_t sortLoopMaxElement_ = 0LL;

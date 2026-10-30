@@ -143,7 +143,7 @@ protected:
     uint32_t col;
     int64_t k;
     bool hasFinished{false};
-    platform_ascendc::SocVersion socVersion;
+    NpuArch npuArch;
 };
 } // namespace optiling
 

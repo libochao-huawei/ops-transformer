@@ -13,6 +13,7 @@
  * \brief
  */
 #include <string>
+#include "op_host/util/op_const_def.h"
 #include <tuple>
 #include "aclnn_moe_init_routing_v2.h"
 #include "opdev/make_op_executor.h"
@@ -212,7 +213,7 @@ ACLNN_API aclnnStatus aclnnMoeInitRoutingV2GetWorkspaceSize(
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
-    bool is310P = GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND310P;
+    bool is310P = GetCurrentPlatformInfo().GetCurNpuArch() == Ops::Base::DAV_2002;
     aclnnStatus ret;
     if (Ops::Transformer::AclnnUtil::IsRegbase()) {
         ret = MoeInitRoutingV2Check::CheckParamsRegbase(x, expertIdx, expandedXOut, expandedRowIdxOut,

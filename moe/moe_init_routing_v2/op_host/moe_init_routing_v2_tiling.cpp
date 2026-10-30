@@ -16,6 +16,7 @@
 #include <string>
 #include "tiling/platform/platform_ascendc.h"
 #include "moe_init_routing_v2_tiling.h"
+#include "op_host/util/op_const_def.h"
 #include "op_host/tiling_util.h"
 
 namespace optiling {
@@ -113,7 +114,7 @@ ge::graphStatus MoeInitRoutingV2TilingBase::GetPlatformInfo()
 
     mrgSortListMaxElement = 2048; // DAVID下，单词搬运最大元素个数2048
     regBase = Ops::Transformer::OpTiling::IsRegbaseSocVersion(context_);
-    is310P = (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND310P);
+    is310P = (ascendcPlatform.GetCurNpuArch() == Ops::Base::DAV_2002);
     CHECK_FAIL(context_, (is310P && dropPadMode != 0),
                OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context_->GetNodeName(), "dropPadMode",
                                                      std::to_string(dropPadMode).c_str(), "must be 0 on Ascend310P"));

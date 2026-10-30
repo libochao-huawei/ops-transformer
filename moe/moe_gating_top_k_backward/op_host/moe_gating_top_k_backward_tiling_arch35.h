@@ -10,7 +10,7 @@
 
 /*!
  * \file moe_gating_top_k_backward_tiling_arch35.h
- * \brief MoeGatingTopKBackward tiling class declaration for Arch35 (ascend950)
+ * \brief MoeGatingTopKBackward tiling class declaration for Arch35 (DAV_3510)
  */
 
 #ifndef MOE_GATING_TOP_K_BACKWARD_TILING_ARCH35_H

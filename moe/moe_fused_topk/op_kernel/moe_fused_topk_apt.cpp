@@ -10,7 +10,7 @@
 
 /*!
  * \file moe_fused_topk_apt.cpp
- * \brief Ascend950 (arch35) kernel entry point.
+ * \brief DAV_3510 (arch35) kernel entry point.
  */
 
 #include "arch35/moe_fused_topk_arch35.h"

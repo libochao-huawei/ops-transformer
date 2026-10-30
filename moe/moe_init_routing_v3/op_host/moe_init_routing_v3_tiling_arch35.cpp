@@ -49,7 +49,7 @@ ge::graphStatus MoeInitRoutingV3TilingArch35::GetPlatformInfo()
                 return ge::GRAPH_FAILED);
     aivCoreNum_ = static_cast<int64_t>(compileInfoPtr->aivNum);
     totalUbSize_ = static_cast<int64_t>(compileInfoPtr->ubSize);
-    socVersion_ = compileInfoPtr->socVersion;
+    npuArch_ = compileInfoPtr->npuArch;
 
     return ge::GRAPH_SUCCESS;
 }

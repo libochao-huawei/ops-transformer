@@ -11,6 +11,7 @@
 #include "log/log.h"
 #include <string>
 #include <initializer_list>
+#include "op_host/util/op_const_def.h"
 #include <tuple>
 
 #include "aclnn_moe_token_permute_v2.h"
@@ -128,7 +129,7 @@ static inline bool CheckDtypeValidV2Regbase(const aclTensor* tokens, const aclTe
     } else if (quantMode == QUANT_MODE_MXFP4_E2M1) {
         OP_CHECK_DTYPE_NOT_MATCH(permuteTokensOut, DataType::DT_FLOAT4_E2M1, return false);
     } else {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "quantMode only supports -1, 2, 3 or 9 on Ascend 950.");
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "quantMode only supports -1, 2, 3 or 9 on DAV_3510.");
         return false;
     }
     OP_CHECK_DTYPE_NOT_MATCH(expandedScaleOut, DataType::DT_FLOAT8_E8M0, return false);
@@ -316,7 +317,7 @@ aclnnStatus aclnnMoeTokenPermuteV2GetWorkspaceSize(const aclTensor* tokens, cons
         return ACLNN_ERR_PARAM_INVALID;
     }
 
-    if (GetCurrentPlatformInfo().GetCurNpuArch() != NpuArch::DAV_3510) {
+    if (GetCurrentPlatformInfo().GetCurNpuArch() != Ops::Base::DAV_3510) {
         CHECK_RET(MoeTokenPermuteV2Check::CheckParamsV2Fallback(tokens, indices, permuteTokensOut, sortedIndicesOut,
                                                                 expandedScaleOut) == ACLNN_SUCCESS,
                   ACLNN_ERR_PARAM_INVALID);

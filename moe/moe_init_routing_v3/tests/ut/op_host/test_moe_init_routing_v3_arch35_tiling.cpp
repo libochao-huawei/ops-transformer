@@ -9,6 +9,7 @@
  */
 
 #include <iostream>
+#include "op_host/util/op_const_def.h"
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -326,7 +327,7 @@ void RunArch35ExtendedTestcase(int64_t N, int64_t H, int64_t K, int64_t expertCa
                                ge::DataType expandedXDtypeOverride, ge::graphStatus expectResult,
                                uint64_t expectTilingKey = SKIP_TILING_KEY_VALIDATION)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     gert::TilingContextPara tilingContextPara = MakeArch35ExtendedTilingContextPara(
         N, H, K, expertCapacity, dropPadMode, expertTokensNumType, expertTokensNumFlag, quantMode, xDataType,
         aciveExpertRange, rowIdxType, scaleShape, scaleDtype, offsetShape, offsetDtype, expandedXDtypeOverride,
@@ -336,7 +337,7 @@ void RunArch35ExtendedTestcase(int64_t N, int64_t H, int64_t K, int64_t expertCa
 
 void ExpectArch35MxFP8NoQuantUseGatherCopy(int64_t n, int64_t h, int64_t k, int64_t expectedUseGatherCopy)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     std::vector<int64_t> scaleShape = {n, CeilDiv(h, 64), 2};
     gert::TilingContextPara tilingContextPara = MakeArch35ExtendedTilingContextPara(
         n, h, k, 0, 0, EXPERT_TOKENS_TYPE_COUNT, true, QUANT_MODE_UNQUANT, ge::DT_FLOAT8_E5M2, {0, 100},
@@ -384,7 +385,7 @@ void RunSuccessTestcase(int64_t N, int64_t H, int64_t K, int64_t expertCapacity,
                         int64_t rowIdxType, ge::graphStatus result, int64_t expectTilingKey,
                         std::string expectTilingData, std::vector<size_t> expectWorkspaces)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     int64_t activeNum = N * K;
     int64_t expert_num = EXPERT_NUM;
     int64_t E = aciveExpertRange[1] - aciveExpertRange[0];
@@ -419,7 +420,7 @@ void RunFailureTestcase(int64_t N, int64_t H, int64_t K, int64_t expertCapacity,
                         ge::graphStatus result, int64_t expectTilingKey, std::string expectTilingData,
                         std::vector<size_t> expectWorkspaces)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 196608, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 196608, Ops::Base::DAV_3510};
     int64_t activeNum = N * K;
     int64_t expert_num = EXPERT_NUM;
     int64_t E = aciveExpertRange[1] - aciveExpertRange[0];
@@ -452,7 +453,7 @@ void RunDropPadTilingTestcase(int64_t N, int64_t H, int64_t K, int64_t expertCap
                               std::vector<int64_t> activeExpertRange, int64_t rowIdxType, ge::graphStatus result,
                               int64_t expectTilingKey = UINT64_MAX, bool expertTokensNumFlag = true)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     int64_t activeNum = N * K;
     int64_t expertNum = EXPERT_NUM;
     int64_t expertRange = expertTokensNumFlag ? activeExpertRange[1] - activeExpertRange[0] : 0;
@@ -941,7 +942,7 @@ TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_cols_zero_not_
 TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_cols_zero_accepts_zero_active_num)
 {
     constexpr uint64_t FULL_LOAD_UNQUANT_TILING_KEY = 200000ULL;
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     auto tilingContextPara = MakeArch35ExtendedTilingContextPara(
         17, 0, 115, 0, 0, EXPERT_TOKENS_TYPE_COUNT, true, QUANT_MODE_UNQUANT, ge::DT_INT8, {0, EXPERT_NUM},
         ROW_IDX_TYPE_GATHER, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT, kExpandedXDtypeAuto, &compileInfo, 0);
@@ -1027,7 +1028,7 @@ TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_cols_zero_full
     };
     for (const auto& testcase : cases) {
         SCOPED_TRACE(testcase.quantMode);
-        optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+        optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
         auto tilingContextPara = MakeArch35ExtendedTilingContextPara(
             3, 0, 8, 0, 0, EXPERT_TOKENS_TYPE_COUNT, true, testcase.quantMode, testcase.xDtype, {0, EXPERT_NUM},
             ROW_IDX_TYPE_GATHER, testcase.scaleShape, ge::DT_FLOAT, testcase.offsetShape, ge::DT_FLOAT,
@@ -1120,7 +1121,7 @@ TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_cs_cutorigin_u
 // actualExpertNum > 32 故不满足 FullLoad），因此 countingSortMode 应保持 0（COUTSORT_MODE_NONE）。
 TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_cs_cutorigin_nk_below_threshold_fallback)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     gert::TilingContextPara tilingContextPara = MakeArch35ExtendedTilingContextPara(
         2048, 1024, 3, 0, 0, EXPERT_TOKENS_TYPE_COUNT, true, QUANT_MODE_UNQUANT, ge::DT_FLOAT16, {0, 64},
         ROW_IDX_TYPE_GATHER, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT, kExpandedXDtypeAuto, &compileInfo);
@@ -1148,7 +1149,7 @@ TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_false_routing_
     };
     for (const auto& c : cases) {
         SCOPED_TRACE(c.key);
-        optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+        optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
         auto para = MakeArch35ExtendedTilingContextPara(c.n, c.h, c.k, 0, 0, c.type, false, QUANT_MODE_UNQUANT,
                                                         ge::DT_INT8, c.activeRange, c.rowIdxType, {}, ge::DT_FLOAT, {},
                                                         ge::DT_FLOAT, kExpandedXDtypeAuto, &compileInfo);
@@ -1182,7 +1183,7 @@ TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_false_droppad)
 TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_false_accepts_unused_count_shapes)
 {
     for (const auto& shape : std::vector<std::vector<int64_t>>{{1}, {256}, {0, 2}}) {
-        optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+        optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
         auto inputs = BuildArch35ExtendedInputs(4, 16, 2, ge::DT_FLOAT16, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT);
         auto outputs = BuildArch35ExtendedOutputs(8, 16, ge::DT_FLOAT16, shape, {{0}, ge::DT_FLOAT});
         auto attrs = BuildArch35ExtendedAttrs(8, 0, EXPERT_NUM, 0, 1, false, -1, {0, EXPERT_NUM}, 0);
@@ -1194,7 +1195,7 @@ TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_false_accepts_
 
 TEST_F(MoeInitRoutingV3Tiling, moe_init_routing_v3_tiling_regbase_false_skips_unused_count_dtype)
 {
-    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, platform_ascendc::SocVersion::ASCEND950};
+    optiling::MoeInitRoutingV3CompileInfo compileInfo = {40, 262144, Ops::Base::DAV_3510};
     auto inputs = BuildArch35ExtendedInputs(4, 16, 2, ge::DT_FLOAT16, {}, ge::DT_FLOAT, {}, ge::DT_FLOAT);
     auto outputs = BuildArch35ExtendedOutputs(8, 16, ge::DT_FLOAT16, {0}, {{0}, ge::DT_FLOAT});
     outputs[2] = gert::TilingContextPara::TensorDescription(MakeStorageShape({0}), ge::DT_INT32, ge::FORMAT_ND);

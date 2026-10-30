@@ -14,6 +14,7 @@
  */
 
 #include "platform/platform_info.h"
+#include "op_host/util/op_const_def.h"
 #include "register/op_def_registry.h"
 #include "op_host/tiling_templates_registry.h"
 #include "op_host/tiling_type.h"
@@ -83,7 +84,7 @@ private:
 bool MoeGatingTopKSoftmax310PTiling::IsCapable()
 {
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context_->GetPlatformInfo());
-    auto is310P = (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND310P);
+    auto is310P = (ascendcPlatform.GetCurNpuArch() == Ops::Base::DAV_2002);
     return is310P;
 }
 

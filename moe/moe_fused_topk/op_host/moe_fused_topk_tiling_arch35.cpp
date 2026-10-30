@@ -10,7 +10,7 @@
 
 /*!
  * \file moe_fused_topk_tiling_arch35.cpp
- * \brief Standalone Ascend950 tiling implementation for MoeFusedTopk.
+ * \brief Standalone DAV_3510 tiling implementation for MoeFusedTopk.
  */
 
 #include "moe_fused_topk_tiling_arch35.h"
@@ -272,7 +272,7 @@ ge::graphStatus MoeFusedTopkTilingArch35::SplitUb()
                 ReportTilingFailure(context_->GetNodeName(),
                                     "required UB size is larger than available UB size for current input shape"),
                 return ge::GRAPH_FAILED);
-    OP_LOGD(context_->GetNodeName(), "Ascend950 case need minimum UB size is %lu.", needUbSize);
+    OP_LOGD(context_->GetNodeName(), "DAV_3510 case need minimum UB size is %lu.", needUbSize);
     return ge::GRAPH_SUCCESS;
 }
 

@@ -14,6 +14,7 @@
 #include "log/log.h"
 #include <string>
 #include "aclnn_kernels/common/op_error_check.h"
+#include "op_host/util/op_const_def.h"
 #include "external/aclnn_kernels/aclnn_platform.h"
 
 using namespace op;
@@ -22,14 +23,12 @@ namespace MoeFinalizeRoutingCheck {
 
 static inline bool Is310P()
 {
-    return GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND310P;
+    return GetCurrentPlatformInfo().GetCurNpuArch() == Ops::Base::DAV_2002;
 }
 
 static inline bool IsCommonValidationChip()
 {
-    return Ops::Transformer::AclnnUtil::IsRegbase() ||
-           GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND910B ||
-           GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND910_93;
+    return Ops::Transformer::AclnnUtil::IsRegbase() || GetCurrentPlatformInfo().GetCurNpuArch() == Ops::Base::DAV_2201;
 }
 
 static const std::initializer_list<op::DataType> DTYPE_SUPPORT_LIST_X = {op::DataType::DT_FLOAT16,

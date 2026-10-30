@@ -9,7 +9,7 @@
  */
 
 /**
- * Standalone Ascend950 (arch35) kernel implementation for MoeFusedTopk.
+ * Standalone DAV_3510 (arch35) kernel implementation for MoeFusedTopk.
  *
  * This header intentionally owns the whole kernel class instead of including
  * the Ascend910C implementation.  Keeping the duplicated code here allows

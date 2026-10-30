@@ -10,6 +10,7 @@
 #ifndef AIR_CXX_RUNTIME_V2_OP_IMPL_MOE_INIT_ROUTING_V2_GRAD_H
 #define AIR_CXX_RUNTIME_V2_OP_IMPL_MOE_INIT_ROUTING_V2_GRAD_H
 #include "log/log.h"
+#include "op_host/util/op_const_def.h"
 #include "register/op_impl_registry.h"
 #include "register/tilingdata_base.h"
 #include "register/op_def_registry.h"
@@ -131,7 +132,7 @@ protected:
     int64_t C = 0;
     ge::DataType inDtype = ge::DT_FLOAT;
     const char* opName = "";
-    platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
+    NpuArch npuArch = Ops::Base::DAV_2201;
 };
 
 struct MoeInitRoutingV2GradCompileInfo {

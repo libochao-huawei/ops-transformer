@@ -11,6 +11,7 @@
 #include "log/log.h"
 #include <string>
 #include "aclnn_moe_token_permute.h"
+#include "op_host/util/op_const_def.h"
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
 #include "opdev/op_executor.h"
@@ -203,7 +204,7 @@ aclnnStatus aclnnMoeTokenPermuteGetWorkspaceSize(const aclTensor* tokens, const 
     }
 
     bool isRegbaseCalled =
-        GetCurrentPlatformInfo().GetCurNpuArch() == NpuArch::DAV_3510 && tokens->GetDataType() == DataType::DT_INT8;
+        GetCurrentPlatformInfo().GetCurNpuArch() == Ops::Base::DAV_3510 && tokens->GetDataType() == DataType::DT_INT8;
     if (isRegbaseCalled) {
         CHECK_RET(MoeTokenPermuteCheck::CheckDtypeValidInt8Regbase(tokens, indices, permuteTokensOut, sortedIndicesOut),
                   ACLNN_ERR_PARAM_INVALID);

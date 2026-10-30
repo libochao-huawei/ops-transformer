@@ -144,7 +144,7 @@ protected:
     virtual void PrintTilingData() = 0;
 
 protected:
-    platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
+    NpuArch npuArch_ = Ops::Base::DAV_2201;
     size_t offset_{0};
     int64_t totalCoreNum_{0};
     int64_t ubSize_{0};

@@ -37,7 +37,7 @@ bool IsMxQuantMode(int64_t quantMode)
            quantMode == QUANT_MODE_MXFP4_E2M1;
 }
 
-bool IsAscend950()
+bool IsDAV_3510()
 {
     const char* socName = aclrtGetSocName();
     return socName != nullptr && std::strstr(socName, "Ascend950") != nullptr;
@@ -72,9 +72,9 @@ int64_t GetActualNumOutTokens(const at::Tensor& indices, c10::optional<int64_t> 
 
 int64_t ResolveQuantMode(const at::Tensor& tokens, int64_t quantMode)
 {
-    int64_t effectiveQuantMode = IsAscend950() ? quantMode : QUANT_MODE_NONE;
+    int64_t effectiveQuantMode = IsDAV_3510() ? quantMode : QUANT_MODE_NONE;
     TORCH_CHECK(effectiveQuantMode == QUANT_MODE_NONE || IsMxQuantMode(effectiveQuantMode),
-                "quant_mode only supports -1, 2, 3 or 9 on Ascend 950.");
+                "quant_mode only supports -1, 2, 3 or 9 on DAV_3510.");
     TORCH_CHECK(!tokens.requires_grad() || effectiveQuantMode == QUANT_MODE_NONE,
                 "moe_token_permute does not support autograd when quant_mode is 2, 3 or 9.");
     return effectiveQuantMode;

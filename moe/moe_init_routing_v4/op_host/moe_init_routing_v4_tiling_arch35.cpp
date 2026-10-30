@@ -39,7 +39,7 @@ protected:
             return true;
         }
         auto npuArch = platform_ascendc::PlatformAscendC(platformInfo).GetCurNpuArch();
-        return npuArch == NpuArch::DAV_9201 || npuArch == NpuArch::DAV_9202;
+        return npuArch == Ops::Base::DAV_9201 || npuArch == Ops::Base::DAV_9202;
     }
 
     bool IsCapable() override

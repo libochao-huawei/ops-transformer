@@ -64,7 +64,7 @@ ge::graphStatus MoeFinalizeRoutingV2GradTiling::GetPlatformInfo()
                     nodeName_, "ub_size", std::to_string(aicoreParams_.ubSize).c_str(), "get ub size failed"),
                 return ge::GRAPH_FAILED);
 
-    socVersion_ = ascendcPlatform.GetSocVersion();
+    npuArch_ = ascendcPlatform.GetCurNpuArch();
     blockSize_ = Ops::Base::GetUbBlockSize(context_);
     vlFp32_ = Ops::Base::GetVRegSize(context_) / sizeof(float);
 

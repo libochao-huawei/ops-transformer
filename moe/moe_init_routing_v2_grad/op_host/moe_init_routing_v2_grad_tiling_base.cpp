@@ -35,7 +35,7 @@ ge::graphStatus MoeInitRoutingV2GradTilingBaseClass::GetPlatformInfo()
         OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName, "platformInfo", "nullptr", "Failed to get platform info."),
         return ge::GRAPH_FAILED);
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
-    socVersion = ascendcPlatform.GetSocVersion();
+    npuArch = ascendcPlatform.GetCurNpuArch();
 
     auto compileInfoPtr = reinterpret_cast<const MoeInitRoutingV2GradCompileInfo*>(context_->GetCompileInfo());
     OP_CHECK_IF(compileInfoPtr == nullptr,

@@ -15,6 +15,7 @@
 #include "log/log.h"
 #include <string>
 #include "moe_finalize_routing_v2_tiling.h"
+#include "op_host/util/op_const_def.h"
 #include "op_host/tiling_util.h"
 using namespace std;
 using namespace ge;
@@ -661,8 +662,7 @@ bool MoeFinalizeRoutingV2Membase::IsUnpermuteFastPath() const
     auto isEmptyOptional = [](const gert::StorageShape* shape) {
         return shape == nullptr || shape->GetStorageShape().GetShapeSize() == 0;
     };
-    bool isA2OrA3 = socVersion_ == platform_ascendc::SocVersion::ASCEND910B ||
-                    socVersion_ == platform_ascendc::SocVersion::ASCEND910_93;
+    bool isA2OrA3 = npuArch_ == Ops::Base::DAV_2201;
     bool isRowMajor = dropPadMode_ == DROP_MODE_VALUE_2 || dropPadMode_ == DROP_MODE_VALUE_3;
     return isA2OrA3 && dataType_ == ge::DT_BF16 && k_ == 1 && isRowMajor && isEmptyOptional(params.x1Shape) &&
            isEmptyOptional(params.x2Shape) && isEmptyOptional(params.biasShape) &&
@@ -1078,7 +1078,7 @@ ge::graphStatus MoeFinalizeRoutingV2Membase::Check310pParams()
 
 ge::graphStatus MoeFinalizeRoutingV2Membase::CalcOpTiling()
 {
-    if (socVersion_ == platform_ascendc::SocVersion::ASCEND310P) {
+    if (npuArch_ == Ops::Base::DAV_2002) {
         OP_CHECK_IF(Check310pParams() != ge::GRAPH_SUCCESS,
                     OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context_->GetNodeName(), "310p_inputs", "GRAPH_FAILED",
                                                           "Check 310p inputs failed."),
