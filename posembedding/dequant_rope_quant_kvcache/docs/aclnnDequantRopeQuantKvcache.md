@@ -398,7 +398,7 @@ aclnnStatus aclnnDequantRopeQuantKvcache(
     <tr>
       <td>ACLNN_ERR_PARAM_INVALID</td>
       <td>161002</td>
-      <td>输入和输出的数据类型不在支持的范围内。</td>
+      <td>输入、输出的数据类型、shape、维度或属性值不符合约束。</td>
     </tr>
   </tbody>
   </table>
@@ -456,6 +456,8 @@ aclnnStatus aclnnDequantRopeQuantKvcache(
 4. 输入x不为INT32时，x、cos、sin与输出qOut、kOut、vOut的数据类型保持一致，此时activationScaleOptional，weightScaleOptional、biasOptional不生效。
 5. 输入x为INT32时，cos、sin与输出qOut、kOut、vOut的数据类型保持一致，此时weightScaleOptional必选，activationScaleOptional、biasOptional可选（biasOptional不需要与其他输入类型一致）。
 6. x的尾轴小于等于4096，且按64对齐。
+7. sizeSplits的元素个数必须为3，各元素均不得小于0；sizeSplits[1]与sizeSplits[2]必须相等，且分别等于Nkv*D；x的尾轴必须等于sizeSplits三个元素之和。
+8. kCacheRef和vCacheRef必须为4维且shape一致；D必须为16的正整数倍。scaleK、scaleV以及可选输入offsetKOptional、offsetVOptional的元素个数均必须为Nkv*D。
 
 ## 调用示例
 

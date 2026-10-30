@@ -235,6 +235,8 @@
 - cacheModeOptional为contiguous时：kCacheRef的第0维大于等于x的第0维；x为3维时，indices数据值大于等于0且小于等于kCacheRef的第1维减x的第1维；x为2维时，indices数据值大于等于0且小于等于kCacheRef的第1维减1。cacheModeOptional为page时：indices数据值大于等于0，小于kCacheRef的第0维*第1维且不重复。
 - x的尾轴小于等于4096，且按64对齐。
 - 输入x不为int32时，x、cos、sin与输出qOut、kOut、vOut的数据类型保持一致，此时activationScaleOptional，weightScaleOptional、biasOptional不生效；x为int32时，cos、sin与输出qOut、kOut、vOut的数据类型保持一致，此时weightScaleOptional必选，activationScaleOptional、biasOptional可选（biasOptional不需要与其他输入类型一致）。
+- sizeSplits的元素个数必须为3，各元素均不得小于0；sizeSplits[1]与sizeSplits[2]必须相等，且分别等于Nkv*D；x的尾轴必须等于sizeSplits三个元素之和。
+- kCacheRef和vCacheRef必须为4维且shape一致；D必须为16的正整数倍。scaleK、scaleV以及可选输入offsetKOptional、offsetVOptional的元素个数均必须为Nkv*D。
 
 ## 调用说明
 
