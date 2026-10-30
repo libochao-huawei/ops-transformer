@@ -116,17 +116,20 @@ ge::graphStatus MoeGatingTopKSoftmaxBaseTiling::GetShapeAttrsInfo()
         }
     }
 
-    auto ret = CheckOutShape(context_->GetOutputShape(OUT_INDEX)->GetStorageShape(), gatingShape);
+    const auto yShape = context_->GetOutputShape(OUT_INDEX)->GetStorageShape();
+    auto ret = CheckOutShape(yShape, gatingShape);
     if (ret != ge::SUCCESS) {
         return ret;
     }
 
-    ret = CheckOutShape(context_->GetOutputShape(INDICES_INDEX)->GetStorageShape(), gatingShape);
+    const auto expertIdxShape = context_->GetOutputShape(INDICES_INDEX)->GetStorageShape();
+    ret = CheckOutShape(expertIdxShape, gatingShape);
     if (ret != ge::SUCCESS) {
         return ret;
     }
 
-    ret = CheckOutShape(context_->GetOutputShape(SOURCE_ROW_OUT_INDEX)->GetStorageShape(), gatingShape);
+    const auto rowIdxShape = context_->GetOutputShape(SOURCE_ROW_OUT_INDEX)->GetStorageShape();
+    ret = CheckOutShape(rowIdxShape, gatingShape);
     if (ret != ge::SUCCESS) {
         return ret;
     }
@@ -158,6 +161,14 @@ ge::graphStatus MoeGatingTopKSoftmaxBaseTiling::GetShapeAttrsInfo()
         OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context_->GetNodeName(), "k", std::to_string(k).c_str(),
                                               ("must be less than or equal to " + std::to_string(MAX_K)).c_str()),
         return ge::GRAPH_FAILED);
+
+    const auto lastDim = gatingShape.GetDimNum() - 1;
+    if (yShape.GetDim(lastDim) != k || expertIdxShape.GetDim(lastDim) != k || rowIdxShape.GetDim(lastDim) != k) {
+        OP_LOGW(context_->GetNodeName(),
+                "The last dim of outputs should be equal to k, but got y: %ld, expertIdx: %ld, rowIdx: %ld, "
+                "k: %ld. The outputs may be partially written.",
+                yShape.GetDim(lastDim), expertIdxShape.GetDim(lastDim), rowIdxShape.GetDim(lastDim), k);
+    }
     return ge::GRAPH_SUCCESS;
 }
 } // namespace optiling
