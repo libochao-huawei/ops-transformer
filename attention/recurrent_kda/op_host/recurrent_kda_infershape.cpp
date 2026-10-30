@@ -32,7 +32,10 @@ const size_t DIM_2 = 2;
 static ge::graphStatus InferShapeRecurrentKda(InferShapeContext* context)
 {
     if (context == nullptr) {
-        OP_LOGE("RecurrentKda", "inference context is null");
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1014", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{"RecurrentKda",
+                                      "InferShape: context is null; check inference context construction."}));
         return ge::GRAPH_FAILED;
     }
 
@@ -42,9 +45,15 @@ static ge::graphStatus InferShapeRecurrentKda(InferShapeContext* context)
     auto shapeOut = context->GetOutputShape(DIM_0);
     auto shapeInitialStateOut = context->GetOutputShape(DIM_1);
     auto shapeFinalState = context->GetOutputShape(DIM_2);
-    if (shapeValue == nullptr || shapeInitialState == nullptr || shapeOut == nullptr ||
-        shapeInitialStateOut == nullptr || shapeFinalState == nullptr) {
-        OP_LOGE(opName, "[InferShape] shape is null");
+    if (shapeValue == nullptr || shapeInitialState == nullptr) {
+        OP_LOGE_WITH_INVALID_INPUT(opName, shapeValue == nullptr ? "value" : "initial_state");
+        return ge::GRAPH_FAILED;
+    }
+    if (shapeOut == nullptr || shapeInitialStateOut == nullptr || shapeFinalState == nullptr) {
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1014", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{
+                opName, "InferShape: output shape container is null; check inference context output construction."}));
         return ge::GRAPH_FAILED;
     }
 

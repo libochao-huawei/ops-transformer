@@ -50,7 +50,8 @@ const std::array<const aclTensor*, 3> RecurrentKda(
         OP_ATTR(layout, scaleAttr, outputFinalState, inplaceFinalState, useQkL2normInKernel, useGateInKernel,
                 useBetaSigmoidInKernel, allowNegEigval, safeGate, lowerBoundAttr, stateVFirst));
     if (ret != ACLNN_SUCCESS) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "RecurrentKda ADD_TO_LAUNCHER_LIST_AICORE failed.");
+        OP_LOGE_WITHOUT_REPORT(
+            ret, "RecurrentKda: ADD_TO_LAUNCHER_LIST_AICORE failed during task-list construction, ret=%d.", ret);
         return {nullptr, nullptr, nullptr};
     }
 

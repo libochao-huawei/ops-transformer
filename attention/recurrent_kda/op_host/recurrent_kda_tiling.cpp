@@ -58,7 +58,7 @@ void RecurrentKdaTiling::InitCompileInfo()
 {
     auto platformInfoPtr = context_->GetPlatformInfo();
     if (platformInfoPtr == nullptr) {
-        OP_LOGE(context_->GetNodeName(), "platformInfoPtr is null");
+        OP_LOGE_WITHOUT_REPORT(context_->GetNodeName(), "platformInfoPtr is null");
         return;
     }
     const auto& ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
@@ -67,7 +67,7 @@ void RecurrentKdaTiling::InitCompileInfo()
     compileInfo_.isA5 = ascendcPlatform.GetCurNpuArch() == NpuArch::DAV_3510;
 
     if (compileInfo_.aivNum <= 0) {
-        OP_LOGE(context_->GetNodeName(), "aivNum <= 0");
+        OP_LOGE_WITHOUT_REPORT(context_->GetNodeName(), "aivNum <= 0");
         return;
     }
     tilingData_.vectorCoreNum = static_cast<uint32_t>(compileInfo_.aivNum);
@@ -154,27 +154,37 @@ RecurrentKdaTilingContext RecurrentKdaTiling::BuildProcessorContext() const
 
 ge::graphStatus RecurrentKdaTiling::GetPlatformInfo()
 {
+    if (context_->GetPlatformInfo() == nullptr || compileInfo_.aivNum <= 0 || compileInfo_.ubSize == 0) {
+        const std::string reason = "GetPlatformInfo: platformInfo is " +
+                                   std::string(context_->GetPlatformInfo() == nullptr ? "null" : "available") +
+                                   ", aivNum=" + std::to_string(compileInfo_.aivNum) +
+                                   ", ubSize=" + std::to_string(compileInfo_.ubSize) +
+                                   "; check the SoC-specific OPP package and platform information loading.";
+        REPORT_PREDEFINED_ERR_MSG("EZ1008", (std::vector<const char*>{"opName", "reason"}),
+                                  (std::vector<const char*>{context_->GetNodeName(), reason.c_str()}));
+        return ge::GRAPH_FAILED;
+    }
     return ge::GRAPH_SUCCESS;
 };
 
 ge::graphStatus RecurrentKdaTiling::GetShapeAttrsInfo()
 {
-    OP_CHECK_IF(CheckContext() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid context."),
+    OP_CHECK_IF(CheckContext() != ge::GRAPH_SUCCESS, OP_LOGE_WITHOUT_REPORT(inputParams_.opName, "Invalid context."),
                 return ge::GRAPH_FAILED);
 
-    OP_CHECK_IF(GetOptionalInput() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid optional input."),
+    OP_CHECK_IF(GetOptionalInput() != ge::GRAPH_SUCCESS,
+                OP_LOGE_WITHOUT_REPORT(inputParams_.opName, "Invalid optional input."), return ge::GRAPH_FAILED);
+
+    OP_CHECK_IF(GetAttrsInfo() != ge::GRAPH_SUCCESS, OP_LOGE_WITHOUT_REPORT(inputParams_.opName, "Invalid attrs."),
                 return ge::GRAPH_FAILED);
 
-    OP_CHECK_IF(GetAttrsInfo() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid attrs."),
+    OP_CHECK_IF(AnalyzeDtype() != ge::GRAPH_SUCCESS, OP_LOGE_WITHOUT_REPORT(inputParams_.opName, "Invalid dtypes."),
                 return ge::GRAPH_FAILED);
 
-    OP_CHECK_IF(AnalyzeDtype() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid dtypes."),
+    OP_CHECK_IF(AnalyzeShapes() != ge::GRAPH_SUCCESS, OP_LOGE_WITHOUT_REPORT(inputParams_.opName, "Invalid shapes."),
                 return ge::GRAPH_FAILED);
 
-    OP_CHECK_IF(AnalyzeShapes() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid shapes."),
-                return ge::GRAPH_FAILED);
-
-    OP_CHECK_IF(AnalyzeFormat() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "Invalid format."),
+    OP_CHECK_IF(AnalyzeFormat() != ge::GRAPH_SUCCESS, OP_LOGE_WITHOUT_REPORT(inputParams_.opName, "Invalid format."),
                 return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
@@ -182,7 +192,7 @@ ge::graphStatus RecurrentKdaTiling::GetShapeAttrsInfo()
 
 ge::graphStatus RecurrentKdaTiling::DoOpTiling()
 {
-    OP_CHECK_IF(CalUbSize() != ge::GRAPH_SUCCESS, OP_LOGE(inputParams_.opName, "CalUbSize failed."),
+    OP_CHECK_IF(CalUbSize() != ge::GRAPH_SUCCESS, OP_LOGE_WITHOUT_REPORT(inputParams_.opName, "CalUbSize failed."),
                 return ge::GRAPH_FAILED);
 
     PrintTilingData();
@@ -210,17 +220,39 @@ ge::graphStatus RecurrentKdaTiling::PostTiling()
 {
     context_->SetBlockDim(tilingData_.vectorCoreNum);
     auto tilingDataSize = sizeof(RecurrentKdaTilingData);
-    errno_t ret = memcpy_s(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity(),
+    auto rawTilingData = context_->GetRawTilingData();
+    if (rawTilingData == nullptr || rawTilingData->GetData() == nullptr ||
+        rawTilingData->GetCapacity() < tilingDataSize) {
+        const std::string reason =
+            "PostTiling: raw tiling buffer is missing or too small, requiredBytes=" + std::to_string(tilingDataSize) +
+            ", actualBytes=" + std::to_string(rawTilingData == nullptr ? 0 : rawTilingData->GetCapacity()) +
+            "; check TilingContext buffer construction.";
+        REPORT_PREDEFINED_ERR_MSG("EZ1008", (std::vector<const char*>{"opName", "reason"}),
+                                  (std::vector<const char*>{context_->GetNodeName(), reason.c_str()}));
+        return ge::GRAPH_FAILED;
+    }
+    errno_t ret = memcpy_s(rawTilingData->GetData(), rawTilingData->GetCapacity(),
                            reinterpret_cast<void*>(&tilingData_), tilingDataSize);
     if (ret != EOK) {
-        OP_LOGE(context_->GetNodeName(), "memcpy_s failed, ret=%d", ret);
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{context_->GetNodeName(),
+                                      ("PostTiling: memcpy_s failed, ret=" + std::to_string(ret) +
+                                       ", requiredBytes=" + std::to_string(tilingDataSize) +
+                                       ", actualBytes=" + std::to_string(rawTilingData->GetCapacity()))
+                                          .c_str()}));
         return ge::GRAPH_FAILED;
     }
     context_->GetRawTilingData()->SetDataSize(tilingDataSize);
 
     size_t* workspaces = context_->GetWorkspaceSizes(1);
-    OP_CHECK_IF(workspaces == nullptr, OPS_REPORT_CUBE_INNER_ERR(context_->GetNodeName(), "workspaces is null"),
-                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        workspaces == nullptr,
+        REPORT_PREDEFINED_ERR_MSG("EZ1008", (std::vector<const char*>{"opName", "reason"}),
+                                  (std::vector<const char*>{context_->GetNodeName(),
+                                                            "PostTiling: GetWorkspaceSizes(1) returned null; required "
+                                                            "output slots=1. Check TilingContext construction."})),
+        return ge::GRAPH_FAILED);
     workspaces[0] = workspaceSize_;
 
     return ge::GRAPH_SUCCESS;
@@ -228,18 +260,66 @@ ge::graphStatus RecurrentKdaTiling::PostTiling()
 
 ge::graphStatus RecurrentKdaTiling::CheckContext()
 {
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputShape(QUERY_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputDesc(QUERY_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputShape(KEY_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputDesc(KEY_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputShape(VALUE_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputDesc(VALUE_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputShape(GATE_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputDesc(GATE_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputShape(BETA_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputDesc(BETA_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputShape(STATE_INDEX));
-    OP_CHECK_NULL_WITH_CONTEXT(context_, context_->GetInputDesc(STATE_INDEX));
+    OP_CHECK_IF(context_->GetInputShape(QUERY_INDEX) == nullptr,
+                OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "query"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        context_->GetInputDesc(QUERY_INDEX) == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{context_->GetNodeName(),
+                                      "CheckContext: query input descriptor is null although its tensor is present; "
+                                      "check TilingContext metadata construction."})),
+        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(context_->GetInputShape(KEY_INDEX) == nullptr,
+                OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "key"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        context_->GetInputDesc(KEY_INDEX) == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{context_->GetNodeName(),
+                                      "CheckContext: key input descriptor is null although its tensor is present; "
+                                      "check TilingContext metadata construction."})),
+        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(context_->GetInputShape(VALUE_INDEX) == nullptr,
+                OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "value"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        context_->GetInputDesc(VALUE_INDEX) == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{context_->GetNodeName(),
+                                      "CheckContext: value input descriptor is null although its tensor is present; "
+                                      "check TilingContext metadata construction."})),
+        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(context_->GetInputShape(GATE_INDEX) == nullptr,
+                OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "gate"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        context_->GetInputDesc(GATE_INDEX) == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{context_->GetNodeName(),
+                                      "CheckContext: gate input descriptor is null although its tensor is present; "
+                                      "check TilingContext metadata construction."})),
+        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(context_->GetInputShape(BETA_INDEX) == nullptr,
+                OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "beta"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        context_->GetInputDesc(BETA_INDEX) == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{context_->GetNodeName(),
+                                      "CheckContext: beta input descriptor is null although its tensor is present; "
+                                      "check TilingContext metadata construction."})),
+        return ge::GRAPH_FAILED);
+    OP_CHECK_IF(context_->GetInputShape(STATE_INDEX) == nullptr,
+                OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "initial_state"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(context_->GetInputDesc(STATE_INDEX) == nullptr,
+                REPORT_PREDEFINED_ERR_MSG(
+                    "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+                    (std::vector<const char*>{
+                        context_->GetNodeName(),
+                        "CheckContext: initial_state input descriptor is null although its tensor is present; "
+                        "check TilingContext metadata construction."})),
+                return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -248,44 +328,61 @@ ge::graphStatus RecurrentKdaTiling::AnalyzeDtype()
     auto queryDtype = context_->GetInputDesc(QUERY_INDEX)->GetDataType();
     auto keyDtype = context_->GetInputDesc(KEY_INDEX)->GetDataType();
     auto valueDtype = context_->GetInputDesc(VALUE_INDEX)->GetDataType();
-    OP_CHECK_IF(queryDtype != ge::DT_BF16 || keyDtype != ge::DT_BF16 || valueDtype != ge::DT_BF16,
-                OP_LOGE(context_->GetNodeName(), "query, key and value dtype should be bfloat16"),
-                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        queryDtype != ge::DT_BF16 || keyDtype != ge::DT_BF16 || valueDtype != ge::DT_BF16,
+        OP_LOGE_FOR_INVALID_DTYPES_WITH_REASON(context_->GetNodeName(), "query, key, value",
+                                               Ops::Base::ToString(queryDtype) + ", " + Ops::Base::ToString(keyDtype) +
+                                                   ", " + Ops::Base::ToString(valueDtype),
+                                               "query, key and value must be bfloat16"),
+        return ge::GRAPH_FAILED);
 
     auto gateDtype = context_->GetInputDesc(GATE_INDEX)->GetDataType();
     auto betaDtype = context_->GetInputDesc(BETA_INDEX)->GetDataType();
     auto stateDtype = context_->GetInputDesc(STATE_INDEX)->GetDataType();
-    OP_CHECK_IF((gateDtype != ge::DT_FLOAT && gateDtype != ge::DT_BF16 && gateDtype != ge::DT_FLOAT16) ||
-                    (betaDtype != ge::DT_FLOAT && betaDtype != ge::DT_BF16 && betaDtype != ge::DT_FLOAT16),
-                OP_LOGE(context_->GetNodeName(), "gate and beta dtype should be float32, bfloat16 or float16"),
-                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        (gateDtype != ge::DT_FLOAT && gateDtype != ge::DT_BF16 && gateDtype != ge::DT_FLOAT16) ||
+            (betaDtype != ge::DT_FLOAT && betaDtype != ge::DT_BF16 && betaDtype != ge::DT_FLOAT16),
+        OP_LOGE_FOR_INVALID_DTYPES_WITH_REASON(context_->GetNodeName(), "gate, beta",
+                                               Ops::Base::ToString(gateDtype) + ", " + Ops::Base::ToString(betaDtype),
+                                               "gate and beta must be float32, bfloat16 or float16"),
+        return ge::GRAPH_FAILED);
     OP_CHECK_IF(stateDtype != ge::DT_FLOAT && stateDtype != ge::DT_BF16,
-                OP_LOGE(context_->GetNodeName(), "initial_state dtype should be bfloat16 or float32"),
+                OP_LOGE_FOR_INVALID_DTYPE(context_->GetNodeName(), "initial_state", Ops::Base::ToString(stateDtype),
+                                          "bfloat16 or float32"),
                 return ge::GRAPH_FAILED);
     if (context_->GetOptionalInputDesc(CU_SEQLENS_INDEX) != nullptr) {
         auto dtype = context_->GetOptionalInputDesc(CU_SEQLENS_INDEX)->GetDataType();
         OP_CHECK_IF(dtype != ge::DT_INT32 && dtype != ge::DT_INT64,
-                    OP_LOGE(context_->GetNodeName(), "cu_seqlens dtype should be int32 or int64"),
+                    OP_LOGE_FOR_INVALID_DTYPE(context_->GetNodeName(), "cu_seqlens", Ops::Base::ToString(dtype),
+                                              "int32 or int64"),
                     return ge::GRAPH_FAILED);
     }
     if (context_->GetOptionalInputDesc(SSM_STATE_INDICES_INDEX) != nullptr) {
         auto dtype = context_->GetOptionalInputDesc(SSM_STATE_INDICES_INDEX)->GetDataType();
         OP_CHECK_IF(dtype != ge::DT_INT32 && dtype != ge::DT_INT64,
-                    OP_LOGE(context_->GetNodeName(), "ssm_state_indices dtype should be int32 or int64"),
+                    OP_LOGE_FOR_INVALID_DTYPE(context_->GetNodeName(), "ssm_state_indices", Ops::Base::ToString(dtype),
+                                              "int32 or int64"),
                     return ge::GRAPH_FAILED);
     }
     if (context_->GetOptionalInputDesc(A_LOG_INDEX) != nullptr) {
         OP_CHECK_IF(context_->GetOptionalInputDesc(A_LOG_INDEX)->GetDataType() != ge::DT_FLOAT,
-                    OP_LOGE(context_->GetNodeName(), "A_log dtype should be float32"), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_DTYPE(
+                        context_->GetNodeName(), "A_log",
+                        Ops::Base::ToString(context_->GetOptionalInputDesc(A_LOG_INDEX)->GetDataType()), "float32"),
+                    return ge::GRAPH_FAILED);
     }
     if (context_->GetOptionalInputDesc(DT_BIAS_INDEX) != nullptr) {
         OP_CHECK_IF(context_->GetOptionalInputDesc(DT_BIAS_INDEX)->GetDataType() != ge::DT_FLOAT,
-                    OP_LOGE(context_->GetNodeName(), "dt_bias dtype should be float32"), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_DTYPE(
+                        context_->GetNodeName(), "dt_bias",
+                        Ops::Base::ToString(context_->GetOptionalInputDesc(DT_BIAS_INDEX)->GetDataType()), "float32"),
+                    return ge::GRAPH_FAILED);
     }
     if (context_->GetOptionalInputDesc(ACC_TOKEN_INDEX) != nullptr) {
         auto dtype = context_->GetOptionalInputDesc(ACC_TOKEN_INDEX)->GetDataType();
         OP_CHECK_IF(dtype != ge::DT_INT32 && dtype != ge::DT_INT64,
-                    OP_LOGE(context_->GetNodeName(), "num_accepted_tokens dtype should be int32 or int64"),
+                    OP_LOGE_FOR_INVALID_DTYPE(context_->GetNodeName(), "num_accepted_tokens",
+                                              Ops::Base::ToString(dtype), "int32 or int64"),
                     return ge::GRAPH_FAILED);
     }
     return ge::GRAPH_SUCCESS;
@@ -300,7 +397,8 @@ ge::graphStatus RecurrentKdaTiling::AnalyzeShapes()
 bool RecurrentKdaTiling::CheckFormat(ge::Format format, const std::string& desc)
 {
     if (format == ge::FORMAT_FRACTAL_NZ) {
-        OP_LOGE(context_->GetNodeName(), "%s format does not support NZ", desc.c_str());
+        OP_LOGE_FOR_INVALID_FORMAT_WITH_REASON(context_->GetNodeName(), desc, Ops::Base::ToString(format),
+                                               "FRACTAL_NZ is not supported; use an ND tensor");
         return false;
     }
     return true;
@@ -336,14 +434,21 @@ ge::graphStatus RecurrentKdaTiling::AnalyzeFormat()
 ge::graphStatus RecurrentKdaTiling::GetAttrsInfo()
 {
     auto attrs = context_->GetAttrs();
-    OP_CHECK_IF(attrs == nullptr, OP_LOGE(context_->GetNodeName(), "attrs is null"), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        attrs == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{
+                context_->GetNodeName(),
+                "GetAttrsInfo: runtime attrs are null; check registered attributes and TilingContext construction."})),
+        return ge::GRAPH_FAILED);
     const char* layout = attrs->GetAttrPointer<char>(ATTR_LAYOUT_INDEX);
     if (layout == nullptr || std::strcmp(layout, "BSND") == 0) {
         tilingData_.layout = RKDA_LAYOUT_BSND;
     } else if (std::strcmp(layout, "TND") == 0) {
         tilingData_.layout = RKDA_LAYOUT_TND;
     } else {
-        OP_LOGE(context_->GetNodeName(), "layout must be BSND or TND for RecurrentKda, got %s", layout);
+        OP_LOGE_FOR_INVALID_VALUE(context_->GetNodeName(), "layout", layout, "BSND or TND");
         return ge::GRAPH_FAILED;
     }
     tilingData_.scale = *attrs->GetAttrPointer<float>(ATTR_SCALE_INDEX);
@@ -417,23 +522,43 @@ ge::graphStatus RecurrentKdaTiling::CalUbSize()
 
 static ge::graphStatus RecurrentKdaTilingFunc(gert::TilingContext* context)
 {
-    OP_CHECK_IF(context == nullptr, OPS_REPORT_CUBE_INNER_ERR("RecurrentKda", "context is null"),
-                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        context == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{"RecurrentKda", "Tiling: context is null; check TilingContext construction."})),
+        return ge::GRAPH_FAILED);
     return Ops::Transformer::OpTiling::TilingRegistry::GetInstance().DoTilingImpl(context);
 }
 
 static ge::graphStatus TilingPrepareForRecurrentKda(gert::TilingParseContext* context)
 {
-    OP_CHECK_IF(context == nullptr, OPS_REPORT_CUBE_INNER_ERR("RecurrentKda", "context is null"),
-                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        context == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{"RecurrentKda", "Tiling: context is null; check TilingContext construction."})),
+        return ge::GRAPH_FAILED);
 
     fe::PlatFormInfos* platformInfo = context->GetPlatformInfo();
-    OP_CHECK_IF(platformInfo == nullptr, OPS_REPORT_CUBE_INNER_ERR(context->GetNodeName(), "platformInfoPtr is null"),
-                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        platformInfo == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{
+                context->GetNodeName(),
+                "TilingPrepare: platformInfo is null; check SoC-specific OPP and platform information loading."})),
+        return ge::GRAPH_FAILED);
 
     auto compileInfoPtr = context->GetCompiledInfo<RecurrentKdaCompileInfo>();
-    OP_CHECK_IF(compileInfoPtr == nullptr, OPS_REPORT_CUBE_INNER_ERR(context->GetNodeName(), "compileInfoPtr is null"),
-                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        compileInfoPtr == nullptr,
+        REPORT_PREDEFINED_ERR_MSG(
+            "EZ1008", (std::vector<const char*>{"opName", "reason"}),
+            (std::vector<const char*>{
+                context->GetNodeName(),
+                "TilingPrepare: compileInfo is null; check compiled metadata and TilingParseContext construction."})),
+        return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
 }
