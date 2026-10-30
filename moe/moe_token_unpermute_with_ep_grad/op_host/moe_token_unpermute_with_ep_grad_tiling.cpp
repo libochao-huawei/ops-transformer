@@ -455,7 +455,12 @@ static ge::graphStatus SetTilingForTiling4MoeTokenUnpermuteWithEpGrad(gert::Tili
                 return ge::GRAPH_FAILED);
     int64_t tokensNum = 0;
     int64_t hiddenSize = 0;
-    int64_t topK = 1;
+    const int64_t* topKPtr = attrPtr->GetAttrPointer<int64_t>(ATTR_TOPKNUM_IDX);
+    int64_t topK = (topKPtr == nullptr) ? 1 : *topKPtr;
+    if (topK < 1 || topK > MAX_TOPK) {
+        OP_LOGW(context->GetNodeName(), "[MoeTokenUnpermuteWithEpGrad] topkNum should be in [1, 512], but got %ld.",
+                topK);
+    }
     int64_t totalNum = 0;
     int64_t numOutTokens = 0;
 
