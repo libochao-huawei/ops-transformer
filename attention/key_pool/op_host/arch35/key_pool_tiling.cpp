@@ -145,6 +145,13 @@ ge::graphStatus KeyPoolTiling::SetBaseInfo()
     baseParams_->stateCacheStrideDim0 = static_cast<uint64_t>(*context_->stateCacheStrideDim0);
     baseParams_->nSize = 2; // 2:每个核处理两个基本块后做全核同步
     baseParams_->usedCoreNum = aicNum_;
+    constexpr uint32_t SMALL_TOKEN_LIMIT = 256U;
+    constexpr uint32_t MODEL_HEAD_DIM = 128U;
+    constexpr uint32_t SMALL_INPUT_CORE_LIMIT = 8U;
+    // Keep launch size and task partitioning consistent for small workloads.
+    if (baseParams_->headDim == MODEL_HEAD_DIM && baseParams_->tokenSize <= SMALL_TOKEN_LIMIT) {
+        baseParams_->usedCoreNum = std::min(aicNum_, SMALL_INPUT_CORE_LIMIT);
+    }
     baseParams_->batchConsistency = static_cast<uint32_t>(context_->batchConsistency);
     OP_LOGI(context_->opName, "[TILING] bSize:%u  tSize:%u cmpRatio:%u, stateCacheStrideDim0:%u",
             baseParams_->batchSize, baseParams_->tokenSize, baseParams_->cmpRatio, baseParams_->stateCacheStrideDim0);
@@ -333,7 +340,7 @@ ge::graphStatus KeyPoolTiling::RunBigKernelTiling(KeyPoolTilingData* tilingData)
         }
     }
 
-    context_->blockDim = aicNum_;
+    context_->blockDim = baseParams_->usedCoreNum;
 
     OP_LOGI("Run big kernel");
 

@@ -22,6 +22,7 @@
 #include "vf/key_pool_vf_add.h"
 #include "vf/key_pool_vf_mul.h"
 #include "../key_pool_layer_norm.h"
+#include "vf/key_pool_vf_norm.h"
 
 using namespace AscendC;
 
@@ -1191,9 +1192,9 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::PrepareNormalizedKv(const Vec1R
                         static_cast<uint64_t>(normalizedSlice.key_pooledScCnt * cmpRatio_ + historicalRows) *
                         constInfo_.headDim;
                     LocalTensor<T> normScratch = inputQue1.AllocTensor<T>();
-                    KeyPoolLayerNormRowsInplace(kvLocal[currentOffset], normScratch, normWeightGm_, normBiasGm_,
-                                                constInfo_.normEps, currentRows, constInfo_.headDim,
-                                                constInfo_.headDim);
+                    KeyPoolLayerNormRowsVectorized(kvLocal[currentOffset], normScratch, normWeightGm_, normBiasGm_,
+                                                   constInfo_.normEps, currentRows, constInfo_.headDim,
+                                                   constInfo_.headDim);
                     inputQue1.FreeTensor(normScratch);
                     PipeBarrier<PIPE_ALL>();
                     ApplyKeyPoolRotaryPlaceholder(kvLocal[currentOffset], currentRows * constInfo_.headDim);
@@ -1244,8 +1245,8 @@ __aicore__ inline void KeyPoolBlockVector<COMP>::PrepareNormalizedKv(const Vec1R
                 WaitFlag<HardEvent::MTE2_V>(eventIdMte2ToV);
                 RoundToHiddenDtype(tailKv, tailRows * constInfo_.headDim);
                 LocalTensor<T> normScratch = inputQue1.AllocTensor<T>();
-                KeyPoolLayerNormRowsInplace(tailKv, normScratch, normWeightGm_, normBiasGm_, constInfo_.normEps,
-                                            tailRows, constInfo_.headDim, constInfo_.headDim);
+                KeyPoolLayerNormRowsVectorized(tailKv, normScratch, normWeightGm_, normBiasGm_, constInfo_.normEps,
+                                               tailRows, constInfo_.headDim, constInfo_.headDim);
                 inputQue1.FreeTensor(normScratch);
                 ApplyKeyPoolRotaryPlaceholder(tailKv, tailRows * constInfo_.headDim);
 
