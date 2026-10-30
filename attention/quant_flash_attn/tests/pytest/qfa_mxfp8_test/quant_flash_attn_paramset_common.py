@@ -21,6 +21,7 @@ PARAM_NAMES = [
     "cu_seqlens_kv",
     "seqused_q",
     "seqused_kv",
+    "batch_size",
     "max_seqlen_q",
     "max_seqlen_kv",
     "enable_pa",
@@ -47,6 +48,8 @@ PARAM_NAMES = [
 
 TEST_PARAMS_DEFAULTS = {
     "softmax_scale": [None],
+    # BNSD/BSND decode 可只给 batch_size (cu_seqlens/seqused 全空), 默认不传
+    "batch_size": [None],
     "max_seqlen_q": [-1],
     "max_seqlen_kv": [-1],
     "input_layout": ["TND"],

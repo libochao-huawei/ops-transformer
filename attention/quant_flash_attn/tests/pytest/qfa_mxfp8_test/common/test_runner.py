@@ -31,6 +31,7 @@ PARAM_MAP = {
     "cu_seqlens_kv": "CU_SEQLENS_KV",
     "seqused_q": "SEQUSED_Q",
     "seqused_kv": "SEQUSED_KV",
+    "batch_size": "BATCH_SIZE",
     "max_seqlen_q": "MAX_SEQLEN_Q",
     "max_seqlen_kv": "MAX_SEQLEN_KV",
     "enable_pa": "ENABLE_PA",
@@ -207,6 +208,7 @@ def execute_test(params, mode, cdir=None):
                 block_table_torch,
                 qr_bf16,
                 kr_bf16,
+                batch_size=golden.BATCH_SIZE,
             )
         golden_cache.save_npu_output(case_name, npu_out, lse_out, cache_dir=cdir)
     else:
@@ -217,7 +219,7 @@ def execute_test(params, mode, cdir=None):
 
     # NPU op 约束: layout_out == layout_q, 故输出排布始终为 INPUT_LAYOUT
     compare_layout = golden.INPUT_LAYOUT
-    act_seqused_q = golden._get_seqused_q()
+    act_seqused_q = golden._get_act_seq_q()
 
     def _to_cmp(tensor):
         if compare_layout == "TND":

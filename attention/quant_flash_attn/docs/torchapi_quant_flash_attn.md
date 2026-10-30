@@ -518,7 +518,7 @@ quant_mode参数解释：
             <td>
                 <ul>
                     <li>tensor_type支持float8_e8m0、float32</li>
-                    <li>shape dim：MxFP8场景支持4、5；FP8场景支持2；HIF8场景支持1</li>
+                    <li>shape dim：MxFP8场景支持4、5、6；FP8场景支持2；HIF8场景支持1</li>
                 </ul>
             </td>
             <td rowspan="3">必须存在</td>
@@ -628,7 +628,7 @@ layout匹配关系表：<a name="layout匹配关系表"></a>
 >
 > HIF8场景（`quant_mode=0`）下，layout_q、layout_kv、layout_out三者必须相同。
 >
-> MxFP8场景（`quant_mode=1`）下：layout_out必须与layout_q相同；layout_kv为非PA布局时必须与layout_q相同；layout_q=BNSD时，layout_q_descale仅支持BNSD(prefill场景下性能更优，decode场景推荐其他layout)；layout_q=BSND时，layout_q_descale为BSND（prefill场景推荐）或BN2SGD（decode场景推荐）；layout_q=TND时，layout_q_descale为TND（prefill场景推荐）或N2TGD（decode场景推荐）。
+> MxFP8场景（`quant_mode=1`）下：layout_out必须与layout_q相同；layout_kv为非PA布局时必须与layout_q相同；layout_q=BNSD时，layout_q_descale仅支持BNSD(prefill场景下性能更优，decode场景推荐其他layout_q)；layout_q=BSND时，layout_q_descale为BSND（prefill场景推荐）或BN2SGD（decode场景推荐）；layout_q=TND时，layout_q_descale为TND（prefill场景推荐）或N2TGD（decode场景推荐）。
 
 q/k/v descale dtype匹配关系表：<a name="descale_dtype匹配关系表"></a>
 

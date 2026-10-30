@@ -30,6 +30,10 @@
 形状按 pytest golden (common/quant_flash_attn_golden.py) 的 generate_data +
 prepare_npu_inputs 产出的算子入参布局纯 Python 推导, 无需 torch/NPU。
 
+支持 layout: TND(varlen) / BNSD / BSND(含 decode 的 BN2SGD q_scale)。
+BNSD/BSND 场景算子的 cu_seqlens 不入参, 序列长度由 seqused 或
+batch_size + max_seqlen 推导 (对齐 ttk 上仅给 batch_size 的用例)。
+
 仅支持 MXFP8 (quant_mode=1)。
 
 用法:
@@ -135,6 +139,12 @@ def _vscale_tnd_T(act_list):
     return total
 
 
+def _vscale_bnsd_S_out(max_s):
+    """非 PA V scale 在 BNSD/BSND 下 S 维偶奇打包后的行数。"""
+    sg = _ceil_div(max_s, GROUP_SIZE)
+    return (sg + (sg % 2)) // 2
+
+
 def _pa_kv_shape(total_blocks, n_kv, head_dim, block_size, kv_layout):
     if kv_layout == "PA_BNBD":
         return (total_blocks, n_kv, block_size, head_dim)
@@ -179,6 +189,22 @@ def _qscale_shape(total_q, n_q, n_kv, num_groups, q_scale_layout):
     raise ValueError(f"unsupported q_scale_layout: {q_scale_layout}")
 
 
+def _qscale_bnsd_shape(B, n_q, n_kv, max_s, num_groups, q_scale_layout):
+    """非 PA BNSD/BSND 的 Q descale shape (BNSD / BSND / BN2SGD)。"""
+    dg_half = num_groups // 2
+    if q_scale_layout == "BNSD":
+        return (B, n_q, max_s, dg_half, 2)
+    if q_scale_layout == "BSND":
+        return (B, max_s, n_q, dg_half, 2)
+    if q_scale_layout == "BN2SGD":
+        if n_kv <= 0 or n_q % n_kv != 0:
+            raise ValueError(
+                f"N_q must be divisible by N_kv, got N_q={n_q}, N_kv={n_kv}"
+            )
+        return (B, n_kv, max_s, n_q // n_kv, dg_half, 2)
+    raise ValueError(f"unsupported q_scale_layout for BNSD/BSND: {q_scale_layout}")
+
+
 def _derive_case(case):
     """返回 (shapes, data_ranges, attrs)，dtypes 用模块常量 _DTYPES。"""
     quant_mode = case.get("quant_mode", 1)
@@ -212,27 +238,73 @@ def _derive_case(case):
     seq_q = case.get("seqused_q")
     seq_kv = case.get("seqused_kv")
 
-    act_q = list(seq_q) if seq_q is not None else _derive_seqused(cu_q)
-    act_kv = list(seq_kv) if seq_kv is not None else _derive_seqused(cu_kv)
-    if not act_q or not act_kv:
-        raise ValueError("need cu_seqlens_* or seqused_* to derive sequence lengths")
+    # 非 TND (BNSD/BSND) 场景算子的 cu_seqlens 不入参 (见 golden _call_npu_fa_op),
+    # 因此 CSV 侧同步置空; 序列长度改由 seqused 或 batch_size 推导。
+    input_layout = str(case.get("input_layout") or "TND").upper()
+    if input_layout not in ("TND", "BNSD", "BSND"):
+        raise ValueError(f"unsupported input_layout for csv export: {input_layout}")
+    is_varlen = input_layout == "TND"
+    cu_q = cu_q if is_varlen else None
+    cu_kv = cu_kv if is_varlen else None
+
+    batch_size = case.get("batch_size")
+    batch_size = int(batch_size) if batch_size is not None else None
 
     max_sq = case.get("max_seqlen_q")
-    max_sq = max(act_q) if (max_sq is None or int(max_sq) < 0) else int(max_sq)
     max_skv = case.get("max_seqlen_kv")
+
+    act_q = list(seq_q) if seq_q is not None else _derive_seqused(cu_q)
+    act_kv = list(seq_kv) if seq_kv is not None else _derive_seqused(cu_kv)
+    # BNSD/BSND decode: 只给 batch_size 属性, 每 batch 长度即为 max_seqlen
+    if not act_q and batch_size and max_sq is not None and int(max_sq) > 0:
+        act_q = [int(max_sq)] * batch_size
+    if not act_kv and batch_size and max_skv is not None and int(max_skv) > 0:
+        act_kv = [int(max_skv)] * batch_size
+    if not act_q or not act_kv:
+        raise ValueError(
+            "need cu_seqlens_* / seqused_* / batch_size+max_seqlen_* "
+            "to derive sequence lengths"
+        )
+
+    max_sq = max(act_q) if (max_sq is None or int(max_sq) < 0) else int(max_sq)
     max_skv = max(act_kv) if (max_skv is None or int(max_skv) < 0) else int(max_skv)
 
     total_q = cu_q[-1] if cu_q else sum(act_q)
     total_kv = cu_kv[-1] if cu_kv else sum(act_kv)
     num_groups = _num_groups(D)
+    # 与 golden resolve_q_scale_layout 的 BNSD/BSND 覆盖规则保持一致
+    if input_layout == "BNSD":
+        q_scale_layout = "BNSD"
+    elif input_layout == "BSND":
+        q_scale_layout = "BN2SGD" if q_scale_layout in ("N2TGD", "BN2SGD") else "BSND"
 
     if kv_layout == "PA_NZ" and enable_v_tail and D % 16 != 0:
         raise ValueError(
             f"PA_NZ + D={D} + v_tail 结构性不成立: NZ 16 列分形要求 D%16==0"
         )
 
-    q_shape = (total_q, N_q, D)
-    q_descale_shape = _qscale_shape(total_q, N_q, N_kv, num_groups, q_scale_layout)
+    if input_layout == "BNSD":
+        q_shape = (B, N_q, max_sq, D)
+        kv_shape = (B, N_kv, max_skv, D)
+        q_descale_shape = _qscale_bnsd_shape(
+            B, N_q, N_kv, max_sq, num_groups, q_scale_layout
+        )
+        k_descale_shape = (B, N_kv, max_skv, num_groups // 2, 2)
+        v_descale_shape = (B, N_kv, _vscale_bnsd_S_out(max_skv), D, 2)
+    elif input_layout == "BSND":
+        q_shape = (B, max_sq, N_q, D)
+        kv_shape = (B, max_skv, N_kv, D)
+        q_descale_shape = _qscale_bnsd_shape(
+            B, N_q, N_kv, max_sq, num_groups, q_scale_layout
+        )
+        k_descale_shape = (B, max_skv, N_kv, num_groups // 2, 2)
+        v_descale_shape = (B, _vscale_bnsd_S_out(max_skv), N_kv, D, 2)
+    else:
+        q_shape = (total_q, N_q, D)
+        kv_shape = (total_kv, N_kv, D)
+        q_descale_shape = _qscale_shape(total_q, N_q, N_kv, num_groups, q_scale_layout)
+        k_descale_shape = (total_kv, N_kv, num_groups // 2, 2)
+        v_descale_shape = (_vscale_tnd_T(act_kv), N_kv, D, 2)
 
     if enable_pa:
         if not kv_layout.startswith("PA_"):
@@ -253,17 +325,12 @@ def _derive_case(case):
         )
         block_table_shape = (B, max_blocks)
         layout_kv = kv_layout
-        layout_out = "TND"
         block_size_attr = block_size
     else:
-        k_shape = (total_kv, N_kv, D)
-        v_shape = k_shape
-        # K/V descale 非 PA: K 固定 TND, V 走偶奇打包的 TND
-        k_descale_shape = (total_kv, N_kv, num_groups // 2, 2)
-        v_descale_shape = (_vscale_tnd_T(act_kv), N_kv, D, 2)
+        k_shape = kv_shape
+        v_shape = kv_shape
         block_table_shape = None
-        layout_kv = "TND"
-        layout_out = "TND"
+        layout_kv = input_layout
         block_size_attr = 0
 
     if enable_v_tail:
@@ -334,16 +401,16 @@ def _derive_case(case):
         "max_seqlen_kv": int(case["max_seqlen_kv"])
         if case.get("max_seqlen_kv") is not None
         else -1,
-        "layout_q": "TND",
+        "layout_q": input_layout,
         "layout_q_descale": q_scale_layout,
         "layout_kv": layout_kv,
-        "layout_out": layout_out,
+        "layout_out": input_layout,
         "return_softmax_lse": return_lse,
         "N_q": N_q,
         "N_kv": N_kv,
         "D": D,
         "head_dim_v": None,
-        "batch_size": None,
+        "batch_size": batch_size,
         "enable_pa": enable_pa,
         "kv_cache_layout": kv_layout,
         "q_scale_layout": q_scale_layout,

@@ -32,6 +32,17 @@ logger = logging.getLogger(__name__)
 _SEED_MAP = {"q": 54, "k": 3, "v": 4}
 
 
+def _empty_like_slot(slot, dtype):
+    """按 CSV slot 形状生成同形空张量占位（slot 缺失时退化为长度 0）。
+
+    用于 PA 空 cache 的透传: 测试脚本不做形状合法性校验，只保证脚本自身
+    不下标越界，合法性/报错交给算子侧。
+    """
+    if slot is None:
+        return torch.zeros(0, dtype=dtype)
+    return torch.zeros(tuple(slot.shape), dtype=dtype)
+
+
 def _write_int32_list(slot, values, slot_name):
     """把 attributes 里的 int 值列表写进 CSV tensor slot（覆盖 ttk 随机生成）。
 
@@ -185,6 +196,28 @@ def generate_qfa_mxfp8_inputs(
     enable_pa = bool(kwargs.get("enable_pa", False))
     kv_cache_layout = kwargs.get("kv_cache_layout") or layout_kv
     block_size = kwargs.get("block_size", 0)
+    # PA 的 block_size 物理真值在 K cache slot 上 (按 kv_cache_layout 的 Bs 轴取:
+    # PA_BBND/BnBsND → dim1, PA_NZ → dim3, PA_BNBD/BnNBsD → dim2)。CSV 属性与之
+    # 不一致时以 slot 为准, 否则 ceil(kvLen/block_size) 会大于 block_table 列数,
+    # 填块表时越界 (IndexError: index N is out of bounds for dimension 1)。
+    if enable_pa:
+        _pa_lay_up = str(kv_cache_layout or "").upper()
+        _bs_axis = (
+            1
+            if _pa_lay_up in ("BNBSND", "PA_BBND", "BBSND")
+            else (3 if _pa_lay_up == "PA_NZ" else 2)
+        )
+        if k is not None and k.ndim > _bs_axis and int(k.shape[_bs_axis]) > 0:
+            _slot_bs = int(k.shape[_bs_axis])
+            if int(block_size or 0) != _slot_bs:
+                logger.warning(
+                    "[INPUTS] PA block_size attr=%s != K cache slot dim%d=%d — "
+                    "use slot value",
+                    block_size,
+                    _bs_axis,
+                    _slot_bs,
+                )
+            block_size = _slot_bs
     q_scale_layout = kwargs.get("q_scale_layout") or layout_q_descale
     cu_seqlens_q = kwargs.get("cu_seqlens_q_values")
     cu_seqlens_kv = kwargs.get("cu_seqlens_kv_values")
@@ -246,14 +279,34 @@ def generate_qfa_mxfp8_inputs(
     # cu_seqlens -> actual_seq (差分还原)
     cu_seqlens_q = list(cu_seqlens_q) if cu_seqlens_q is not None else [0]
     cu_seqlens_kv = list(cu_seqlens_kv) if cu_seqlens_kv is not None else [0]
+
+    # batch_size: CSV 原始值 (可为 -1), 透传给 metadata;
+    # B: cu_seqlens_q (len-1) → seqused_q (len) → batch_size 属性 → 1。
+    # BNSD/BSND 用例 cu_seqlens 缺失 (占位 [0]) 时回退 seqused_q 长度 —
+    # redline PA+BNSD 用例 seqused_q=[4,4,4,4] → B=4, 与 CSV slot 形状一致;
+    # 非 varlen 的 BNSD/BSND decode 用例 (如 141B/8Q/3500KV) 两者都不提供,
+    # batch 只能由 batch_size 属性给出, 否则 B=1 与 CSV slot 形状不符。
+    _bs_attr = kwargs.get("batch_size")
+    if len(cu_seqlens_q) >= 2:
+        B = len(cu_seqlens_q) - 1
+    elif seqused_q is not None and len(seqused_q) > 0:
+        B = len(seqused_q)
+    elif _bs_attr is not None and int(_bs_attr) > 0:
+        B = int(_bs_attr)
+    else:
+        B = 1
+
     # Q 与 KV 一致: cu_seqlens 缺失 (BNSD/BSND 用例不提供) 时回退 seqused,
-    # 不能回退 [0] — 否则 Q 生成长度为 0, 与 CSV slot 形状不匹配。
+    # 再回退 max_seqlen*B (非 varlen decode), 不能回退 [0] — 否则 Q 生成长度
+    # 为 0, 与 CSV slot 形状不匹配。
     if len(cu_seqlens_q) > 1:
         actual_seq_q = [
             cu_seqlens_q[i + 1] - cu_seqlens_q[i] for i in range(len(cu_seqlens_q) - 1)
         ]
     elif seqused_q is not None and len(seqused_q) > 0:
         actual_seq_q = list(seqused_q)
+    elif max_seqlen_q is not None and max_seqlen_q > 0:
+        actual_seq_q = [max_seqlen_q] * B
     else:
         actual_seq_q = [0]
     if len(cu_seqlens_kv) > 1:
@@ -263,19 +316,10 @@ def generate_qfa_mxfp8_inputs(
         ]
     elif seqused_kv is not None and len(seqused_kv) > 0:
         actual_seq_kv = list(seqused_kv)
+    elif max_seqlen_kv is not None and max_seqlen_kv > 0:
+        actual_seq_kv = [max_seqlen_kv] * B
     else:
         actual_seq_kv = [0]
-
-    # batch_size: CSV 原始值 (可为 -1), 透传给 metadata;
-    # B: 从 cu_seqlens_q 推导的正整数, 供 BNSD 张量生成。
-    # BNSD/BSND 用例 cu_seqlens 缺失 (占位 [0]) 时回退 seqused_q 长度 —
-    # redline PA+BNSD 用例 seqused_q=[4,4,4,4] → B=4, 与 CSV slot 形状一致。
-    if len(cu_seqlens_q) >= 2:
-        B = len(cu_seqlens_q) - 1
-    elif seqused_q is not None and len(seqused_q) > 0:
-        B = len(seqused_q)
-    else:
-        B = 1
 
     max_sq = max(actual_seq_q) if actual_seq_q else D
     # CSV q slot 的 S 维是 padding 权威上界: redline 用例 slot S 可大于
@@ -495,70 +539,118 @@ def generate_qfa_mxfp8_inputs(
     )
 
     if enable_pa:
-        total_blocks_k = int(dequant_scale_k.shape[0])
-        total_blocks_v = int(dequant_scale_v.shape[0])
-        total_blocks = min(total_blocks_k, total_blocks_v)
-
-        if block_table.size == 0:
-            raise ValueError(
-                "[INPUTS] enable_pa=True but block_table CSV shape is (0,) — "
-                "Excel AI column empty for PA row"
+        # PA 物理 block 数 (Bn) 由 K/V cache 数据 slot 的 dim0 决定
+        # (PA_BNBD/PA_BBND/PA_NZ 的 dim0 均为 Bn)。不能再用 descale slot 作为
+        # 唯一来源: 该 slot 在 CSV 里可能缺失 (None) 或为空 ((0,)), 直接取
+        # shape[0] 会分别触发 AttributeError 与 total_blocks=0 的除零。
+        total_blocks_k = int(k.shape[0]) if k is not None and k.ndim >= 4 else 0
+        total_blocks_v = int(v.shape[0]) if v is not None and v.ndim >= 4 else 0
+        # 测试脚本不对 cache 形状做合法性校验 — 空 cache 直接透传给算子, 由 NPU 侧
+        # 校验并报错。这里只按空处理避免脚本自身越界:
+        #   - V cache 空是 v_tail 的合法形态: 每 batch 主体段长度 align_down(kvLen,64)
+        #     为 0 时 (kvLen<64) 真实 V 全部在 v_tail 里;
+        #   - K cache 空属于算子侧应拦截的非法输入。
+        k_cache_empty = total_blocks_k <= 0
+        v_cache_empty = total_blocks_v <= 0
+        if k_cache_empty or v_cache_empty:
+            logger.warning(
+                "[INPUTS] PA cache slot dim0: k=%d v=%d (k slot=%s, v slot=%s) — "
+                "空 cache 直接透传, 合法性由算子侧校验; 本脚本跳过对应 scatter",
+                total_blocks_k,
+                total_blocks_v,
+                tuple(k.shape) if k is not None else None,
+                tuple(v.shape) if v is not None else None,
             )
-        max_blocks = block_table.shape[1] if block_table.ndim >= 2 else 0
-        if max_blocks <= 0:
-            raise ValueError(
-                f"[INPUTS] PA mode block_table max_blocks={max_blocks} invalid"
-            )
-        torch.manual_seed(42)  # 确定性 block_table
-        blockid_pool = torch.randperm(total_blocks, dtype=torch.int32)
-        bt_real = torch.full((B, max_blocks), -1, dtype=torch.int32)
-        idx = 0
-        for b in range(B):
-            n_blocks = math.ceil(actual_seq_kv[b] / block_size)
-            for j in range(n_blocks):
-                bt_real[b, j] = blockid_pool[idx % total_blocks]
-                idx += 1
-        k_fp8_final = mxfp8_golden_mod.mxfp8_pa_preprocessing(
-            k_fp8_bnsd_f32,
-            actual_seq_kv,
-            block_size,
-            bt_real,
-            is_scale=False,
-            kv_layout=kv_cache_layout,
-            total_blocks=total_blocks_k,
-        )
-        v_fp8_final = mxfp8_golden_mod.mxfp8_pa_preprocessing(
-            v_fp8_bnsd_f32,
-            actual_seq_kv,
-            block_size,
-            bt_real,
-            is_scale=False,
-            kv_layout=kv_cache_layout,
-            total_blocks=total_blocks_v,
+        total_blocks = (
+            total_blocks_k if v_cache_empty else min(total_blocks_k, total_blocks_v)
         )
 
-        k_scale_pa = mxfp8_golden_mod.mxfp8_pa_preprocessing(
-            quant_scale_k_bnsd,
-            actual_seq_kv,
-            block_size,
-            bt_real,
-            is_scale=True,
-            is_vscale=False,
-            kv_layout=kv_cache_layout,
-            total_blocks=total_blocks_k,
-        )
-        v_scale_pa = mxfp8_golden_mod.mxfp8_pa_preprocessing(
-            quant_scale_v_bnsd,
-            actual_seq_kv,
-            block_size,
-            bt_real,
-            is_scale=True,
-            is_vscale=True,
-            kv_layout=kv_cache_layout,
-            total_blocks=total_blocks_v,
-        )
-        k_scale_final_layout = k_scale_pa
-        v_scale_final_layout = v_scale_pa
+        if k_cache_empty:
+            # K cache 为空时无法建立 block 映射: K/V 数据与 scale 全部按 slot 同形
+            # 占位原样透传, 由算子侧报错。
+            k_fp8_final = _empty_like_slot(k, torch.float8_e4m3fn)
+            v_fp8_final = _empty_like_slot(v, torch.float8_e4m3fn)
+            k_scale_final_layout = _empty_like_slot(dequant_scale_k, torch.float32)
+            v_scale_final_layout = _empty_like_slot(dequant_scale_v, torch.float32)
+        else:
+            if block_table is None or block_table.size == 0:
+                raise ValueError(
+                    "[INPUTS] enable_pa=True but block_table CSV shape is (0,) — "
+                    "Excel AI column empty for PA row"
+                )
+            max_blocks = block_table.shape[1] if block_table.ndim >= 2 else 0
+            if max_blocks <= 0:
+                raise ValueError(
+                    f"[INPUTS] PA mode block_table max_blocks={max_blocks} invalid"
+                )
+            # block_table 列数是每 batch 能表达的最大 block 数 (CSV 口径应等于
+            # ceil(max(actual_seq_kv)/block_size))。需求超出列数时无法表达该 batch
+            # 的 KV 映射, 直接给出可定位的报错, 而不是填表时裸 IndexError。
+            _need_blocks = max(math.ceil(a / block_size) for a in actual_seq_kv)
+            if _need_blocks > max_blocks:
+                raise ValueError(
+                    f"[INPUTS] PA block_table too narrow: need {_need_blocks} blocks "
+                    f"per batch (actual_seq_kv={list(actual_seq_kv)}, "
+                    f"block_size={block_size}) but block_table slot is "
+                    f"{tuple(block_table.shape)} (max_blocks={max_blocks}); "
+                    f"check block_table shape / block_size / seqused_kv attrs. "
+                    f"k slot={tuple(k.shape)}, v slot={tuple(v.shape)}"
+                )
+            torch.manual_seed(42)  # 确定性 block_table
+            blockid_pool = torch.randperm(total_blocks, dtype=torch.int32)
+            bt_real = torch.full((B, max_blocks), -1, dtype=torch.int32)
+            idx = 0
+            for b in range(B):
+                n_blocks = math.ceil(actual_seq_kv[b] / block_size)
+                for j in range(n_blocks):
+                    bt_real[b, j] = blockid_pool[idx % total_blocks]
+                    idx += 1
+            k_fp8_final = mxfp8_golden_mod.mxfp8_pa_preprocessing(
+                k_fp8_bnsd_f32,
+                actual_seq_kv,
+                block_size,
+                bt_real,
+                is_scale=False,
+                kv_layout=kv_cache_layout,
+                total_blocks=total_blocks_k,
+            )
+            if v_cache_empty:
+                # 空 V cache: 没有可 scatter 的物理 block, 直接给与 slot 同形的空张量
+                # (V 主体真值全部在 v_tail / seqused_v_tail 里)。
+                v_fp8_final = _empty_like_slot(v, torch.float8_e4m3fn)
+                v_scale_final_layout = _empty_like_slot(dequant_scale_v, torch.float32)
+            else:
+                v_fp8_final = mxfp8_golden_mod.mxfp8_pa_preprocessing(
+                    v_fp8_bnsd_f32,
+                    actual_seq_kv,
+                    block_size,
+                    bt_real,
+                    is_scale=False,
+                    kv_layout=kv_cache_layout,
+                    total_blocks=total_blocks_v,
+                )
+
+            k_scale_final_layout = mxfp8_golden_mod.mxfp8_pa_preprocessing(
+                quant_scale_k_bnsd,
+                actual_seq_kv,
+                block_size,
+                bt_real,
+                is_scale=True,
+                is_vscale=False,
+                kv_layout=kv_cache_layout,
+                total_blocks=total_blocks_k,
+            )
+            if not v_cache_empty:
+                v_scale_final_layout = mxfp8_golden_mod.mxfp8_pa_preprocessing(
+                    quant_scale_v_bnsd,
+                    actual_seq_kv,
+                    block_size,
+                    bt_real,
+                    is_scale=True,
+                    is_vscale=True,
+                    kv_layout=kv_cache_layout,
+                    total_blocks=total_blocks_v,
+                )
     else:
         # 非 PA 模式: k/v 按解析的 KV 数据布局转换 (TND/BNSD/BSND);
         # cu_seqlens 占位 [0] 视为未提供 (同 Q 侧)。
@@ -630,6 +722,15 @@ def generate_qfa_mxfp8_inputs(
         掩盖真正注入的异常属性, 且无法定位。跳过写入让非法输入按 CSV 声明的
         形状透传到算子, 由 host 侧 checker 给出明确拦截报错。
         """
+        if slot is None:
+            # CSV 未分配该 slot (省略 → 主算子收到 None): 不写, 也不崩溃。
+            logger.warning(
+                "[INPUTS] %s slot is None (CSV omitted) - skip in-place write "
+                "(computed %s)",
+                slot_name,
+                tuple(src_torch.shape),
+            )
+            return
         if tuple(slot.shape) == tuple(src_torch.shape):
             slot.copy_(src_torch)
             return
@@ -658,10 +759,14 @@ def generate_qfa_mxfp8_inputs(
     p_scale_value = kwargs.get("p_scale_value", 1.0)
     if isinstance(p_scale_value, torch.Tensor):
         p_scale_value = float(p_scale_value.item())
-    p_scale[...] = p_scale_value
+    if p_scale is not None:
+        p_scale[...] = p_scale_value
 
     if enable_pa:
-        block_table[...] = bt_real
+        # 空 K cache 时没有 block 映射可填, block_table 保持 slot 原值透传,
+        # 由算子侧校验报错。
+        if not k_cache_empty:
+            block_table[...] = bt_real
     elif block_table is not None:
         block_table[...] = 0
 
@@ -685,13 +790,16 @@ def generate_qfa_mxfp8_inputs(
         )
         _write_int32_list(seqused_v_tail, tail_lens, "seqused_v_tail (slot 17)")
 
+    def _slot_shape(t):
+        return tuple(t.shape) if t is not None and hasattr(t, "shape") else None
+
     logger.info(
         "[INPUTS] in-place wrote fp8 q/k/v (q=%s), e8m0 descale (dq=%s, dk=%s, dv=%s), "
         "fp32 p_scale, int32 block_table (pa=%s)",
-        tuple(q.shape),
-        tuple(dequant_scale_q.shape),
-        tuple(dequant_scale_k.shape),
-        tuple(dequant_scale_v.shape),
+        _slot_shape(q),
+        _slot_shape(dequant_scale_q),
+        _slot_shape(dequant_scale_k),
+        _slot_shape(dequant_scale_v),
         enable_pa,
     )
 

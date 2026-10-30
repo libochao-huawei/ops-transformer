@@ -539,15 +539,26 @@ def cpu_qfa_mxfp8(
     )
 
     # batch_size: CSV 原始值 (可为 -1), 透传给 metadata;
-    # B: 从 cu_seqlens_q 推导的正整数, 供 shape assert 与 BNSD 逆转换。
+    # B: cu_seqlens_q (len-1) → seqused_q (len) → batch_size 属性 → 1。
     # 与 impl/inputs.py 一致: cu_seqlens 占位 [0] (BNSD/BSND 用例不提供) 时
-    # 回退 seqused_q 长度, 否则 B=1 与 NPU 实际 batch 不匹配。
+    # 回退 seqused_q 长度; 非 varlen 的 BNSD/BSND decode 用例两者都不提供,
+    # batch 只能由 batch_size 属性给出, 否则 B=1 与 NPU 实际 batch 不匹配。
+    _bs_attr = kwargs.get("batch_size")
     if cu_seqlens_q_list and len(cu_seqlens_q_list) >= 2:
         B = len(cu_seqlens_q_list) - 1
     elif seqused_q_list is not None and len(seqused_q_list) > 0:
         B = len(seqused_q_list)
+    elif _bs_attr is not None and int(_bs_attr) > 0:
+        B = int(_bs_attr)
     else:
         B = 1
+
+    # 非 varlen (BNSD/BSND decode) 场景 cu_seqlens/seqused 均为空, actual_seq
+    # 按 max_seqlen 补齐到 B 长度 — 与 metadata 的 max_seqlen 口径一致。
+    if not actual_seq_q:
+        actual_seq_q = [max_seqlen_q] * B if max_seqlen_q > 0 else []
+    if not actual_seq_kv:
+        actual_seq_kv = [max_seqlen_kv] * B if max_seqlen_kv > 0 else []
 
     # p_scale_value 从 CSV attributes 经 kwargs 传入
     p_scale_value = kwargs.get("p_scale_value", 1.0)
@@ -630,66 +641,100 @@ def cpu_qfa_mxfp8(
             )
 
         k_pa = _to_torch_fp8(k)
-        k_cache = _reverse_layout_to_cache(
-            k_pa, kv_cache_layout, is_scale=False, is_vscale=False
-        )
-        k_fp8_bnsd = mxfp8_golden_mod.pa_to_bnsd_data(
-            k_cache, actual_seq_kv, block_size, bt, kv_layout=kv_cache_layout
-        )
-        # PA_NZ 等布局会对 D 维做对齐 padding (如 D=72→96, 32 对齐),
-        # 裁剪到 logical D, 排除 padding 列 (fill_value=0), 与 NPU 算子
-        # 按 head_dim=logical D 计算的行为一致. 对 D∈{64,96,128} 等整除值是 no-op.
-        if k_fp8_bnsd.shape[-1] > D:
-            k_fp8_bnsd = k_fp8_bnsd[:, :, :, :D].contiguous()
+        # 测试脚本不对 cache 形状做合法性校验: K cache 为空 (dim0=0) 时无法反查
+        # block, K 主体用占位, 合法性由算子侧拦截 (空 K 属非法输入)。
+        k_cache_empty = k_pa.ndim < 4 or int(k_pa.shape[0]) == 0
+        if k_cache_empty:
+            logger.warning(
+                "[GOLDEN] PA K cache dim0=0 — 主体 K/scale 用占位, 合法性由算子侧"
+                "校验 (k slot=%s)",
+                tuple(k_pa.shape),
+            )
+            k_fp8_bnsd = torch.zeros((B, N_kv, max_skv, D), dtype=torch.float8_e4m3fn)
+        else:
+            k_cache = _reverse_layout_to_cache(
+                k_pa, kv_cache_layout, is_scale=False, is_vscale=False
+            )
+            k_fp8_bnsd = mxfp8_golden_mod.pa_to_bnsd_data(
+                k_cache, actual_seq_kv, block_size, bt, kv_layout=kv_cache_layout
+            )
+            # PA_NZ 等布局会对 D 维做对齐 padding (如 D=72→96, 32 对齐),
+            # 裁剪到 logical D, 排除 padding 列 (fill_value=0), 与 NPU 算子
+            # 按 head_dim=logical D 计算的行为一致. 对 D∈{64,96,128} 等整除值是 no-op.
+            if k_fp8_bnsd.shape[-1] > D:
+                k_fp8_bnsd = k_fp8_bnsd[:, :, :, :D].contiguous()
         # V data: 同 K
         v_pa = _to_torch_fp8(v)
-        v_cache = _reverse_layout_to_cache(
-            v_pa, kv_cache_layout, is_scale=False, is_vscale=False
-        )
-        v_fp8_bnsd = mxfp8_golden_mod.pa_to_bnsd_data(
-            v_cache, actual_seq_kv, block_size, bt, kv_layout=kv_cache_layout
-        )
-        if v_fp8_bnsd.shape[-1] > D:
-            v_fp8_bnsd = v_fp8_bnsd[:, :, :, :D].contiguous()
+        # v_tail 场景下 V cache 可以为空: 每 batch 主体段长度 align_down(kvLen,64)
+        # 为 0 时 (kvLen<64, 真实 V 值全部在 v_tail 里), cache slot dim0 合法为 0,
+        # 此时没有可反查的物理 block, 主体段用同形占位 (内容会被尾段注入覆盖)。
+        v_cache_empty = v_pa.ndim < 4 or int(v_pa.shape[0]) == 0
+        if v_cache_empty or k_cache_empty:
+            logger.warning(
+                "[GOLDEN] PA V cache 用占位 (v_tail 主体段为 0 或 K cache 为空) — "
+                "真实值由 v_tail 注入 (v slot=%s, k_cache_empty=%s)",
+                tuple(v_pa.shape),
+                k_cache_empty,
+            )
+            v_fp8_bnsd = torch.zeros_like(k_fp8_bnsd)
+        else:
+            v_cache = _reverse_layout_to_cache(
+                v_pa, kv_cache_layout, is_scale=False, is_vscale=False
+            )
+            v_fp8_bnsd = mxfp8_golden_mod.pa_to_bnsd_data(
+                v_cache, actual_seq_kv, block_size, bt, kv_layout=kv_cache_layout
+            )
+            if v_fp8_bnsd.shape[-1] > D:
+                v_fp8_bnsd = v_fp8_bnsd[:, :, :, :D].contiguous()
 
         # K scale: e8m0 -> fp32 -> reverse layout -> out_cache (Bn,N,Bs,Dg//2,2) -> grouped BNSD
-        dk_e8m0 = _to_torch_e8m0(dequant_scale_k)
-        _assert_no_e8m0_nan(dk_e8m0, "descale_k")
-        dk_fp32 = mxfp8_golden_mod.e8m0_to_fp32(dk_e8m0)
-        dk_cache = _reverse_layout_to_cache(
-            dk_fp32, kv_cache_layout, is_scale=True, is_vscale=False
-        )
-        dk_bnsd_grouped = _pa_k_scale_to_bnsd_grouped(
-            dk_cache, actual_seq_kv, block_size, bt
-        )
-        assert dk_bnsd_grouped.shape == (B, N_kv, max_skv, Dg), (
-            f"K scale grouped shape mismatch: got {tuple(dk_bnsd_grouped.shape)}, "
-            f"expected {(B, N_kv, max_skv, Dg)}"
-        )
+        if k_cache_empty:
+            dk_bnsd_grouped = torch.ones((B, N_kv, max_skv, Dg), dtype=torch.float32)
+        else:
+            dk_e8m0 = _to_torch_e8m0(dequant_scale_k)
+            _assert_no_e8m0_nan(dk_e8m0, "descale_k")
+            dk_fp32 = mxfp8_golden_mod.e8m0_to_fp32(dk_e8m0)
+            dk_cache = _reverse_layout_to_cache(
+                dk_fp32, kv_cache_layout, is_scale=True, is_vscale=False
+            )
+            dk_bnsd_grouped = _pa_k_scale_to_bnsd_grouped(
+                dk_cache, actual_seq_kv, block_size, bt
+            )
+            assert dk_bnsd_grouped.shape == (B, N_kv, max_skv, Dg), (
+                f"K scale grouped shape mismatch: got {tuple(dk_bnsd_grouped.shape)}, "
+                f"expected {(B, N_kv, max_skv, Dg)}"
+            )
 
         # V scale: e8m0 -> fp32 -> reverse layout -> out_cache (Bn,N,pack_bs,D,2) -> grouped BNSD
-        dv_e8m0 = _to_torch_e8m0(dequant_scale_v)
-        _assert_no_e8m0_nan(dv_e8m0, "descale_v")
-        dv_fp32 = mxfp8_golden_mod.e8m0_to_fp32(dv_e8m0)
-        dv_cache = _reverse_layout_to_cache(
-            dv_fp32, kv_cache_layout, is_scale=True, is_vscale=True
-        )
-        dv_bnsd_grouped = _pa_v_scale_to_bnsd_grouped(
-            dv_cache, actual_seq_kv, block_size, bt, group_size=group_size
-        )
-        # V scale grouped: (B, N_kv, Sg_max, D), Sg_max = ceil(max_skv/32)
-        # PA_NZ 布局 V scale 的 D 维会 16 对齐 padding (如 D=72→80),
-        # 物理 D >= logical D, 裁剪到 logical D 排除 padding (fill_value=E8M0_MIN_POSITIVE).
-        Sg_max = math.ceil(max_skv / group_size) if max_skv > 0 else 0
-        assert dv_bnsd_grouped.shape[:3] == (B, N_kv, Sg_max), (
-            f"V scale grouped first 3 dims mismatch: got {tuple(dv_bnsd_grouped.shape[:3])}, "
-            f"expected {(B, N_kv, Sg_max)}"
-        )
-        assert dv_bnsd_grouped.shape[3] >= D, (
-            f"V scale grouped D={dv_bnsd_grouped.shape[3]} < logical D={D}"
-        )
-        if dv_bnsd_grouped.shape[3] > D:
-            dv_bnsd_grouped = dv_bnsd_grouped[:, :, :, :D].contiguous()
+        # V cache 为空 (v_tail 主体段为 0) 时没有 cache scale 可反查: slot 也可能
+        # 缺失 (None) 或为 (0,), 直接用 scale=1 占位 — 尾段注入会把覆盖区间
+        # 的 dequant_scale_v 置 1.0, 与 kernel 尾块 scale 恒 1 的语义一致。
+        if v_cache_empty or k_cache_empty:
+            Sg_max = math.ceil(max_skv / group_size) if max_skv > 0 else 0
+            dv_bnsd_grouped = torch.ones((B, N_kv, Sg_max, D), dtype=torch.float32)
+        else:
+            dv_e8m0 = _to_torch_e8m0(dequant_scale_v)
+            _assert_no_e8m0_nan(dv_e8m0, "descale_v")
+            dv_fp32 = mxfp8_golden_mod.e8m0_to_fp32(dv_e8m0)
+            dv_cache = _reverse_layout_to_cache(
+                dv_fp32, kv_cache_layout, is_scale=True, is_vscale=True
+            )
+            dv_bnsd_grouped = _pa_v_scale_to_bnsd_grouped(
+                dv_cache, actual_seq_kv, block_size, bt, group_size=group_size
+            )
+            # V scale grouped: (B, N_kv, Sg_max, D), Sg_max = ceil(max_skv/32)
+            # PA_NZ 布局 V scale 的 D 维会 16 对齐 padding (如 D=72→80),
+            # 物理 D >= logical D, 裁剪到 logical D 排除 padding (fill_value=E8M0_MIN_POSITIVE).
+            Sg_max = math.ceil(max_skv / group_size) if max_skv > 0 else 0
+            assert dv_bnsd_grouped.shape[:3] == (B, N_kv, Sg_max), (
+                f"V scale grouped first 3 dims mismatch: got {tuple(dv_bnsd_grouped.shape[:3])}, "
+                f"expected {(B, N_kv, Sg_max)}"
+            )
+            assert dv_bnsd_grouped.shape[3] >= D, (
+                f"V scale grouped D={dv_bnsd_grouped.shape[3]} < logical D={D}"
+            )
+            if dv_bnsd_grouped.shape[3] > D:
+                dv_bnsd_grouped = dv_bnsd_grouped[:, :, :, :D].contiguous()
     else:
         # 非 PA: K/V 按解析的 KV 数据布局逆转换 -> BNSD
         k_fp8_tnd = _to_torch_fp8(k)

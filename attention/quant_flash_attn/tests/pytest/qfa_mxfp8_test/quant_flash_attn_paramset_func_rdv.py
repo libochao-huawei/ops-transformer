@@ -13,6 +13,29 @@
 from quant_flash_attn_paramset_common import expand_paramset_to_cases
 
 TEST_PARAMS = {
+    # BNSD decode 且 cu_seqlens/seqused 全空, 只给 batch_size 属性:
+    # 覆盖算子 metadata 的 B 推导兜底路径 (对齐 ttk 上 BNSD 仅 batch_size 的用例)
+    "BNSD_BATCHSIZE_ONLY_B4_QS8_KVS512_Nq2_Nkv1_D128_SP0": {
+        "B": [4],
+        "N_q": [2],
+        "N_kv": [1],
+        "D": [128],
+        "cu_seqlens_q": [None],
+        "cu_seqlens_kv": [None],
+        "seqused_q": [None],
+        "seqused_kv": [None],
+        "batch_size": [4],
+        "max_seqlen_q": [8],
+        "max_seqlen_kv": [512],
+        "enable_pa": [False],
+        "kv_cache_layout": ["BNSD"],
+        "input_layout": ["BNSD"],
+        "block_size": [512],
+        "mask_mode": [0],
+        "q_scale_layout": ["BNSD"],
+        "p_scale": [1.0],
+        "enable_lse": [False],
+    },
     # v_tail尾task强制ND范式执行(q_scale_layout=TND路由DN); TND的v_tail=(B,N2,64,D)直存
     # 四形状: 纯尾31 / 拆分kMain128 / 拆分kMain192 / 拆分kMain448双subLoop+大尾48
     # [PA prefill] v_tail=尾块从主cache剥离直存(布局跟主KV): 三变体×纯尾/混合尾

@@ -121,6 +121,31 @@ def _get_seqused_kv():
     return SEQUSED_KV if SEQUSED_KV is not None else _derive_seqused(CU_SEQLENS_KV)
 
 
+# BNSD/BSND decode 只给 batch_size 属性 (cu_seqlens/seqused 全空) 时的显式 batch 数;
+# None 表示走 cu_seqlens/seqused 推导。仅透传给算子 metadata, 不合成 seqused tensor。
+BATCH_SIZE = None
+
+
+def _fallback_seq_lens(max_seqlen):
+    """无 cu_seqlens/seqused 时的每 batch 长度兜底: 非 varlen 场景各 batch 同长。"""
+    if BATCH_SIZE is None or int(BATCH_SIZE) <= 0:
+        return None
+    if max_seqlen is None or int(max_seqlen) <= 0:
+        return None
+    return [int(max_seqlen)] * int(BATCH_SIZE)
+
+
+def _get_act_seq_q():
+    """golden/layout 计算用的 Q 每 batch 长度 (比 _get_seqused_q 多一层 batch_size 兜底)。"""
+    seq_lens = _get_seqused_q()
+    return seq_lens if seq_lens is not None else _fallback_seq_lens(MAX_SEQLEN_Q)
+
+
+def _get_act_seq_kv():
+    seq_lens = _get_seqused_kv()
+    return seq_lens if seq_lens is not None else _fallback_seq_lens(MAX_SEQLEN_KV)
+
+
 ENABLE_PA = False
 BLOCK_SIZE = 512
 
@@ -884,8 +909,8 @@ def generate_data():
     """生成 BNSD BF16 Q/K/V 并做 MXFP8 量化，使用原始序列长度"""
     max_sq = MAX_SEQLEN_Q
     max_skv = MAX_SEQLEN_KV
-    seqused_q = _get_seqused_q()
-    seqused_kv = _get_seqused_kv()
+    seqused_q = _get_act_seq_q()
+    seqused_kv = _get_act_seq_kv()
     if max_sq is None or max_sq < 0:
         max_sq = max(seqused_q)
     if max_skv is None or max_skv < 0:
@@ -1710,9 +1735,9 @@ def cpu_mxfp8_golden(
         V_BLOCK_SIZE = 512
 
     if actual_seq_q is None:
-        actual_seq_q = _get_seqused_q()
+        actual_seq_q = _get_act_seq_q()
     if actual_seq_kv is None:
-        actual_seq_kv = _get_seqused_kv()
+        actual_seq_kv = _get_act_seq_kv()
 
     # 尝试按 kernel SectionStreamK 分核调度模拟 (对齐 P 的 fp8 量化网格);
     # metadata 解码失败或计算异常时回退全局 online softmax 语义
@@ -2072,9 +2097,9 @@ def cpu_mxfp8_golden_fp64(
         V_BLOCK_SIZE = 512
 
     if actual_seq_q is None:
-        actual_seq_q = _get_seqused_q()
+        actual_seq_q = _get_act_seq_q()
     if actual_seq_kv is None:
-        actual_seq_kv = _get_seqused_kv()
+        actual_seq_kv = _get_act_seq_kv()
 
     # FP8 → FP64 反量化
     q_tensor = q_fp8.to(torch.float64)
@@ -2316,6 +2341,7 @@ def _call_npu_fa_op(
     v_tail=None,
     block_table_tail=None,
     seqused_v_tail=None,
+    batch_size=None,
 ):
     """调用 NPU 双算子 (QFA: quant_flash_attn_metadata + quant_flash_attn)"""
     if not _HAS_NPU:
@@ -2359,6 +2385,7 @@ def _call_npu_fa_op(
         cu_seqlens_kv=cu_seqlens_kv_t if is_tnd_kv else None,
         seqused_q=seqused_q_t,
         seqused_kv=seqused_kv_t,
+        batch_size=batch_size,
         mask_mode=sparse_mode,
         layout_q=layout_q,
         layout_q_descale=layout_q_descale,
@@ -2465,6 +2492,7 @@ class Network(nn.Module):
         v_tail=None,
         block_table_tail=None,
         seqused_v_tail=None,
+        batch_size=None,
     ):
         metadata = quant_flash_attn_metadata(
             num_heads_q=q_n,
@@ -2475,6 +2503,7 @@ class Network(nn.Module):
             cu_seqlens_kv=cu_seqlens_kv,
             seqused_q=seqused_q,
             seqused_kv=seqused_kv,
+            batch_size=batch_size,
             head_dim_v=None,
             mask_mode=sparse_mode,
             layout_q=layout_q,
@@ -2586,6 +2615,7 @@ def prepare_npu_inputs(
     block_table_torch=None,
     qr_bf16=None,
     kr_bf16=None,
+    batch_size=None,
 ):
     """准备 NPU 侧入参 (layout 转换 / scale 转换 / mask / rope / block_table)，返回可直接传给
     _call_npu_fa_op 的入参字典。
@@ -2595,7 +2625,8 @@ def prepare_npu_inputs(
       cu_seqlens_q, cu_seqlens_kv, seqused_q, seqused_kv, max_seqlen_q, max_seqlen_kv,
       dequant_scale_q, dequant_scale_k, v_descale, p_scale,
       block_table, q_n, kv_n, softmax_scale,
-      layout_q, layout_q_descale, layout_kv, layout_out, block_size, sparse_mode, out_dtype
+      layout_q, layout_q_descale, layout_kv, layout_out, block_size, sparse_mode, out_dtype,
+      batch_size (BNSD/BSND 仅给 batch_size 属性时透传, 否则 None)
     其中 cu_seqlens_q/kv、seqused_q/kv 为 python list (或 None)，由 _call_npu_fa_op 负责转 NPU tensor；
     其余 tensor 字段均为已就绪的 NPU tensor。
     """
@@ -2611,8 +2642,8 @@ def prepare_npu_inputs(
     logger.info("[NPU] Q layout: q_layout=%s, G=%d", q_runtime_layout, q_group)
 
     npu_input_layout = INPUT_LAYOUT
-    act_seqused_q = _get_seqused_q()
-    act_seqused_kv = _get_seqused_kv()
+    act_seqused_q = _get_act_seq_q()
+    act_seqused_kv = _get_act_seq_kv()
     q_npu = (
         convert_q_bnsd_to_layout(
             q_fp8, act_seqused_q, npu_input_layout, cu_seqlens=CU_SEQLENS_Q
@@ -2792,6 +2823,7 @@ def prepare_npu_inputs(
             block_size=BLOCK_SIZE,
             sparse_mode=SPARSE_MODE,
             out_dtype=out_dtype,
+            batch_size=batch_size,
             v_tail=_vtail_pa["v_tail_pa"].npu() if _vtail_pa is not None else None,
             block_table_tail=_vtail_pa["block_table_tail"].npu()
             if _vtail_pa is not None
@@ -2880,6 +2912,7 @@ def prepare_npu_inputs(
         block_size=0,
         sparse_mode=SPARSE_MODE,
         out_dtype=out_dtype,
+        batch_size=batch_size,
         v_tail=_vtail["v_tail_pa"].npu() if _vtail is not None else None,
         block_table_tail=(
             _vtail["block_table_tail"].npu()
@@ -2907,6 +2940,7 @@ def npu_mxfp8_fa(
     block_table_torch=None,
     qr_bf16=None,
     kr_bf16=None,
+    batch_size=None,
 ):
     """调用 NPU 算子，支持 N2TGD layout
 
@@ -2929,6 +2963,7 @@ def npu_mxfp8_fa(
         block_table_torch=block_table_torch,
         qr_bf16=qr_bf16,
         kr_bf16=kr_bf16,
+        batch_size=batch_size,
     )
 
     logger.info(
@@ -2939,7 +2974,7 @@ def npu_mxfp8_fa(
     # 通过 mxfp8_fa_torch_npu 路由，支持 GRAPH_PATH=7 (aclgraph)
     atten_out, lse_out = mxfp8_fa_torch_npu(**inputs)
 
-    act_seqused_q = _get_seqused_q()
+    act_seqused_q = _get_act_seq_q()
     npu_output = atten_out
     out_layout = INPUT_LAYOUT
     if out_layout == "TND":
@@ -2981,6 +3016,7 @@ def mxfp8_fa_torch_npu(
     v_tail=None,
     block_table_tail=None,
     seqused_v_tail=None,
+    batch_size=None,
 ):
     """NPU 调用入口, 支持 GRAPH_PATH=0 (单算子) 和 GRAPH_PATH=7 (aclgraph)"""
     if GRAPH_PATH == 0:
@@ -3016,6 +3052,7 @@ def mxfp8_fa_torch_npu(
             v_tail,
             block_table_tail,
             seqused_v_tail,
+            batch_size,
         )
 
     # GRAPH_PATH == 7: aclgraph
@@ -3077,6 +3114,7 @@ def mxfp8_fa_torch_npu(
             v_tail,
             block_table_tail,
             seqused_v_tail,
+            batch_size,
         )
 
         # aclgraph: 直接使用 npugraph_ex backend
