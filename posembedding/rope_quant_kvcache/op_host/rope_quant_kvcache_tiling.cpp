@@ -23,6 +23,7 @@ constexpr int64_t TASK_NUM = 2;
 constexpr int SIZE_SPLIT_Q = 0;
 constexpr int SIZE_SPLIT_K = 1;
 constexpr int SIZE_SPLIT_V = 2;
+constexpr size_t SIZE_SPLITS_COUNT = 3;
 constexpr int KVCACHE_INPUT_INDEX = 5;
 constexpr int KVCACHE_HEAD_DIM_INDEX = 2;
 constexpr int KVCACHE_HIDDEN_DIM_INDEX = 3;
@@ -36,8 +37,11 @@ static ge::graphStatus TilingForRopeQuantKvcache(gert::TilingContext* context)
     const gert::StorageShape* cacheShape = context->GetInputShape(KVCACHE_INPUT_INDEX);
 
     auto attrs = context->GetAttrs();
+    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
     auto attr = attrs->GetAttrPointer<gert::ContinuousVector>(0);
     OP_CHECK_NULL_WITH_CONTEXT(context, attr);
+    OP_CHECK_IF(attr->GetSize() != SIZE_SPLITS_COUNT, OP_LOGE(context, "size_splits must contain exactly 3 elements."),
+                return ge::GRAPH_FAILED);
     const int64_t* attrData = reinterpret_cast<const int64_t*>(attr->GetData());
 
     int64_t batch = cacheShape->GetStorageShape().GetDim(0);

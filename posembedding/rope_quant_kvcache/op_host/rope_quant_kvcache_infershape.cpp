@@ -25,6 +25,7 @@ static constexpr int VCACHE_OUTPUT_INDEX = 4;
 static constexpr int TOTAL_DIM = 4;
 static constexpr int THIRD_DIM = 2;
 static constexpr int FORTH_DIM = 3;
+static constexpr size_t SIZE_SPLITS_COUNT = 3;
 
 static ge::graphStatus RopeQuantKvcacheInferShape(gert::InferShapeContext* context)
 {
@@ -38,7 +39,11 @@ static ge::graphStatus RopeQuantKvcacheInferShape(gert::InferShapeContext* conte
     gert::Shape* vCacheShape = context->GetOutputShape(VCACHE_OUTPUT_INDEX);
 
     auto attrs = context->GetAttrs();
+    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
     const gert::ContinuousVector* splitSize = attrs->GetAttrPointer<gert::ContinuousVector>(0);
+    OP_CHECK_NULL_WITH_CONTEXT(context, splitSize);
+    OP_CHECK_IF(splitSize->GetSize() != SIZE_SPLITS_COUNT,
+                OP_LOGE(context, "size_splits must contain exactly 3 elements."), return ge::GRAPH_FAILED);
     const int64_t* splitSizeArray = reinterpret_cast<const int64_t*>(splitSize->GetData());
 
     int64_t batch = cacheShape->GetDim(0);
