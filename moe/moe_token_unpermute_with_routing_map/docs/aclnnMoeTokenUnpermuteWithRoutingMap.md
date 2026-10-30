@@ -180,7 +180,7 @@ aclnnStatus aclnnMoeTokenUnpermuteWithRoutingMap(
       <td>routingMapOptional（aclTensor*）</td>
       <td>输入</td>
       <td>计算公式中的routingMapOptional，代表对应位置的Token是否被对应专家处理。</td>
-      <td>当输入probsOptional为空指针时不需要此输入，应该传入空指针。<br>当数据类型为INT8，取值支持0、1。<br>当数据类型为bool，取值支持true、false。</td>
+      <td>当输入probsOptional为空指针时，该输入不参与计算，应传入空指针；当输入probsOptional不为空指针时，必须传入该输入。<br>当数据类型为INT8，取值支持0、1。<br>当数据类型为bool，取值支持true、false。</td>
       <td>INT8、BOOL</td>
       <td>ND</td>
       <td>(tokens_num, experts_num)</td>
@@ -230,7 +230,7 @@ aclnnStatus aclnnMoeTokenUnpermuteWithRoutingMap(
       <td>outIndex（aclTensor*）</td>
       <td>输出</td>
       <td>表示输出的索引值，计算公式中的outIndex。</td>
-      <td>当paddedMode为false时，outIndex表示槽位索引，取值范围[0，tokens_num * topK_num - 1]。sortedIndices中的-1仅表示无效输入槽位，不改变outIndex的槽位索引范围。<br>当paddedMode为true时，索引取值范围[0，experts_num* capacity- 1]。</td>
+      <td>该输出仅在paddedMode为true时生效，索引取值范围为[0，experts_num * capacity - 1]。<br>当paddedMode为false时，该输出不生效。</td>
       <td>INT32</td>
       <td>ND</td>
       <td>paddedMode为false：(tokens_num * topK_num)<br>paddedMode为true：(experts_num* capacity)</td>
@@ -240,7 +240,7 @@ aclnnStatus aclnnMoeTokenUnpermuteWithRoutingMap(
       <td>permuteTokenId（aclTensor*）</td>
       <td>输出</td>
       <td>计算公式中的permuteTokenId。</td>
-      <td>索引取值范围[0，tokens_num - 1]。</td>
+      <td>该输出仅在paddedMode为true时生效，索引取值范围为[0，tokens_num - 1]。<br>当paddedMode为false时，该输出不生效。</td>
       <td>INT32</td>
       <td>ND</td>
       <td>paddedMode为false：(tokens_num * topK_num)<br>paddedMode为true：(experts_num* capacity)</td>
@@ -365,6 +365,8 @@ aclnnStatus aclnnMoeTokenUnpermuteWithRoutingMap(
   - aclnnMoeTokenUnpermuteWithRoutingMap默认非确定性实现，支持通过aclrtSetSysParamOpt开启确定性。
 
 - topK_num <= 512。paddedMode为false时，每个token最多预留topK_num个专家槽位，routingMap中每行为1或true的个数小于等于topK_num；sortedIndices中允许使用-1表示无效槽位。
+
+- 当paddedMode为false时，outIndex与permuteTokenId不生效。
 
 - 以下场景后续版本会拦截，如果提示warning，建议整改：
   - paddedMode为true，且topK_num > experts_num。
