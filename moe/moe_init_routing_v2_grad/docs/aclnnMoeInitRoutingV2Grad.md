@@ -134,11 +134,11 @@ aclnnStatus aclnnMoeInitRoutingV2Grad(
       <td>out</td>
       <td>输出</td>
       <td>表示Routing反向输出。</td>
-      <td><ul><li>支持空tensor。</li><li>要求是一个2D的Tensor，shape为[B*S, H]。</li><li>数据类型与输入gradExpandedX一致。</li></ul></td>
+      <td><ul><li>支持空tensor。</li><li>要求是一个2D的Tensor，shape为[B*S, H]。</li><li>数据类型与输入gradExpandedX一致。</li><li>支持非连续Tensor，通过ViewCopy按stride回写。</li></ul></td>
       <td>FLOAT16、BFLOAT16、FLOAT32</td>
       <td>ND</td>
       <td>2</td>
-      <td>×</td>
+      <td>√</td>
     </tr>
     <tr>
       <td>workspaceSize</td>
@@ -280,6 +280,7 @@ aclnnStatus aclnnMoeInitRoutingV2Grad(
 
 - 确定性计算：
   - aclnnMoeInitRoutingV2Grad默认确定性实现。
+- 出参out支持非连续Tensor：内部先计算连续结果，再由ViewCopy按stride逐元素回写，允许转置视图或带空洞的视图，空洞位置的内存不会被改写。
 
 ## 调用示例
 
