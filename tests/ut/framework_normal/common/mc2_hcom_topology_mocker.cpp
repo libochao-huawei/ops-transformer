@@ -51,6 +51,8 @@ void MC2HcomTopologyMocker::Reset()
 // mock mc2/common/inc/mc2_hcom_topo_info.h ----------------------------------------------------------------------------
 constexpr static uint64_t DEFAULT_RANK_NUM = 8;
 constexpr static uint64_t DEFAULT_CCL_BUFFER_SIZE = 6000ULL * 1024ULL * 1024ULL;
+// 混联默认形态下L0实例数：覆盖L0的CLOS实例与die内mesh实例并存，共2个
+constexpr static uint64_t DEFAULT_L0_INST_NUM = 2;
 
 // class MC2HcomTopology
 // public:
@@ -100,14 +102,39 @@ HcclResult MC2HcomTopology::CommGetHcclBufferByGroup([[maybe_unused]] const char
     return HCCL_SUCCESS;
 }
 
-// private:
-MC2HcomTopology& MC2HcomTopology::GetInstance()
+HcclResult MC2HcomTopology::CommGetTopoInfoByGroup([[maybe_unused]] const char* group, Mc2TopoInfo& topoInfo)
 {
-    static MC2HcomTopology instance("");
-    return instance;
+    if (group == nullptr) {
+        return HCCL_E_PARA;
+    }
+    const MC2HcomTopologyMocker& mocker = MC2HcomTopologyMocker::GetInstance();
+    topoInfo = Mc2TopoInfo{};
+    topoInfo.userRankSize =
+        static_cast<uint32_t>(mocker.GetValue("userRankSize", mocker.GetValue("rankNum", DEFAULT_RANK_NUM)));
+    const uint64_t layerNum = mocker.GetValue("layerNum", 1);
+    for (uint64_t i = 0; i < layerNum; i++) {
+        std::string key = "layer" + std::to_string(i);
+        topoInfo.netLayers.push_back(static_cast<uint32_t>(mocker.GetValue(key.c_str(), 0)));
+    }
+    topoInfo.topoLevelNums = static_cast<uint32_t>(mocker.GetValue("topoLevelNums", layerNum));
+    // L0实例结构事实位图(默认模拟单层Mesh+CLOS混联形态：1DMESH+CLOS实例并存且CLOS覆盖L0，die内mesh不覆盖)
+    topoInfo.l0InstTypeSet =
+        static_cast<uint32_t>(mocker.GetValue("l0InstTypeSet", (1ULL << COMM_TOPO_1DMESH) | (1ULL << COMM_TOPO_CLOS)));
+    topoInfo.l0CoverTypeSet = static_cast<uint32_t>(mocker.GetValue("l0CoverTypeSet", 1ULL << COMM_TOPO_CLOS));
+    topoInfo.l0InstNum = static_cast<uint32_t>(mocker.GetValue("l0InstNum", DEFAULT_L0_INST_NUM));
+    topoInfo.l0LinkProtocols = static_cast<uint32_t>(mocker.GetValue("l0LinkProtocols", 0));
+    topoInfo.level0PcieMix = (topoInfo.l0LinkProtocols & (1ULL << COMM_PROTOCOL_PCIE)) != 0;
+    // 组网形态汇总值(仅日志/comm_sets映射用，不参与算法表匹配)
+    topoInfo.level0Topo =
+        static_cast<Mc2Level0Topo>(mocker.GetValue("level0Topo", static_cast<uint64_t>(Mc2Level0Topo::MESH_1D_CLOS)));
+    topoInfo.level0RankSize = static_cast<uint32_t>(mocker.GetValue("level0RankSize", topoInfo.userRankSize));
+    return static_cast<HcclResult>(mocker.GetValue("getTopoInfoRet", HCCL_SUCCESS));
 }
 
-MC2HcomTopology::MC2HcomTopology([[maybe_unused]] const char* libPath) {}
+// private:
+MC2HcomTopology::MC2HcomTopology() {}
+
+MC2HcomTopology::~MC2HcomTopology() {}
 
 HcclResult MC2HcomTopology::CallHcomGetCommHandleByGroup([[maybe_unused]] const char* group,
                                                          [[maybe_unused]] HcclComm* commHandle) const
@@ -125,16 +152,24 @@ HcclResult MC2HcomTopology::CallCommGetCCLBufSizeCfg([[maybe_unused]] HcclComm c
 }
 
 HcclResult MC2HcomTopology::CallHcomGetRankSizeEx([[maybe_unused]] const char* group,
-                                                  [[maybe_unused]] uint32_t* ranksize,
-                                                  [[maybe_unused]] uint32_t flag) const
+                                                  [[maybe_unused]] uint32_t* ranksize) const
 {
     return HCCL_SUCCESS;
 }
 
-HcclResult MC2HcomTopology::CallHcomGetL0TopoTypeEx([[maybe_unused]] const char* group,
-                                                    [[maybe_unused]] CommTopo* topoType,
-                                                    [[maybe_unused]] uint32_t flag) const
+HcclResult MC2HcomTopology::CallCommGetNetLayers([[maybe_unused]] HcclComm comm, uint32_t** netLayer,
+                                                 uint32_t* netLayerNum) const
 {
+    return HCCL_SUCCESS;
+}
+
+HcclResult MC2HcomTopology::CallCommGetInstTopoTypeByNetLayer([[maybe_unused]] HcclComm comm,
+                                                              [[maybe_unused]] uint32_t netLayer,
+                                                              uint32_t* topoType) const
+{
+    if (topoType == nullptr) {
+        return HCCL_E_PARA;
+    }
     return HCCL_SUCCESS;
 }
 

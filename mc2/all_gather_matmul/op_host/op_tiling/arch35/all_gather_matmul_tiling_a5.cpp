@@ -14,6 +14,7 @@
  */
 #include "all_gather_formulaic_tiling_a5.h"
 #include "all_gather_matmul_tiling_a5.h"
+#include "mc2/all_gather_matmul_v2/op_host/op_tiling/arch35/all_gather_comm_algo_table.h"
 #include "mc2_comm_utils.h"
 
 namespace optiling {
@@ -39,10 +40,19 @@ void AllGatherMatmulTilingA5::SetSocParam(Mc2Tiling::AllGatherMatmulTilingData* 
     tilingData->socParam.isND2NZ = 1U;
 }
 
-std::string AllGatherMatmulTilingA5::GetAlgConfig([[maybe_unused]] Mc2Tiling::AllGatherMatmulTilingData* tilingData,
-                                                  [[maybe_unused]] const mc2tiling::TilingArgs& args)
+std::string AllGatherMatmulTilingA5::GetAlgConfig(Mc2Tiling::AllGatherMatmulTilingData* tilingData,
+                                                  const mc2tiling::TilingArgs& args)
 {
-    return "AllGather=level0:fullmesh";
+    // 单轮通信量 = 每轮切分的 tileM × K × dtypeSize（带回绕钳位），
+    // MCSpliteM 各分支结束时 args.mValue 即单轮 tileM，覆盖 formulate/enableSplitK/commTurn 全部路径；
+    // 用于选择器按表项 [minBytes, maxBytes] 区间过滤，算法表为空时回退默认算法 ALLGATHER_DEFAULT_ALGO_NAME
+    // V1 tiling 侧无 comm_engine 概念，arch35 仅存在 AICPU 引擎路径（op_api 固定以 ai_cpu 转发），故固定传 AICPU
+    std::string algConfig =
+        Mc2Tiling::SelectAllGatherAlgoName("AllGatherMatmul", group_, Mc2Comm::ENGINE_AICPU, args.mValue, args.kValue,
+                                           args.inputDtypeSize, tilingData->param.rankDim);
+    OP_LOGD("AllGatherMatmul", "GetAlgConfig selected algConfig=%s, rankDim=%u", algConfig.c_str(),
+            tilingData->param.rankDim);
+    return algConfig;
 }
 
 CutResult AllGatherMatmulTilingA5::GetCutResult(Mc2Tiling::AllGatherMatmulTilingData& tilingData,

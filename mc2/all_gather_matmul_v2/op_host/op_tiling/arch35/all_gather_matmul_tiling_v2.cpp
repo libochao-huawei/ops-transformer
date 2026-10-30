@@ -27,6 +27,7 @@
 
 #include "all_gather_matmul_tiling_v2.h"
 #include "../../../op_kernel/all_gather_matmul_v2_apt_tiling_key.h"
+#include "all_gather_comm_algo_table.h"
 #include "all_gather_fit_balance_tiling.h"
 #include "all_gather_hccl_utils.h"
 #include "graph/utils/type_utils.h"
@@ -386,8 +387,12 @@ ge::graphStatus AllGatherMatmulTilingV2::SetMc2Hcomm(Mc2Tiling::RCSTiling& rcsCf
     }
     OP_LOGD(opName_, "Tiling SetMc2Hcom commMode_: %s", commMode_);
     OP_LOGD(opName_, "Tiling SetMc2Hcom commEngine: %d", commEngine);
+    // 单轮通信量 = 每轮切分的 tileM × K × dtypeSize（对齐 alltoall 口径），算法表为空时回退默认算法
+    std::string algConfig = Mc2Tiling::SelectAllGatherAlgoName(opName_, group_, commEngine, tileMValue_, args_.kValue,
+                                                               args_.inputDtypeSize, args_.rankDim);
+    OP_LOGI(opName_, "[SetMc2Hcomm] selected algConfig=%s, group=%s", algConfig.c_str(), group_);
     Mc2CcTilingConfig mc2CcTilingConfig(
-        group_, static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_ALLGATHER), ALLGATHER_DEFAULT_ALGO_NAME, 0,
+        group_, static_cast<uint32_t>(mc2tiling::AicpuComType::HCCL_CMD_ALLGATHER), algConfig, 0,
         static_cast<uint32_t>(mc2tiling::ConvertGeTypeToHcclType(opName_, args_.geAType)),
         static_cast<uint32_t>(mc2tiling::ConvertGeTypeToHcclType(opName_, args_.geAType)));
     mc2CcTilingConfig.SetCommEngine(commEngine);

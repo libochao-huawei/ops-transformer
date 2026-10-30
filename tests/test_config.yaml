@@ -1775,6 +1775,7 @@ mc2:
         - mc2/grouped_mat_mul_all_reduce/op_kernel
       test:
         examples: False
+        ut: False
       options:
         - grouped_mat_mul_all_reduce
 

@@ -23,6 +23,7 @@
 
 #include "mc2_hcom_topo_info.h"
 #include "mc2_log.h"
+#include "reduce_scatter_comm_algo_table.h"
 #include "op_host/op_tiling/matmul_formulaic_tiling.h"
 #include "graph/utils/type_utils.h"
 #include "register/op_def_registry.h"
@@ -47,7 +48,6 @@ constexpr char ACLNN_CCU_PEER_ONLY_MODE[] = "ccu_peer_only";
 constexpr uint32_t X1SCALE_INDEX = 3;
 constexpr uint32_t X2SCALE_INDEX = 4;
 constexpr uint32_t COMMMODE_INDEX = 10;
-constexpr uint32_t ALG_CONFIG_RANK_SIZE = 16U;
 // 新功能从这里开始
 bool MatmulReduceScatterV2Tiling::IsCapable()
 {
@@ -113,17 +113,14 @@ ge::graphStatus MatmulReduceScatterV2Tiling::SetMc2Hcomm()
 
     int index = 0;
     auto group = context_->GetAttrs()->GetAttrPointer<char>(index++);
+    OP_TILING_CHECK(group == nullptr || std::strlen(group) == 0, OP_LOGE_WITH_INVALID_INPUT(opName_, "group"),
+                    return ge::GRAPH_FAILED);
     uint32_t dataType = static_cast<uint32_t>(mc2tiling::ConvertGeTypeToHcclType(opName_, args_.geAType));
 
     AscendC::Mc2CcTilingConfig mc2CcTilingConfig(group, opType, rsConfig, reduceType, dataType, dataType);
     if (commMode_ == TPL_AICPU_COMM_MODE) {
         mc2CcTilingConfig.SetCommEngine(mc2tiling::A5_AICPU_TS_ENGINE);
         OP_LOGD(opName_, "[SetCommEngine] Set CommEngine to AiCPU for matmul_reduce_scatter_v2_tiling.");
-        // 16p跨机场景，根据通信api benchmark，使用InsReduceScatterParallelMesh1DNHR算法速度更快
-        if (args_.rankDim == ALG_CONFIG_RANK_SIZE) {
-            mc2CcTilingConfig.SetAlgConfig("InsReduceScatterParallelMesh1DNHR");
-            OP_LOGD(opName_, "[SetAlgConfig] Set AlgConfig to InsReduceScatterParallelMesh1DNHR.");
-        }
     } else {
         mc2CcTilingConfig.SetCommEngine(mc2tiling::A5_CCU_ENGINE);
         OP_LOGD(opName_, "[SetCommEngine] Set CommEngine to CCU for matmul_reduce_scatter_v2_tiling.");
@@ -137,6 +134,16 @@ ge::graphStatus MatmulReduceScatterV2Tiling::SetMc2Hcomm()
         // The paired PeerOnly Matmul kernel writes the local contribution directly to output.
         OP_TILING_CHECK(mc2CcTilingConfig.SetSkipLocalRankCopy(1) != 0,
                         OP_LOGE(opName_, "SetSkipLocalRankCopy failed for peer-only MMRS"), return ge::GRAPH_FAILED);
+    } else {
+        // 通信算法统一由算法表管理(组网/卡数/数据量/优先级)：单层Mesh+CLOS混联形态命中具体表项用组网算法，
+        // 16p非混联形态命中benchmark优选表项，其余命中通路对应的fullmesh兜底表项；无匹配回退rsConfig
+        uint8_t commEngine =
+            (commMode_ == TPL_CCU_COMM_MODE) ? mc2tiling::A5_CCU_ENGINE : mc2tiling::A5_AICPU_TS_ENGINE;
+        std::string algoName =
+            SelectReduceScatterAlgoName(opName_, group, commEngine, args_.orgMValue, args_.orgNValue,
+                                        args_.outputDtypeSize, static_cast<uint32_t>(args_.rankDim), rsConfig);
+        OP_LOGI(opName_, "[SetMc2Hcomm] selected algoName=%s, group=%s", algoName.c_str(), group);
+        mc2CcTilingConfig.SetAlgConfig(algoName);
     }
     OP_TILING_CHECK(mc2CcTilingConfig.GetTiling(matmulReduceScatterV2TilingData_->mc2InitTiling) != 0,
                     OP_LOGE(opName_, "mc2CcTilingConfig GetTiling mc2InitTiling failed"), return ge::GRAPH_FAILED);
