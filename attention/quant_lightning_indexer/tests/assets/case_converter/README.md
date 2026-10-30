@@ -70,6 +70,12 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 参数表在 BSND 布局下允许省略 query 或非 PA 的 KV/key 序列长度，按相应 S 轴完整长度生成输入数据，
 输出对应可选 tensor 槽位保持 None；TND prefix 及 PA 的 KV/key 长度必须显式提供。
 
+### 转换前原始表格样例
+
+| testcase_name | batch_size | q_seq | k_seq | q_head_num | k_head_num | head_dim | qk_dtype | weight_dtype | dequant_dtype | actual_seq_dtype | layout_query | layout_key | act_seq_q | act_seq_k | sparse_count | sparse_mode | query_quant_mode | key_quant_mode | block_size | query_datarange | key_datarange | weights_datarange | q_scale_datarange | k_scale_datarange |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qli_paged_example | 1 | 1 | 4096 | 64 | 1 | 128 | float8_e4m3fn | bfloat16 | float32 | int32 | BSND | PA_BSND | [1] | [4096] | 2048 | 3 | 0 | 0 | 128 | [-1, 1] | [-1, 1] | [-1, 1] | [0.01, 1] | [0.01, 1] |
+
 ## 输出与追加合同
 
 - E2E API：`torch_npu.npu_quant_lightning_indexer`，包含 8 个输入 tensor 槽位；可选 tensor 保持 None。

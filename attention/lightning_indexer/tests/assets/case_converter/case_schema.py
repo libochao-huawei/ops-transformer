@@ -414,7 +414,10 @@ def aclnn_case(record):
     for field, added in (("tensor_formats", "ND"), ("tensor_view_offsets", 0)):
         current = literal(record.get(field))
         if current is not None:
-            record[field] = repr(tuple(current) + (added,) * len(output_shapes))
+            record[field] = repr(
+                tuple(current)
+                + tuple(added if shape is not None else None for shape in output_shapes)
+            )
     for target, source, _ in ATTRIBUTES:
         if target != source:
             attributes[target] = attributes.pop(source)
@@ -573,8 +576,8 @@ def output_contract(shapes, types, attributes):
         raise ValueError("query rank does not match its layout")
     count = integer(attributes["sparse_count"], "topk", 1)
     shape = tuple(q[:-2]) + (key[-2], count)
-    values = shape if boolean(attributes["return_value"]) else (0,)
-    value_type = types[0]
+    values = shape if boolean(attributes["return_value"]) else None
+    value_type = types[0] if values is not None else None
     return ((shape, values), ("int32", value_type))
 
 

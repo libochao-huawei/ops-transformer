@@ -442,7 +442,10 @@ def aclnn_case(record):
     for field, added in (("tensor_formats", "ND"), ("tensor_view_offsets", 0)):
         current = literal(record.get(field))
         if current is not None:
-            record[field] = repr(tuple(current) + (added,) * len(output_shapes))
+            record[field] = repr(
+                tuple(current)
+                + tuple(added if shape is not None else None for shape in output_shapes)
+            )
     for target, source, _ in ATTRIBUTES:
         if target != source:
             attributes[target] = attributes.pop(source)
@@ -758,9 +761,9 @@ def output_contract(shapes, types, attributes):
         raise ValueError("query heads must be divisible by positive KV heads")
     lse = (q[0], n2, q[1], q[-2] // n2) if lq == "BSND" else (n2, q[0], q[-2] // n2)
     if not boolean(attributes["return_softmax_lse"]):
-        lse = (0,)
+        lse = None
     output_dtype = types[0]
-    return ((tuple(q), lse), (output_dtype, "float32"))
+    return ((tuple(q), lse), (output_dtype, "float32" if lse is not None else None))
 
 
 def aclnn_inputs(shapes, types, attributes, values):

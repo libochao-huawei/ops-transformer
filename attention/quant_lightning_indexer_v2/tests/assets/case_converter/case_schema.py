@@ -63,15 +63,21 @@ DTYPES = {
     "fp16": "float16",
     "fp32": "float32",
     "float": "float32",
-    "hif8": "uint8",
-    "hifp8": "uint8",
-    "hifloat8": "uint8",
+    "hif8": "hifloat8",
+    "hifp8": "hifloat8",
     "fp8_e4m3fn": "float8_e4m3fn",
-    "fp8_e8m0": "uint8",
-    "float8_e8m0fnu": "uint8",
-    "float4_e2m1fn_x2": "uint8",
-    "fp4_e2m1": "uint8",
-    "hif4": "uint8",
+    "fp8_e8m0": "float8_e8m0",
+    "float8_e8m0fnu": "float8_e8m0",
+    "float4_e2m1fn_x2": "float4_e2m1",
+    "float4_e2m1fn": "float4_e2m1",
+    "fp4_e2m1fn": "float4_e2m1",
+    "fp4_e2m1": "float4_e2m1",
+    "hif4": "hifloat4",
+    "hifp4": "hifloat4",
+    "float4_e1m2fn_x2": "hifloat4",
+    "float4_e1m2fn": "hifloat4",
+    "float4_e1m2": "hifloat4",
+    "fp4_e1m2": "hifloat4",
 }
 
 
@@ -164,6 +170,7 @@ def dtype(value):
         "hifloat8",
         "float8_e8m0",
         "float4_e2m1",
+        "hifloat4",
     }
     if value not in supported:
         raise ValueError(f"unsupported dtype: {value!r}")
@@ -327,6 +334,7 @@ def validate_tensors(record):
             not isinstance(sequence, (tuple, list)) or len(sequence) != INPUT_COUNT
         ):
             raise ValueError(f"{field}: expected {INPUT_COUNT} slots")
+        values[field] = sequence
     return values
 
 
@@ -413,7 +421,7 @@ def aclnn_case(record):
             repr(tuple(current) + tuple(added)) if current is not None else ""
         )
     for field, added in (("tensor_formats", "ND"), ("tensor_view_offsets", 0)):
-        current = literal(record.get(field))
+        current = values[field]
         if current is not None:
             record[field] = repr(tuple(current) + (added,) * len(output_shapes))
     for target, source, _ in ATTRIBUTES:
@@ -444,8 +452,8 @@ def tensor_parameter_case(row):
         "output_idx_offset",
     )
     mode = number(row, "quant_mode", minimum=1)
-    if mode not in (1, 2, 3, 4, 5):
-        raise ValueError("supported QLI V2 quant_mode values are 1..5")
+    if mode not in (1, 2, 3, 4, 5, 6):
+        raise ValueError("supported QLI V2 quant_mode values are 1..6")
     attributes = {
         "layout_q": str(required(row, "q_layout", "layout_q", "layout_query")),
         "layout_k": str(required(row, "k_layout", "layout_k", "layout_key")),
@@ -482,30 +490,42 @@ def tensor_parameter_case(row):
             if sequence is not None:
                 attributes[name + "_values"] = sequence
             value_range = (0, max(sequence or [0]))
-        if mode in (3, 5) and index in (0, 1, 3, 4):
-            type_name, value_range = ("uint8", (0, 255))
-        elif mode == 4 and index in (0, 1):
-            type_name = "uint8"
-        if mode == 5 and index in (0, 1):
+        if mode in (3, 4, 5, 6) and index in (0, 1):
+            type_name = {
+                3: "float8_e4m3fn",
+                4: "hifloat8",
+                5: "float4_e2m1",
+                6: "hifloat4",
+            }[mode]
+        elif mode in (3, 5) and index in (3, 4):
+            type_name = "float8_e8m0"
+        elif mode == 6 and index in (3, 4):
+            if type_name != "float32":
+                raise ValueError("HIF4 scales require float32 encoded scale words")
+        if mode in (5, 6) and index in (0, 1):
             if integer(shape[-1], name + "_shape", 1) % 2:
-                raise ValueError("MXFP4 logical head_dim must be even")
-            shape = tuple(shape[:-1]) + (shape[-1] // 2,)
+                raise ValueError("FP4 logical head_dim must be even")
         tensors.append(slot(shape, type_name, value_range))
     tensors.append(slot((-1,), "int32", (0, 0)))
-    if mode in (3, 5):
+    if mode in (3, 5, 6):
         for data_index, scale_index in ((0, 3), (1, 4)):
             data_shape, scale_shape = (tensors[data_index][0], tensors[scale_index][0])
-            logical_dim = data_shape[-1] * (2 if mode == 5 else 1) if data_shape else 0
+            logical_dim = data_shape[-1] if data_shape else 0
             if (
                 not data_shape
                 or not scale_shape
                 or logical_dim % 64
-                or (scale_shape != data_shape[:-1] + (logical_dim // 64, 2))
+                or (
+                    scale_shape
+                    != data_shape[:-1]
+                    + ((logical_dim // 64,) if mode == 6 else (logical_dim // 64, 2))
+                )
             ):
                 raise ValueError(
-                    "MX scale shape must match Q/K prefix plus (logical head_dim/64, 2)"
+                    "scale shape must match Q/K prefix plus "
+                    "(D/64,) for HIF4 or (D/64, 2) for MX formats"
                 )
-        attributes["qli_input_ranges"] = semantic_ranges
+    attributes["qli_input_ranges"] = semantic_ranges
     result = tensor_fields(tensors)
     result["absolute_precision"] = repr((0.01, 0.01))
     return (result, attributes)
@@ -604,8 +624,8 @@ def parameter_case(row):
         data_range(row, "q_scale_datarange", (0, 1)),
         data_range(row, "k_scale_datarange", (0, 1)),
     )
-    if quant_mode not in (1, 2, 3, 4, 5):
-        raise ValueError("supported QLI V2 quant_mode values are 1..5")
+    if quant_mode not in (1, 2, 3, 4, 5, 6):
+        raise ValueError("supported QLI V2 quant_mode values are 1..6")
     attributes["quant_mode"] = quant_mode
     if quant_mode in (3, 5):
         if quant_mode == 5 and hd % 2:
@@ -614,15 +634,20 @@ def parameter_case(row):
             raise ValueError("MX head_dim must be divisible by 64")
         scale_dim = hd // 64
         qscale, kscale = (qshape[:-1] + (scale_dim, 2), kshape[:-1] + (scale_dim, 2))
-        attributes["qli_input_ranges"] = [qr, kr, wr, qsr, ksr]
-        qtype = dequant = "uint8"
-        qr = kr = qsr = ksr = (0, 255)
-        if quant_mode == 5:
-            qshape, kshape = (qshape[:-1] + (hd // 2,), kshape[:-1] + (hd // 2,))
+        qtype = "float4_e2m1" if quant_mode == 5 else "float8_e4m3fn"
+        dequant = "float8_e8m0"
     elif quant_mode == 4:
-        qtype, qscale, kscale = ("uint8", (1,), (1,))
+        qtype, qscale, kscale = ("hifloat8", (1,), (1,))
+    elif quant_mode == 6:
+        if hd % 64:
+            raise ValueError("HIF4 head_dim must be divisible by 64")
+        qtype = "hifloat4"
+        if dequant != "float32":
+            raise ValueError("HIF4 scales require float32 encoded scale words")
+        qscale, kscale = (qshape[:-1] + (hd // 64,), kshape[:-1] + (hd // 64,))
     elif quant_mode == 2:
         qtype = "int8"
+    attributes["qli_input_ranges"] = [qr, kr, wr, qsr, ksr]
     tensors[:2] = [slot(qshape, qtype, qr), slot(kshape, qtype, kr)]
     tensors += [slot(qscale, dequant, qsr), slot(kscale, dequant, ksr)]
     attributes.update(
@@ -663,6 +688,10 @@ def parameter_case(row):
             "int8": 1,
             "uint8": 1,
             "float8_e4m3fn": 1,
+            "float8_e8m0": 1,
+            "hifloat8": 1,
+            "float4_e2m1": 0.5,
+            "hifloat4": 0.5,
         }
         key_bytes = widths[qtype]
         scale_bytes = widths[dequant]
@@ -706,29 +735,49 @@ def output_contract(shapes, types, attributes):
 def aclnn_inputs(shapes, types, attributes, values):
     types = list(types)
     mode = integer(attributes["quant_mode"], "quant_mode")
-    if mode in (3, 4, 5):
+    packed_indexes = []
+    if mode in (3, 4, 5, 6):
         for index in (0, 1):
-            if types[index] != "uint8":
-                raise ValueError("quantized E2E Q/K descriptors must use byte storage")
-            types[index] = {3: "float8_e4m3fn", 4: "hifloat8", 5: "float4_e2m1"}[mode]
+            target = {
+                3: "float8_e4m3fn",
+                4: "hifloat8",
+                5: "float4_e2m1",
+                6: "hifloat4",
+            }[mode]
+            source = dtype(types[index])
+            if source == "uint8" and mode in (5, 6):
+                packed_indexes.append(index)
+            elif source not in ("uint8", target):
+                raise ValueError(f"quant_mode={mode} Q/K requires {target} or uint8")
+            types[index] = target
     if mode in (3, 5):
         types[3] = types[4] = "float8_e8m0"
-    if mode == 5:
+    if packed_indexes:
         shapes = list(shapes)
-        for index in (0, 1):
+        for index in packed_indexes:
             shapes[index] = tuple(shapes[index][:-1]) + (shapes[index][-1] * 2,)
         shapes = tuple(shapes)
         if values["tensor_storage_shapes"] is not None:
             storage = list(values["tensor_storage_shapes"])
-            for index in (0, 1):
-                storage[index] = tuple(storage[index][:-1]) + (storage[index][-1] * 2,)
+            for index in packed_indexes:
+                if storage[index] is not None:
+                    storage[index] = tuple(storage[index][:-1]) + (
+                        storage[index][-1] * 2,
+                    )
             values["tensor_storage_shapes"] = tuple(storage)
         if values["tensor_view_strides"] is not None:
             strides = list(values["tensor_view_strides"])
-            for index in (0, 1):
+            for index in packed_indexes:
                 if strides[index] is not None:
                     strides[index] = tuple((dim * 2 for dim in strides[index][:-1])) + (
                         strides[index][-1],
                     )
             values["tensor_view_strides"] = tuple(strides)
+        offsets = values.get("tensor_view_offsets")
+        if offsets is not None:
+            offsets = list(offsets)
+            for index in packed_indexes:
+                if offsets[index] is not None:
+                    offsets[index] *= 2
+            values["tensor_view_offsets"] = tuple(offsets)
     return (shapes, tuple(types), values)

@@ -71,10 +71,19 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 参数表在 BSND 布局下允许省略 query 或非 PA 的 KV/key 序列长度，按相应 S 轴完整长度生成输入数据，
 输出对应可选 tensor 槽位保持 None；TND prefix 及 PA 的 KV/key 长度必须显式提供。
 
+### 转换前原始表格样例
+
+| Testcase_Prefix | B | S1 | S2 | N1 | N2 | D | K | layout_query | layout_kv | q_type | kv_type | scale_value | actual_seq_q | actual_seq_kv | block_size | rope_head_dim | sparse_block_size | sparse_mode | attention_mode | use_sinks | return_softmax_lse |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| sfa_decode_example | 1 | 1 | 4096 | 64 | 1 | 512 | 2048 | TND | PA_BSND | bfloat16 | bfloat16 | 0.041666666666666664 | [1] | [4096] | 128 | 64 | 1 | 3 | 2 | False | False |
+
+需要指定数据范围时，可另加 `range_query`、`range_key` 等列，例如单元格填写 `[-1, 1]`。
+
 ## 输出与追加合同
 
 - E2E API：`torch.ops.cann_ops_transformer.sparse_flash_attention`，包含 10 个输入 tensor 槽位；可选 tensor 保持 None。
 - ACLNN API：`aclnnSparseFlashAttentionV2`，在输入后添加真实输出形状和 dtype，并填写 `output_tensor_indexes`。
+- ACLNN 在 `return_softmax_lse=False` 时将两个 softmax 输出槽写为 `None`，不创建空 tensor；开启时保留真实 shape 和 dtype。
 - 输入和输出不得为同一个文件；拒绝同文件的 symlink/hardlink 别名，目标文件不能是 symlink。
 - 追加按目标表头名称对齐，保留旧列和旧行；缺少的新列追加到表头末尾。一个 sheet 不能混放 E2E 和 ACLNN。
 - 写出前检查所有选中 sheet 和目标表；失败不修改目标文件。写入使用同目录临时文件，再原子替换。

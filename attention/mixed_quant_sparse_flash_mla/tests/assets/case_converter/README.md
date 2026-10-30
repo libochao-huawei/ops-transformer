@@ -70,6 +70,12 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 `attributes1`..`attributes9` 合并进 `attributes`；后续列覆盖之前的同名属性。
 输出格式的部分字段只由对应 TTK 模式使用。
 
+### 转换前原始表格样例
+
+| Testcase_Name | B | S1 | S2 | N1 | N2 | D | K | layout_q | layout_kv | q_type | ori_kv_type | cmp_kv_type | quant_mode | rope_head_dim | tile_size | template_run_mode | cmp_ratio | softmax_scale | block_size1 | block_size2 | cu_seqlens_q | seqused_q | seqused_ori_kv | seqused_cmp_kv | ori_mask_mode | cmp_mask_mode | ori_win_left | ori_win_right | use_sinks | return_softmax_lse |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| mqsmla_csa_decode_example | 1 | 1 | 8192 | 64 | 1 | 512 | 512 | TND | PA_BBND | bfloat16 | float8_e4m3fn | float8_e4m3fn | 1 | 64 | 64 | CSA | 4 | 0.04419417 | 128 | 128 | [0, 1] | [1] | [8192] | [2048] | 4 | 3 | 127 | 0 | True | False |
+
 ## 输出与追加合同
 
 - E2E API：`torch.ops.cann_ops_transformer.mixed_quant_sparse_flash_mla`，包含 18 个输入 tensor 槽位；可选 tensor 保持 None。
@@ -86,12 +92,13 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 
 ## 与 TTK 执行的关系
 
+ACLNN 在 `return_softmax_lse=False` 时将可选 LSE 输出槽写为 `None`；开启时保留真实 shape 和 dtype。
+
 转换生成参数描述；实际执行沿用本算子 assets 中的输入、Golden 和 TestSpec。
 参数表输出会包含现有输入适配器需要的属性。执行仍需对应版本 TTK、算子包和设备环境。
 
 metadata 输入使用 `(-1,)` 延迟分配，由现有 `npu_preprocess` 在执行时生成；
 不另建 metadata sheet，不在转换机器上调用 metadata 算子。输入的既有静态 metadata 描述保持。
-关闭 `return_softmax_lse/return_value` 时，ACLNN 对应可选输出为 `(0,)`。
 
 参数表支持 quant_mode 1/2/3。模式 3 按 A2/A3 TurboQuant CSA 约束转换：
 TND/PA_BBND、D=512、N2=1、N1 为 4~128 的 4 倍数；q/ori_kv 使用相同 FP16/BF16，

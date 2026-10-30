@@ -68,6 +68,12 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 参数表在 BSND 布局下允许省略 query 或非 PA 的 KV/key 序列长度，按相应 S 轴完整长度生成输入数据，
 输出对应可选 tensor 槽位保持 None；TND prefix 及 PA 的 KV/key 长度必须显式提供。
 
+### 转换前原始表格样例
+
+| testcase_name | batch_size | q_seq | k_seq | q_head_num | k_head_num | head_dim | qk_dtype | weight_dtype | actual_seq_dtype | layout_query | layout_key | act_seq_q | act_seq_k | sparse_count | sparse_mode | return_value | query_datarange | key_datarange | weights_datarange |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| li_tnd_example | 2 | 1 | 4096 | 64 | 1 | 128 | bfloat16 | bfloat16 | int32 | TND | TND | [1, 2] | [4096, 8192] | 2048 | 3 | False | [-1, 1] | [-1, 1] | [-1, 1] |
+
 ## 输出与追加合同
 
 - E2E API：`torch_npu.npu_lightning_indexer`，包含 6 个输入 tensor 槽位；可选 tensor 保持 None。
@@ -83,6 +89,8 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 - 成功退出码为 0，输入错误、拒绝追加或写入失败为 1。
 
 ## 与 TTK 执行的关系
+
+ACLNN 在 `return_value=False` 时将 values 输出槽写为 `None`；开启时保留真实 shape 和 dtype。
 
 转换生成参数描述；实际执行沿用本算子 assets 中的输入、Golden 和 TestSpec。
 参数表输出会包含现有输入适配器需要的属性。执行仍需对应版本 TTK、算子包和设备环境。

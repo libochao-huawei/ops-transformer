@@ -200,7 +200,7 @@ class QuantLightningIndexerV2InputAdapter:
         dtype_name = str(tensor.dtype)
         if dtype_name in NUMPY_CUSTOM_TORCH_DTYPES:
             return getattr(torch, NUMPY_CUSTOM_TORCH_DTYPES[dtype_name])
-        if "hifloat8" in dtype_name:
+        if any(name in dtype_name for name in ("hifloat8", "hifloat4", "float4_e1m2")):
             return torch.uint8
         return torch.from_numpy(np.asarray(tensor)).dtype
 
@@ -224,6 +224,11 @@ class QuantLightningIndexerV2InputAdapter:
             else:
                 array = array.view(np.uint16 if dtype_name == "bfloat16" else np.uint8)
             return torch.from_numpy(array).view(torch_dtype)
+        if "hifloat4" in dtype_name or "float4_e1m2" in dtype_name:
+            if array.ndim == 0 or array.shape[-1] % 2:
+                raise ValueError("QLI_V2 HIF4 input requires an even last dimension")
+            codes = array.view(np.uint8) & 0x0F
+            return torch.from_numpy(codes[..., ::2] | (codes[..., 1::2] << 4))
         if "hifloat8" in dtype_name:
             array = array.view(np.uint8)
         return torch.from_numpy(array)
@@ -384,6 +389,20 @@ class QuantLightningIndexerV2InputAdapter:
         input_ranges = (
             kwargs.get("qli_input_ranges") or kwargs.get("input_ranges") or ()
         )
+        if quant_mode == QUANT_MODE_HIF4:
+            defaults = ((-1.75, 1.75), (-1.75, 1.75), (-1, 1), (1, 1), (1, 1))
+            resolved_ranges = []
+            for index, default in enumerate(defaults):
+                supplied = input_ranges[index] if index < len(input_ranges) else None
+                resolved_ranges.append(
+                    default
+                    if supplied is None
+                    else tuple(
+                        fallback if value is None else value
+                        for value, fallback in zip(supplied, default)
+                    )
+                )
+            input_ranges = resolved_ranges
         output_range = kwargs.get("output_idx_offset_range")
         output_range = None if output_range is None else repr(list(output_range))
         max_seqlen_q = kwargs.get("max_seqlen_q")
@@ -488,6 +507,51 @@ class QuantLightningIndexerV2InputAdapter:
         return fp4_values[codes.to(torch.long)]
 
     @staticmethod
+    def write_hifp4_storage(dst, src, name):
+        """Write packed pytest HIF4 codes into the CSV's logical E1M2 array."""
+        packed = QuantLightningIndexerV2InputAdapter.to_cpu_tensor(src)
+        if packed is None or packed.dtype != torch.uint8:
+            raise TypeError(f"{name}: HIF4 source must be packed torch.uint8")
+        if not isinstance(dst, np.ndarray) or not any(
+            dtype in str(dst.dtype) for dtype in ("hifloat4", "float4_e1m2")
+        ):
+            raise TypeError(f"{name}: HIF4 destination must be E1M2 NumPy storage")
+        codes = packed.contiguous().numpy()
+        logical = dst.view(np.uint8)
+        if (
+            logical.ndim == 0
+            or codes.ndim == 0
+            or logical.shape[:-1] != codes.shape[:-1]
+            or logical.shape[-1] != 2 * codes.shape[-1]
+        ):
+            raise ValueError(
+                f"{name} shape mismatch: hifloat4={logical.shape} packed={codes.shape}"
+            )
+        logical[..., ::2] = codes & 0x0F
+        logical[..., 1::2] = codes >> 4
+
+    @staticmethod
+    def validate_hif4_inputs(query, key, query_scale, key_scale):
+        head_dims = []
+        for name, tensor in (("query", query), ("key", key)):
+            logical = isinstance(tensor, np.ndarray) and any(
+                dtype in str(tensor.dtype) for dtype in ("hifloat4", "float4_e1m2")
+            )
+            if not logical and str(tensor.dtype) not in ("uint8", "torch.uint8"):
+                raise TypeError(f"{name}: HIF4 requires hifloat4 or packed uint8")
+            head_dim = tensor.shape[-1] * (1 if logical else 2) if tensor.ndim else 0
+            if head_dim <= 0 or head_dim % 64:
+                raise ValueError(
+                    "HIF4 logical head_dim must be a positive multiple of 64"
+                )
+            head_dims.append(head_dim)
+        if head_dims[0] != head_dims[1]:
+            raise ValueError("HIF4 query and key must have the same logical head_dim")
+        for name, scale in (("query_scale", query_scale), ("key_scale", key_scale)):
+            if QuantLightningIndexerV2InputAdapter.tensor_dtype(scale) != torch.float32:
+                raise TypeError(f"{name}: HIF4 requires float32 scale words")
+
+    @staticmethod
     def restore_paged_tensor(tensor, block_table, batch_size, sequence_length):
         """Restore a paged key or scale tensor for the pytest compare model."""
         physical = QuantLightningIndexerV2InputAdapter.to_cpu_tensor(tensor)
@@ -543,6 +607,16 @@ class QuantLightningIndexerV2InputAdapter:
         for source, target in aliases.items():
             if target not in attributes and source in attributes:
                 attributes[target] = attributes[source]
+        if int(attributes.get("quant_mode", 0)) == QUANT_MODE_HIF4:
+            for name, value in (
+                ("layout_query", "BSND"),
+                ("layout_key", "BSND"),
+                ("sparse_mode", 0),
+                ("cmp_ratio", 1),
+                ("return_value", 0),
+                ("max_seqlen_q", -1),
+            ):
+                attributes.setdefault(name, value)
         return attributes
 
     def rebuild_compare_data(self, compare_context):
@@ -822,6 +896,10 @@ class QuantLightningIndexerV2InputAdapter:
     ):
         pytest_golden = self.load_pytest_golden()
         quant_mode = int(kwargs.get("quant_mode") or 1)
+        if quant_mode == QUANT_MODE_HIF4:
+            self.validate_hif4_inputs(
+                query, key, query_dequant_scale, key_dequant_scale
+            )
         params = self.build_case_params(
             query,
             key,
@@ -857,6 +935,14 @@ class QuantLightningIndexerV2InputAdapter:
             ("output_idx_offset", output_idx_offset, "output_idx_offset"),
         ):
             src = data.get(src_name)
+            if (
+                quant_mode == QUANT_MODE_HIF4
+                and name in ("query", "key")
+                and isinstance(dst, np.ndarray)
+                and "float4" in str(dst.dtype)
+            ):
+                self.write_hifp4_storage(dst, src, name)
+                continue
             if (
                 quant_mode == QUANT_MODE_MXFP4
                 and name in ("query", "key")

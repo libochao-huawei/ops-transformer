@@ -411,7 +411,10 @@ def aclnn_case(record):
     for field, added in (("tensor_formats", "ND"), ("tensor_view_offsets", 0)):
         current = literal(record.get(field))
         if current is not None:
-            record[field] = repr(tuple(current) + (added,) * len(output_shapes))
+            record[field] = repr(
+                tuple(current)
+                + tuple(added if shape is not None else None for shape in output_shapes)
+            )
     for target, source, _ in ATTRIBUTES:
         if target != source:
             attributes[target] = attributes.pop(source)
@@ -642,8 +645,9 @@ def output_contract(shapes, types, attributes):
         else (heads, q[0], q[-2] // heads)
     )
     if not boolean(attributes["return_softmax_lse"]):
-        lse = (0,)
-    return ((output, lse, lse), (types[0], "float32", "float32"))
+        lse = None
+    lse_type = "float32" if lse is not None else None
+    return ((output, lse, lse), (types[0], lse_type, lse_type))
 
 
 def aclnn_inputs(shapes, types, attributes, values):

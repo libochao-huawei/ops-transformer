@@ -122,12 +122,25 @@ def max_sequence(prefix, used, fallback):
 
 
 def restore_mx_dtypes(query, key, query_scale, key_scale, quant_mode):
-    """Support older uint8-storage CSVs; native TTK dtypes pass through."""
+    """Adapt device storage to the Torch wrapper without changing encoded bytes."""
     quant_mode = int(quant_mode)
+    if quant_mode in (QUANT_MODE_MXFP4, QUANT_MODE_HIF4):
+        dtype_name = (
+            "float4_e2m1fn_x2" if quant_mode == QUANT_MODE_MXFP4 else "float4_e1m2fn_x2"
+        )
+        fp4_dtype = getattr(torch, dtype_name, None)
+        for name, tensor in (("query", query), ("key", key)):
+            if not torch.is_tensor(tensor) or tensor.dtype == torch.uint8:
+                continue
+            if tensor.dtype != fp4_dtype:
+                raise TypeError(f"QLI_V2 {name} must use {dtype_name} or packed uint8")
+            tensor.data = tensor.data.view(torch.uint8)
+        if quant_mode == QUANT_MODE_HIF4:
+            return
     if quant_mode == QUANT_MODE_MXFP8:
         qk_dtype = getattr(torch, "float8_e4m3fn", None)
     elif quant_mode == QUANT_MODE_MXFP4:
-        qk_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        qk_dtype = torch.uint8
     else:
         return
     scale_dtype = getattr(torch, "float8_e8m0fnu", None)
@@ -329,7 +342,7 @@ def run(
         and int(arguments["head_dim"]) == 64
         and all(
             torch.is_tensor(tensor)
-            and tensor.dtype == torch.float4_e2m1fn_x2
+            and tensor.dtype == torch.uint8
             and tensor.shape[-1] == 64
             for tensor in (query, key)
         )

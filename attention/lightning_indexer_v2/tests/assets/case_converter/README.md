@@ -67,6 +67,12 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 `attributes1`..`attributes9` 合并进 `attributes`；后续列覆盖之前的同名属性。
 输出格式的部分字段只由对应 TTK 模式使用。
 
+### 转换前原始表格样例
+
+| testcase_name | batch_size | q_seq | k_seq | q_head_num | k_head_num | head_dim | qk_dtype | weight_dtype | layout_q | layout_k | cu_seqlens_q | cu_seqlens_k | seqused_q | seqused_k | topk | mask_mode | cmp_ratio | max_seqlen_q | return_value | query_datarange | key_datarange | weights_datarange |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| liv2_tnd_example | 2 | 1 | 4096 | 64 | 1 | 128 | bfloat16 | bfloat16 | TND | TND | [0, 1, 2] | [0, 4096, 8192] | [1, 1] | [4096, 4096] | 2048 | 3 | 1 | 1 | 0 | [-1, 1] | [-1, 1] | [-1, 1] |
+
 ## 输出与追加合同
 
 - E2E API：`torch.ops.cann_ops_transformer.lightning_indexer`，包含 11 个输入 tensor 槽位；可选 tensor 保持 None。

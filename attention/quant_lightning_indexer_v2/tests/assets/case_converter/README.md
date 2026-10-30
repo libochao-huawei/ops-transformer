@@ -58,11 +58,22 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 - `max_seqlen_q` 缺省 -1；BSND 没有 `seqused_q` 时按完整 Q 序列长度处理，可保持 -1。
   `output_idx_offset` 使用两个端点；`return_value` 决定是否需要 values 输出。
 
-- 支持量化模式 1..5：FP8、INT8、MXFP8、HiFloat8、MXFP4。MX 模式的 `head_dim` 必须能被 64 整除。
-  Excel E2E 表用 `uint8` 表示 MX/HiFloat8 字节存储；ACLNN 表恢复逻辑 dtype，MXFP4 恢复逻辑 D。
+- 支持量化模式 1..6：FP8、INT8、MXFP8、HiFloat8、MXFP4、HiFloat4。
+  MX/HiFloat4 模式的 `head_dim` 必须能被 64 整除。参数表转换出的 E2E/ACLNN 表都使用语义 dtype
+  和逻辑 shape，不再将新用例的 MX/HiFloat 类型写成 `uint8`。
 - 也接受独立 tensor 列格式：`q/k/weight/q_descale/k_descale` 的
   `*_shape/*_dtype/*_datarange`，可选序列、block table 和 offset 使用同样的命名。
   `q_shape/k_shape` 填逻辑形状；布局列为 `q_layout/k_layout`，MX scale 形状为输入前缀加 `(D/64, 2)`。
+  HiFloat4 scale 使用输入前缀加 `(D/64,)`，dtype 为 `float32`（编码后的 scale word，不能改成 E8M0）。
+
+| quant_mode | Q/K 表格 dtype | Q/K 最后一维 | scale 表格 dtype |
+| --- | --- | --- | --- |
+| 1 | `float8_e4m3fn` | 逻辑 D | `float16`/`float32`，按接口支持值填写 |
+| 2 | `int8` | 逻辑 D | `float16`/`float32`，按接口支持值填写 |
+| 3 | `float8_e4m3fn` | 逻辑 D | `float8_e8m0` |
+| 4 | `hifloat8` | 逻辑 D | `float16`/`float32`，单元素 scale |
+| 5 | `float4_e2m1` | 逻辑 D，不能填 D/2 | `float8_e8m0` |
+| 6 | `hifloat4`（兼容 `float4_e1m2`） | 逻辑 D，不能填 D/2 | `float32` scale word |
 
 - PA 的 `block_size` 缺省 128，`block_num` 缺省按容量计算，显式不足时拒绝转换。
 - 数据范围列：`query_datarange/key_datarange/weights_datarange`，量化算子另有 `q_scale_datarange/k_scale_datarange`。
@@ -72,6 +83,12 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 `remark/network_name/priority/soc_series/golden_api/device_ids` 及已有 batch 字段按表中值保留。
 `attributes1`..`attributes9` 合并进 `attributes`；后续列覆盖之前的同名属性。
 输出格式的部分字段只由对应 TTK 模式使用。
+
+### 转换前原始表格样例
+
+| testcase_name | batch_size | q_seq | k_seq | q_head_num | k_head_num | head_dim | qk_dtype | weight_dtype | dequant_dtype | quant_mode | layout_q | layout_k | cu_seqlens_q | cu_seqlens_k | seqused_q | seqused_k | topk | mask_mode | cmp_ratio | max_seqlen_q | return_value | query_datarange | key_datarange | weights_datarange | q_scale_datarange | k_scale_datarange |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qliv2_int8_tnd_example | 2 | 1 | 4096 | 64 | 1 | 128 | int8 | bfloat16 | float32 | 2 | TND | TND | [0, 1, 2] | [0, 4096, 8192] | [1, 1] | [4096, 4096] | 2048 | 3 | 1 | 1 | 0 | [-1, 1] | [-1, 1] | [-1, 1] | [0.01, 1] | [0.01, 1] |
 
 ## 输出与追加合同
 

@@ -74,6 +74,12 @@ list、tuple、字典使用 Python 字面量，例如 `[0, 16, 32]`、`(1, 16, 8
 参数表在 BSND 布局下允许省略 query 或非 PA 的 KV/key 序列长度，按相应 S 轴完整长度生成输入数据，
 输出对应可选 tensor 槽位保持 None；TND prefix 及 PA 的 KV/key 长度必须显式提供。
 
+### 转换前原始表格样例
+
+| Testcase_Prefix | B | S1 | S2 | N1 | N2 | D | K | layout_query | layout_kv | q_type | kv_type | scale_value | actual_seq_q | actual_seq_kv | block_size | rope_head_dim | sparse_block_size | sparse_mode | attention_mode | key_quant_mode | value_quant_mode | tile_size | quant_scale_repo_mode |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qsfa_decode_example | 1 | 1 | 4096 | 64 | 1 | 512 | 2048 | TND | PA_BSND | bfloat16 | hifloat8 | 0.041666666666666664 | [1] | [4096] | 128 | 64 | 1 | 3 | 2 | 2 | 2 | 128 | 1 |
+
 ## 输出与追加合同
 
 - E2E API：`qsfa_ttk_ops.kv_quant_sparse_flash_attention_ttk`，包含 9 个输入 tensor 槽位；可选 tensor 保持 None。
