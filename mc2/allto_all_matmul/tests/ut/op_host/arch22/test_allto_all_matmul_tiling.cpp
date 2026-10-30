@@ -1,4 +1,3 @@
-
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -18,6 +17,11 @@
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
+#include <initializer_list>
+#include <string>
+#include <utility>
+#include <gtest/gtest-spi.h>
+#include "experiment/metadef/common/util/error_manager/error_manager.h"
 #include <cstdlib>
 #include "tiling_context_faker.h"
 #include "tiling_case_executor.h"
@@ -25,6 +29,65 @@
 #include "../allto_all_matmul_host_ut_param.h"
 
 namespace AlltoAllMatmulUT {
+
+namespace {
+// ErrorManager state belongs to the executing thread; always drain it on that thread.
+class ScopedMc2TestState {
+public:
+    ScopedMc2TestState()
+    {
+        Reset();
+    }
+    ~ScopedMc2TestState()
+    {
+        Reset();
+    }
+    static void Reset()
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+};
+
+template <typename Reports>
+void CheckFormalReport(const Reports& reports, const std::string& errorId,
+                       std::initializer_list<std::pair<std::string, std::string>> exactFields,
+                       std::initializer_list<std::string> nonEmptyFields = {},
+                       std::initializer_list<std::pair<std::string, std::string>> containsFields = {})
+{
+    ASSERT_EQ(reports.size(), 1U);
+    ASSERT_EQ(reports[0].error_id, errorId);
+    const auto& fields = reports[0].args_map;
+    for (const auto& item : exactFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        ASSERT_EQ(fields.count(key), 1U) << key;
+    }
+    for (const auto& item : containsFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& item : exactFields) {
+        EXPECT_EQ(fields.at(item.first), item.second) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        EXPECT_FALSE(fields.at(key).empty()) << key;
+    }
+    for (const auto& item : containsFields) {
+        EXPECT_NE(fields.at(item.first).find(item.second), std::string::npos) << item.first;
+    }
+}
+
+void FailWithScopedMc2State()
+{
+    ScopedMc2TestState state;
+    Mc2Hcom::MC2HcomTopologyMocker::GetInstance().SetValue("rankNum", 123U);
+    ASSERT_EQ(
+        ErrorManager::GetInstance().ReportErrMessage("EZ0004", {{"op_name", "CleanupProbe"}, {"param_name", "group"}}),
+        0);
+    ASSERT_TRUE(false) << "intentional cleanup probe";
+}
+} // namespace
 
 using namespace std;
 using namespace ge;
@@ -2084,6 +2147,15 @@ static AlltoAllMatmulTestParam testCases[] = {
 // setup & teardown
 class AlltoAllMatmulA3TilingTest : public testing::TestWithParam<AlltoAllMatmulTestParam> {
 protected:
+    void SetUp() override
+    {
+        ScopedMc2TestState::Reset();
+    }
+    void TearDown() override
+    {
+        ScopedMc2TestState::Reset();
+    }
+
     static void SetUpTestCase()
     {
         std::cout << "AlltoAllMatmulA3TilingTest SetUp." << std::endl;
@@ -2101,6 +2173,7 @@ struct AlltoAllMatmulCompileInfo {
 // ut
 static void TestOneParamCase(const AlltoAllMatmulTestParam& param)
 {
+    ScopedMc2TestState state;
     std::cout << "[TEST_CASE] " << param.caseName << std::endl;
     //
     //  Shape  tensor  shape  gert::StorageShape
@@ -2196,8 +2269,27 @@ static std::string GetCsvPath(const char* file)
     return ReplaceFileExtension2Csv(file);
 }
 
-class AlltoAllMatmulArch22CsvTilingTest : public testing::TestWithParam<AlltoAllMatmulTilingUtParam> {
+struct AlltoAllMatmulArch22CsvParam : public AlltoAllMatmulTilingUtParam {
+    std::string expectedErrorId;
+    std::string expectedParamName;
+    explicit AlltoAllMatmulArch22CsvParam(const csv_map& csvMap)
+        : AlltoAllMatmulTilingUtParam(csvMap),
+          expectedErrorId(ReadMap(csvMap, "expectedErrorId")),
+          expectedParamName(ReadMap(csvMap, "expectedParamName"))
+    {}
+};
+
+class AlltoAllMatmulArch22CsvTilingTest : public testing::TestWithParam<AlltoAllMatmulArch22CsvParam> {
 protected:
+    void SetUp() override
+    {
+        ScopedMc2TestState::Reset();
+    }
+    void TearDown() override
+    {
+        ScopedMc2TestState::Reset();
+    }
+
     static void SetUpTestCase()
     {
         std::cout << "AlltoAllMatmulArch22CsvTilingTest SetUp." << std::endl;
@@ -2209,9 +2301,17 @@ protected:
     }
 };
 
+TEST_F(AlltoAllMatmulArch22CsvTilingTest, CleanupSurvivesFatalAssertion)
+{
+    EXPECT_FATAL_FAILURE(FailWithScopedMc2State(), "intentional cleanup probe");
+    EXPECT_EQ(Mc2Hcom::MC2HcomTopologyMocker::GetInstance().GetValue("rankNum", 0U), 0U);
+    EXPECT_TRUE(ErrorManager::GetInstance().GetRawErrorMessages().empty());
+}
+
 TEST_P(AlltoAllMatmulArch22CsvTilingTest, csv_param)
 {
     auto param = GetParam();
+    ScopedMc2TestState state;
     std::cout << "[TEST_CASE] " << param.case_name << std::endl;
 
     std::vector<gert::TilingContextPara::TensorDescription> inputTensorDesc_(
@@ -2241,11 +2341,27 @@ TEST_P(AlltoAllMatmulArch22CsvTilingTest, csv_param)
     Mc2Hcom::MC2HcomTopologyMocker::GetInstance().SetValue("rankNum", static_cast<uint64_t>(param.worldSize));
     ExecuteTestCase(tilingContextPara, param.expectResult, param.expectTilingKey, param.expectTilingData,
                     param.expectWorkspaces, param.mc2TilingDataReservedLen);
+    if (!param.expectedErrorId.empty()) {
+        ASSERT_TRUE(param.expectedErrorId == "EZ0024" || param.expectedErrorId == "EZ0021" ||
+                    param.expectedErrorId == "EZ0010")
+            << param.expectedErrorId;
+        const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+        if (param.expectedErrorId == "EZ0024") {
+            CheckFormalReport(
+                reports, param.expectedErrorId,
+                {{"param_name", param.expectedParamName}, {"incorrect_value", "ai_cpu"}, {"correct_value", "aiv"}},
+                {"op_name"});
+        } else {
+            const char* actualField = param.expectedErrorId == "EZ0021" ? "incorrect_dtypes" : "incorrect_shapes";
+            CheckFormalReport(reports, param.expectedErrorId, {}, {actualField, "reason"},
+                              {{"param_names", "x1"}, {"param_names", "x2"}});
+        }
+    }
     Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
 }
 
 INSTANTIATE_TEST_SUITE_P(AlltoAllMatmulCsvTilingUT, AlltoAllMatmulArch22CsvTilingTest,
-                         testing::ValuesIn(GetCasesFromCsv<AlltoAllMatmulTilingUtParam>(GetCsvPath(__FILE__))),
-                         PrintCaseInfoString<AlltoAllMatmulTilingUtParam>);
+                         testing::ValuesIn(GetCasesFromCsv<AlltoAllMatmulArch22CsvParam>(GetCsvPath(__FILE__))),
+                         PrintCaseInfoString<AlltoAllMatmulArch22CsvParam>);
 
 } // namespace AlltoAllMatmulUT

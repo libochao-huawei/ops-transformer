@@ -116,10 +116,12 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
     const bool* transGmmWeight = attrs->GetAttrPointer<bool>(optiling::NON_QUANT_ATTR_TRANS_GMM_WEIGHT_INDEX);
     const bool* transMmWeight = attrs->GetAttrPointer<bool>(optiling::NON_QUANT_ATTR_TRANS_MM_WEIGHT_INDEX);
     const bool* permuteOutFlag = attrs->GetAttrPointer<bool>(optiling::NON_QUANT_ATTR_PERMUTE_OUT_FLAG_INDEX);
-    OP_TILING_CHECK(group == nullptr || epWorldSize == nullptr || sendCountsVector == nullptr ||
-                        recvCountsVector == nullptr || transGmmWeight == nullptr || transMmWeight == nullptr ||
-                        permuteOutFlag == nullptr,
-                    OP_LOGE(nodeName, "AIV attributes are incomplete."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        group == nullptr || epWorldSize == nullptr || sendCountsVector == nullptr || recvCountsVector == nullptr ||
+            transGmmWeight == nullptr || transMmWeight == nullptr || permuteOutFlag == nullptr,
+        OP_LOGE_WITH_INVALID_INPUT(
+            nodeName, "group/ep_world_size/send_counts/recv_counts/trans_gmm_weight/trans_mm_weight/permute_out_flag"),
+        return ge::GRAPH_FAILED);
 
     fe::PlatFormInfos* platformInfo = context->GetPlatformInfo();
     OP_TILING_CHECK(platformInfo == nullptr, OP_LOGE(nodeName, "AIV platform information is null."),
@@ -129,18 +131,19 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
     const bool is910C = socVersion == "Ascend910_93";
     tilingData->is910C = static_cast<uint32_t>(is910C);
     OP_TILING_CHECK(!IsSupportedAivRankSize(*epWorldSize, is910C),
-                    OP_LOGE(nodeName,
-                            "AIV epWorldSize %lld is unsupported on %s; A2 supports 2/4/8 and A3 supports "
-                            "2/4/8/16/32/64/128.",
-                            static_cast<long long>(*epWorldSize), is910C ? "A3" : "A2"),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        nodeName, "ep_world_size", std::to_string(*epWorldSize),
+                        "AIV mode on " + socVersion + ": A2 supports 2/4/8; A3 supports 2/4/8/16/32/64/128"),
                     return ge::GRAPH_FAILED);
 
     int64_t rankSize = 0;
     OP_TILING_CHECK(!mc2tiling::GetRankSize(nodeName, group, rankSize),
-                    OP_LOGE(nodeName, "Failed to get rank size for group %s.", group), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(nodeName, "Failed to get rank size for group %s.", group),
+                    return ge::GRAPH_FAILED);
     OP_TILING_CHECK(rankSize != *epWorldSize,
-                    OP_LOGE(nodeName, "epWorldSize %lld does not match HCCL rank size %lld.",
-                            static_cast<long long>(*epWorldSize), static_cast<long long>(rankSize)),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        nodeName, "ep_world_size", std::to_string(*epWorldSize),
+                        "must match HCCL rank size " + std::to_string(rankSize) + " for group " + group),
                     return ge::GRAPH_FAILED);
 
     const auto* gmmXShape = context->GetInputShape(optiling::GMM_X_INDEX);
@@ -151,21 +154,36 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
     const auto* gmmYDesc = context->GetOutputDesc(optiling::OUTPUT_GMM_Y_INDEX);
     OP_TILING_CHECK(gmmXShape == nullptr || gmmWeightShape == nullptr || gmmYShape == nullptr || gmmXDesc == nullptr ||
                         gmmWeightDesc == nullptr || gmmYDesc == nullptr,
-                    OP_LOGE(nodeName, "Required GMM tensors are incomplete."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITH_INVALID_INPUT(nodeName, "gmm_x/gmm_weight/gmm_y"), return ge::GRAPH_FAILED);
     const ge::DataType aivDtype = gmmXDesc->GetDataType();
     OP_TILING_CHECK(!IsSupportedAivDType(aivDtype) || gmmWeightDesc->GetDataType() != aivDtype ||
                         gmmYDesc->GetDataType() != aivDtype,
-                    OP_LOGE(nodeName, "AIV mode requires matching FP16 or BF16 GMM tensors."), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_DTYPES_WITH_REASON(nodeName, "gmm_x/gmm_weight/gmm_y",
+                                                           Ops::Base::ToString(aivDtype) + "/" +
+                                                               Ops::Base::ToString(gmmWeightDesc->GetDataType()) + "/" +
+                                                               Ops::Base::ToString(gmmYDesc->GetDataType()),
+                                                           "AIV mode requires matching FP16 or BF16 tensors"),
+                    return ge::GRAPH_FAILED);
     OP_TILING_CHECK(gmmXDesc->GetStorageFormat() != ge::FORMAT_ND ||
                         gmmWeightDesc->GetStorageFormat() != ge::FORMAT_ND ||
                         gmmYDesc->GetStorageFormat() != ge::FORMAT_ND,
-                    OP_LOGE(nodeName, "AIV mode supports ND GMM tensors only."), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_FORMATS_WITH_REASON(nodeName, "gmm_x/gmm_weight/gmm_y",
+                                                            Ops::Base::ToString(gmmXDesc->GetStorageFormat()) + "/" +
+                                                                Ops::Base::ToString(gmmWeightDesc->GetStorageFormat()) +
+                                                                "/" + Ops::Base::ToString(gmmYDesc->GetStorageFormat()),
+                                                            "AIV mode requires ND tensors"),
+                    return ge::GRAPH_FAILED);
 
     const auto& xShape = gmmXShape->GetStorageShape();
     const auto& weightShape = gmmWeightShape->GetStorageShape();
     const auto& yShape = gmmYShape->GetStorageShape();
     OP_TILING_CHECK(xShape.GetDimNum() != 2 || weightShape.GetDimNum() != 3 || yShape.GetDimNum() != 2,
-                    OP_LOGE(nodeName, "AIV GMM expects x/y to be 2D and weight to be 3D."), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_SHAPEDIMS_WITH_REASON(nodeName, "gmm_x/gmm_weight/gmm_y",
+                                                              std::to_string(xShape.GetDimNum()) + "/" +
+                                                                  std::to_string(weightShape.GetDimNum()) + "/" +
+                                                                  std::to_string(yShape.GetDimNum()),
+                                                              "AIV mode requires ranks 2/3/2 respectively"),
+                    return ge::GRAPH_FAILED);
 
     const int64_t inputM = xShape.GetDim(0);
     const int64_t inputK = xShape.GetDim(1);
@@ -175,51 +193,63 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
     const int64_t outputM = yShape.GetDim(0);
     const int64_t outputN = yShape.GetDim(1);
     OP_TILING_CHECK(inputM <= 0 || inputM > AIV_MAX_TOKEN_NUM || outputM <= 0 || outputM > AIV_MAX_TOKEN_NUM,
-                    OP_LOGE(nodeName, "AIV BSK/A must be in [1, %lld], but BSK=%lld and A=%lld.",
-                            static_cast<long long>(AIV_MAX_TOKEN_NUM), static_cast<long long>(inputM),
-                            static_cast<long long>(outputM)),
+                    OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
+                        nodeName, "gmm_x/gmm_y", Ops::Base::ToString(xShape) + "/" + Ops::Base::ToString(yShape),
+                        "first dimensions must be in [1, " + std::to_string(AIV_MAX_TOKEN_NUM) + "]"),
                     return ge::GRAPH_FAILED);
     OP_TILING_CHECK(
         inputK <= 0 || inputK > AIV_MAX_DIMENSION || weightK <= 0 || weightK > AIV_MAX_DIMENSION || weightN <= 0 ||
             weightN > AIV_MAX_DIMENSION || outputN <= 0 || outputN > AIV_MAX_DIMENSION,
-        OP_LOGE(nodeName, "AIV H1/N1 must be in [1, %lld], but H1=%lld/%lld and N1=%lld/%lld.",
-                static_cast<long long>(AIV_MAX_DIMENSION), static_cast<long long>(inputK),
-                static_cast<long long>(weightK), static_cast<long long>(weightN), static_cast<long long>(outputN)),
+        OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
+            nodeName, "gmm_x/gmm_weight/gmm_y",
+            Ops::Base::ToString(xShape) + "/" + Ops::Base::ToString(weightShape) + "/" + Ops::Base::ToString(yShape),
+            "K/N dimensions must be in [1, " + std::to_string(AIV_MAX_DIMENSION) + "]"),
         return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(inputK != weightK || outputN != weightN,
-                    OP_LOGE(nodeName, "AIV GMM K/N dimensions are inconsistent."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        inputK != weightK || outputN != weightN,
+        OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
+            nodeName, "gmm_x/gmm_weight/gmm_y",
+            Ops::Base::ToString(xShape) + "/" + Ops::Base::ToString(weightShape) + "/" + Ops::Base::ToString(yShape),
+            "gmm_x.K must equal gmm_weight.K and gmm_y.N must equal gmm_weight.N after applying trans_gmm_weight"),
+        return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(expertPerRank <= 0 || expertPerRank > static_cast<int64_t>(A2AVGMM_MAX_LOCAL_EXPERT_NUM),
-                    OP_LOGE(nodeName, "AIV local expert count must be in [1, %u], but got %lld.",
-                            A2AVGMM_MAX_LOCAL_EXPERT_NUM, static_cast<long long>(expertPerRank)),
+                    OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(
+                        nodeName, "gmm_weight", Ops::Base::ToString(weightShape),
+                        "local expert dimension must be in [1, " + std::to_string(A2AVGMM_MAX_LOCAL_EXPERT_NUM) + "]"),
                     return ge::GRAPH_FAILED);
     const uint32_t rankSizeU32 = static_cast<uint32_t>(rankSize);
     const uint32_t expertPerRankU32 = static_cast<uint32_t>(expertPerRank);
     uint32_t expectedCountNum = 0U;
-    OP_TILING_CHECK(!AlltoAllvGroupedMatMulAivPlan::IsValidCountShape(rankSizeU32, expertPerRankU32, expectedCountNum),
-                    OP_LOGE(nodeName,
-                            "AIV global expert count rankSize * expertPerRank must be <= %u, "
-                            "but rankSize=%u and expertPerRank=%u.",
-                            A2AVGMM_MAX_COUNT_NUM, rankSizeU32, expertPerRankU32),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        !AlltoAllvGroupedMatMulAivPlan::IsValidCountShape(rankSizeU32, expertPerRankU32, expectedCountNum),
+        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+            nodeName, "ep_world_size/gmm_weight",
+            "rankSize=" + std::to_string(rankSizeU32) + ", local experts=" + std::to_string(expertPerRankU32) +
+                "; their product must be <= " + std::to_string(A2AVGMM_MAX_COUNT_NUM)),
+        return ge::GRAPH_FAILED);
     const uint64_t countNum = sendCountsVector->GetSize();
     OP_TILING_CHECK(
         countNum != recvCountsVector->GetSize() || countNum != expectedCountNum || countNum > A2AVGMM_MAX_COUNT_NUM,
-        OP_LOGE(nodeName,
-                "AIV counts length must equal rankSize * expertPerRank=%u and be <= %u, "
-                "but send=%lu and recv=%lu.",
-                expectedCountNum, A2AVGMM_MAX_COUNT_NUM, countNum, recvCountsVector->GetSize()),
+        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+            nodeName, "send_counts/recv_counts",
+            "lengths=" + std::to_string(countNum) + "/" + std::to_string(recvCountsVector->GetSize()) +
+                "; both must equal rankSize * local experts=" + std::to_string(expectedCountNum)),
         return ge::GRAPH_FAILED);
     const auto* sendCounts = static_cast<const int64_t*>(sendCountsVector->GetData());
     const auto* recvCounts = static_cast<const int64_t*>(recvCountsVector->GetData());
-    OP_TILING_CHECK(sendCounts == nullptr || recvCounts == nullptr, OP_LOGE(nodeName, "AIV counts data is null."),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(sendCounts == nullptr || recvCounts == nullptr,
+                    OP_LOGE_WITH_INVALID_INPUT(nodeName, "send_counts/recv_counts"), return ge::GRAPH_FAILED);
 
     OP_TILING_CHECK(!AlltoAllvGroupedMatMulAivPlan::BuildInclusivePrefixes(
                         sendCounts, recvCounts, rankSizeU32, expertPerRankU32, static_cast<uint32_t>(inputM),
                         static_cast<uint32_t>(outputM), tilingData->sendPrefix, tilingData->recvPrefix),
-                    OP_LOGE(nodeName, "AIV counts must be non-negative int64 values whose sums match BSK/A "
-                                      "and whose inclusive prefixes fit int32."),
+                    OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+                        nodeName, "send_counts/recv_counts",
+                        "send_counts=" + VectorToString(std::vector<int64_t>(sendCounts, sendCounts + countNum)) +
+                            "; recv_counts=" + VectorToString(std::vector<int64_t>(recvCounts, recvCounts + countNum)) +
+                            "; values must be non-negative, prefixes must fit int32, sums must equal gmm_x[0]=" +
+                            std::to_string(inputM) + " and gmm_y[0]=" + std::to_string(outputM)),
                     return ge::GRAPH_FAILED);
 
     uint32_t maxExpertM = 0U;
@@ -237,7 +267,11 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
     const bool hasMmWeight = IsShapePresentAiv(mmWeightShape);
     const bool hasMmY = IsShapePresentAiv(mmYShape);
     OP_TILING_CHECK((hasMmX || hasMmWeight || hasMmY) && !(hasMmX && hasMmWeight && hasMmY),
-                    OP_LOGE(nodeName, "mmX, mmWeight and mmY must be provided together."), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+                        nodeName, "mm_x/mm_weight/mm_y",
+                        "presence=" + std::to_string(hasMmX) + "/" + std::to_string(hasMmWeight) + "/" +
+                            std::to_string(hasMmY) + "; all three must be provided together"),
+                    return ge::GRAPH_FAILED);
 
     uint32_t mmM = 0U;
     uint32_t mmK = 0U;
@@ -246,17 +280,26 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
         const auto* mmXDesc = context->GetOptionalInputDesc(optiling::NON_QUANT_MM_X_INDEX);
         const auto* mmWeightDesc = context->GetOptionalInputDesc(optiling::NON_QUANT_MM_WEIGHT_INDEX);
         const auto* mmYDesc = context->GetOutputDesc(optiling::OUTPUT_MM_Y_INDEX);
-        OP_TILING_CHECK(
-            mmXDesc == nullptr || mmWeightDesc == nullptr || mmYDesc == nullptr || mmXDesc->GetDataType() != aivDtype ||
-                mmWeightDesc->GetDataType() != aivDtype || mmYDesc->GetDataType() != aivDtype ||
-                mmXDesc->GetStorageFormat() != ge::FORMAT_ND || mmWeightDesc->GetStorageFormat() != ge::FORMAT_ND ||
-                mmYDesc->GetStorageFormat() != ge::FORMAT_ND,
-            OP_LOGE(nodeName, "AIV shared MM requires matching FP16/BF16 ND tensors."), return ge::GRAPH_FAILED);
+        OP_TILING_CHECK(mmXDesc == nullptr || mmWeightDesc == nullptr || mmYDesc == nullptr ||
+                            mmXDesc->GetDataType() != aivDtype || mmWeightDesc->GetDataType() != aivDtype ||
+                            mmYDesc->GetDataType() != aivDtype || mmXDesc->GetStorageFormat() != ge::FORMAT_ND ||
+                            mmWeightDesc->GetStorageFormat() != ge::FORMAT_ND ||
+                            mmYDesc->GetStorageFormat() != ge::FORMAT_ND,
+                        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+                            nodeName, "mm_x/mm_weight/mm_y",
+                            "all descriptors must be present, use ND format and match gmm_x dtype=" +
+                                Ops::Base::ToString(aivDtype)),
+                        return ge::GRAPH_FAILED);
         const auto& mx = mmXShape->GetStorageShape();
         const auto& mw = mmWeightShape->GetStorageShape();
         const auto& my = mmYShape->GetStorageShape();
         OP_TILING_CHECK(mx.GetDimNum() != 2 || mw.GetDimNum() != 2 || my.GetDimNum() != 2,
-                        OP_LOGE(nodeName, "AIV shared MM tensors must be 2D."), return ge::GRAPH_FAILED);
+                        OP_LOGE_FOR_INVALID_SHAPEDIMS_WITH_REASON(nodeName, "mm_x/mm_weight/mm_y",
+                                                                  std::to_string(mx.GetDimNum()) + "/" +
+                                                                      std::to_string(mw.GetDimNum()) + "/" +
+                                                                      std::to_string(my.GetDimNum()),
+                                                                  "all shared MM tensors must have rank 2"),
+                        return ge::GRAPH_FAILED);
         const int64_t localMmM = mx.GetDim(0);
         const int64_t localMmK = mx.GetDim(1);
         const int64_t localWeightK = mw.GetDim(*transMmWeight ? 1 : 0);
@@ -265,7 +308,12 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
                             localMmK > AIV_MAX_DIMENSION || localWeightK <= 0 || localWeightK > AIV_MAX_DIMENSION ||
                             localWeightN <= 0 || localWeightN > AIV_MAX_DIMENSION || localMmK != localWeightK ||
                             my.GetDim(0) != localMmM || my.GetDim(1) != localWeightN,
-                        OP_LOGE(nodeName, "AIV shared MM dimensions are inconsistent."), return ge::GRAPH_FAILED);
+                        OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
+                            nodeName, "mm_x/mm_weight/mm_y",
+                            Ops::Base::ToString(mx) + "/" + Ops::Base::ToString(mw) + "/" + Ops::Base::ToString(my),
+                            "M must be in [1, 5000000], K/N in [1, 65535]; K dimensions must match after transpose and "
+                            "output must be [M, N]"),
+                        return ge::GRAPH_FAILED);
         mmM = static_cast<uint32_t>(localMmM);
         mmK = static_cast<uint32_t>(localMmK);
         mmN = static_cast<uint32_t>(localWeightN);
@@ -273,17 +321,23 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
 
     const auto* permuteShape = context->GetOutputShape(optiling::OUTPUT_PERMUTE_OUT_INDEX);
     const bool hasPermute = IsShapePresentAiv(permuteShape);
-    OP_TILING_CHECK(*permuteOutFlag != hasPermute, OP_LOGE(nodeName, "permuteOutFlag must match permuteOut presence."),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        *permuteOutFlag != hasPermute,
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(nodeName, "permute_out_flag", std::to_string(*permuteOutFlag),
+                                              "must match permute_out presence=" + std::to_string(hasPermute)),
+        return ge::GRAPH_FAILED);
     if (hasPermute) {
         const auto* permuteDesc = context->GetOutputDesc(optiling::OUTPUT_PERMUTE_OUT_INDEX);
         const auto& shape = permuteShape->GetStorageShape();
-        OP_TILING_CHECK(
-            permuteDesc == nullptr || permuteDesc->GetDataType() != aivDtype ||
-                permuteDesc->GetStorageFormat() != ge::FORMAT_ND || shape.GetDimNum() != 2 ||
-                shape.GetDim(0) != outputM || shape.GetDim(1) != inputK,
-            OP_LOGE(nodeName, "AIV permuteOut must match the FP16/BF16 input dtype and shape [outputM, K]."),
-            return ge::GRAPH_FAILED);
+        OP_TILING_CHECK(permuteDesc == nullptr || permuteDesc->GetDataType() != aivDtype ||
+                            permuteDesc->GetStorageFormat() != ge::FORMAT_ND || shape.GetDimNum() != 2 ||
+                            shape.GetDim(0) != outputM || shape.GetDim(1) != inputK,
+                        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+                            nodeName, "permute_out",
+                            "descriptor must be present with ND format, dtype=" + Ops::Base::ToString(aivDtype) +
+                                ", shape=[" + std::to_string(outputM) + ", " + std::to_string(inputK) +
+                                "]; actual shape=" + Ops::Base::ToString(shape)),
+                        return ge::GRAPH_FAILED);
     }
 
     auto platform = platform_ascendc::PlatformAscendC(platformInfo);
@@ -365,7 +419,8 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
     const bool windowQuerySucceeded =
         mc2tiling::GetCclBufferSize(group, &actualWindowBytes, nodeName) == ge::GRAPH_SUCCESS;
     if (!windowQuerySucceeded) {
-        OP_LOGE(nodeName, "Failed to query AIV HCCL window size; refusing to launch a mixed-core kernel.");
+        OP_LOGE_WITHOUT_REPORT(nodeName,
+                               "Failed to query AIV HCCL window size; refusing to launch a mixed-core kernel.");
         return ge::GRAPH_FAILED;
     }
     tilingData->actualWindowBytes = actualWindowBytes;
@@ -375,8 +430,11 @@ ge::graphStatus FillAivTiling(gert::TilingContext* context)
     tilingData->controlBytes = window.controlBytes;
     OP_TILING_CHECK(
         actualWindowBytes < window.requiredBytes,
-        OP_LOGE(nodeName, "AIV HCCL window actual=%lu required=%lu payload=%lu count=%lu control=%lu.",
-                actualWindowBytes, window.requiredBytes, window.payloadBytes, window.countBytes, window.controlBytes),
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+            nodeName, "HCCL buffer size", std::to_string(actualWindowBytes),
+            "requires at least " + std::to_string(window.requiredBytes) + " bytes (payload=" +
+                std::to_string(window.payloadBytes) + ", counts=" + std::to_string(window.countBytes) +
+                ", control=" + std::to_string(window.controlBytes) + "); increase the communication buffer"),
         return ge::GRAPH_FAILED);
     OP_LOGD(nodeName, "AIV HCCL window actual=%lu required=%lu payload=%lu payloadPercent=%lu.", actualWindowBytes,
             window.requiredBytes, window.payloadBytes, window.payloadBytes * 100U / actualWindowBytes);
@@ -418,8 +476,8 @@ bool AlltoAllvGmmTilingA3::NeedToCheckCounts() const
 ge::graphStatus AlltoAllvGmmTilingFuncA3::AlltoAllvGmmOpTilingFunc(gert::TilingContext* context)
 {
     AlltoAllvGmmTilingA3 tiling(context);
-    OP_TILING_CHECK(tiling.Init(context) != ge::GRAPH_SUCCESS, OP_LOGE(A_INNER_DEBUG, "GMM tiling init failed."),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(tiling.Init(context) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(A_INNER_DEBUG, "GMM tiling init failed."), return ge::GRAPH_FAILED);
     return tiling.RunFusionKernelTiling(context);
 }
 

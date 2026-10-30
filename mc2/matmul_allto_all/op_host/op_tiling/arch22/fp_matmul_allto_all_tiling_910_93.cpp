@@ -113,18 +113,18 @@ ge::graphStatus FpMatmulAllToAllTilingBaseA3::CheckOpInputInfo()
 {
     OP_TILING_CHECK(
         MatmulAlltoAllTilingUtil::CheckAttrsInfo(context_, opName_, MATMUL_ALLTOALL_INDEX_SCHEMA) != ge::GRAPH_SUCCESS,
-        OP_LOGE(opName_, "Tiling check Attrs failed."), return ge::GRAPH_FAILED);
+        OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check Attrs failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(MatmulAlltoAllTilingUtil::CheckTensorFormat(context_, opName_) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Tiling check format failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check format failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(CheckA3NonQuantTensorDataType(context_, opName_) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Tiling check Dtype failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check Dtype failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(
         MatmulAlltoAllTilingUtil::CheckShapeInfo(context_, opName_, MATMUL_ALLTOALL_INDEX_SCHEMA) != ge::GRAPH_SUCCESS,
-        OP_LOGE(opName_, "Tiling check shape failed."), return ge::GRAPH_FAILED);
+        OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check shape failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(Check2DMatrixMulShapes(context_, opName_) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Tiling check shape failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check shape failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(CheckBsRankSizeRange() != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Tiling check BS*rankSize range failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check BS*rankSize range failed."), return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -173,7 +173,11 @@ ge::graphStatus FpMatmulAllToAllTilingBaseA3::InitTilingContextParameters()
 ge::graphStatus FpMatmulAllToAllTilingBaseA3::DoOpTiling()
 {
     // 输入参数的校验:Attrs,Dtype,Shape等
-    MC2_CHECK_LOG_RET(opName_, CheckOpInputInfo());
+    const ge::graphStatus inputCheckStatus = CheckOpInputInfo();
+    OP_TILING_CHECK(
+        inputCheckStatus != ge::GRAPH_SUCCESS,
+        OP_LOGE_WITHOUT_REPORT(opName_, "input validation failed, status=%d", static_cast<int>(inputCheckStatus)),
+        return ge::FAILED);
     // 参数校验通过后赋值给全局上下文变量
     MC2_CHECK_LOG_RET(opName_, InitTilingContextParameters());
     // 进行通算切分
@@ -217,15 +221,15 @@ ge::graphStatus FpMatmulAllToAllTilingBaseA3::SetHcclTiling()
                             static_cast<int32_t>(contextInfo.args_.geCType)),
                     return ge::GRAPH_FAILED;);
     auto group = context_->GetAttrs()->GetAttrPointer<char>(ATTR_GROUP_INDEX);
-    OP_TILING_CHECK(group == nullptr, OP_LOGE(context_->GetNodeName(), "GetAttrPointer for ATTR_GROUP_INDEX failed"),
+    OP_TILING_CHECK(group == nullptr, OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "group"),
                     return ge::GRAPH_FAILED);
     auto commMode = context_->GetAttrs()->GetAttrPointer<char>(ATTR_COMM_MODE_INDEX);
-    OP_TILING_CHECK(commMode == nullptr,
-                    OP_LOGE(context_->GetNodeName(), "GetAttrPointer for ATTR_COMM_MODE_INDEX failed"),
+    OP_TILING_CHECK(commMode == nullptr, OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "comm_mode"),
                     return ge::GRAPH_FAILED);
     const size_t maxLength = 7UL;
     OP_TILING_CHECK((strncmp(commMode, "ai_cpu", maxLength) != 0),
-                    OP_LOGE(context_->GetNodeName(), "comm_mode only support 'ai_cpu'."), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_VALUE(context_->GetNodeName(), "comm_mode", commMode, "ai_cpu"),
+                    return ge::GRAPH_FAILED);
     uint32_t optype = HcclCMDType::HCCL_CMD_ALLTOALL;
     std::string algConfig = "AlltoAll=level0:fullmesh;level1:pairwise";
     OP_LOGD(context_->GetNodeName(), "AllToAllFpMatmulTilingBaseA3, SetHcclTiling algConfig is: %s", algConfig.c_str());

@@ -507,11 +507,11 @@ static ge::graphStatus MatmulReduceScatterV2CheckAttrAndSetTiling(gert::TilingCo
     return ge::GRAPH_SUCCESS;
 }
 
-static ge::graphStatus MatmulReduceScatterV2CheckShapeAndSetTiling(const gert::TilingContext* context,
-                                                                   MatmulReduceScatterV2AivModeInfo& info)
+static void MatmulReduceScatterV2FillShapeTiling(const gert::TilingContext* context,
+                                                 MatmulReduceScatterV2AivModeInfo& info)
 {
     const char* nodeName = context->GetNodeName();
-    OP_LOGI("MatmulReduceScatterV2AivMode MatmulReduceScatterV2CheckShapeAndSetTiling.");
+    OP_LOGI("MatmulReduceScatterV2AivMode MatmulReduceScatterV2FillShapeTiling.");
 
     const gert::StorageShape* aStorageShape = context->GetInputShape(A_INDEX);
     const gert::StorageShape* bStorageShape = context->GetInputShape(B_INDEX);
@@ -531,8 +531,6 @@ static ge::graphStatus MatmulReduceScatterV2CheckShapeAndSetTiling(const gert::T
     OP_LOGD(K_INNER_DEBUG, "M=%d", info.M);
     OP_LOGD(K_INNER_DEBUG, "K=%d", info.K);
     OP_LOGD(K_INNER_DEBUG, "N=%d", info.N);
-
-    return ge::GRAPH_SUCCESS;
 }
 
 static inline bool IsArrayEqual(std::vector<uint32_t>& arr1, const std::vector<uint32_t>& arr2, uint32_t size)
@@ -599,8 +597,8 @@ static ge::graphStatus MatmulReduceScatterV2CheckDtypeAndSetTiling(const gert::T
     }
 }
 
-static ge::graphStatus MatmulReduceScatterV2GetPlatformInfoAndSetTiling(const gert::TilingContext* context,
-                                                                        MatmulReduceScatterV2AivModeInfo& info)
+static void MatmulReduceScatterV2FillPlatformInfo(const gert::TilingContext* context,
+                                                  MatmulReduceScatterV2AivModeInfo& info)
 {
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
@@ -611,8 +609,6 @@ static ge::graphStatus MatmulReduceScatterV2GetPlatformInfoAndSetTiling(const ge
 
     OP_LOGD(K_INNER_DEBUG, "aivNum=%d", info.aivNum);
     OP_LOGD(K_INNER_DEBUG, "ubSize=%d", info.totalUbSize);
-
-    return ge::GRAPH_SUCCESS;
 }
 
 const std::map<ge::DataType, int64_t> D_TYPE_SIZE_MAP = {
@@ -967,11 +963,19 @@ inline ge::graphStatus checkAndResetTilingData_SmallM(CoCTiling& cocTilingData, 
     auto cType = context->GetOutputDesc(0)->GetDataType();
     uint32_t elementSize = D_TYPE_SIZE_MAP.at(cType);
 
-    OP_TILING_CHECK((static_cast<uint64_t>(info.M) * info.N / rankSize * elementSize) >= (180 * 1024 * 1024),
-                    OP_LOGE(context->GetNodeName(),
-                            "The space required for the output result is larger than the peermem space, and "
-                            "a single copy is not possible."),
-                    return ge::GRAPH_FAILED);
+    const uint64_t outputBytesPerRank = static_cast<uint64_t>(info.M) * info.N / rankSize * elementSize;
+    constexpr uint64_t maxSingleCopyBytes = 180ULL * 1024 * 1024;
+    OP_TILING_CHECK(
+        outputBytesPerRank >= maxSingleCopyBytes,
+        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(
+            context->GetNodeName(), "y",
+            ("M=" + std::to_string(info.M) + ",N=" + std::to_string(info.N) + ",rankSize=" + std::to_string(rankSize))
+                .c_str(),
+            ("per-rank output requires " + std::to_string(outputBytesPerRank) +
+             " bytes; AIV small-M single-copy mode requires less than " + std::to_string(maxSingleCopyBytes) +
+             " bytes; reduce the output shape")
+                .c_str()),
+        return ge::GRAPH_FAILED);
 
     if (cocTilingData.swizzlDirect == 1 && m_loop > count_m_tile) {
         cocTilingData.pValue = CeilDev(m_loop * cocTilingData.swizzlCount, coreNum);
@@ -1061,6 +1065,7 @@ static bool CheckDtype_X2(const gert::TilingContext* context, MatmulReduceScatte
 {
     ge::DataType x2ScaleType = ge::DT_UNDEFINED;
     if (!GetScaleDType(context, X2_SCALE_INDEX, x2ScaleType)) {
+        OP_LOGE_WITH_INVALID_INPUT(context->GetNodeName(), "x2_scale");
         return false;
     }
     info.isX2ScaleTypeInt64 = false;
@@ -1073,6 +1078,9 @@ static bool CheckDtype_X2(const gert::TilingContext* context, MatmulReduceScatte
         info.isX2ScaleTypeInt64 = true;
         return true;
     }
+    OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(
+        context->GetNodeName(), "x2_scale", Ops::Base::ToString(x2ScaleType),
+        "FLOAT32 is supported; INT64 additionally requires FLOAT16 y, but y dtype is " + Ops::Base::ToString(cType));
     return false;
 }
 
@@ -1119,18 +1127,16 @@ ge::graphStatus MatmulReduceScatterTilingV2AivModeFunc(gert::TilingContext* cont
     OP_TILING_CHECK(tilingData == nullptr, OP_LOGE_WITH_INVALID_INPUT(context->GetNodeName(), "tilingData"),
                     return ge::GRAPH_FAILED);
     MatmulReduceScatterV2AivModeInfo& info = tilingData->matmulReduceScatterV2AivModeInfo;
-    OP_TILING_CHECK(MatmulReduceScatterV2CheckAttrAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(context->GetNodeName(), "MatmulReduceScatterV2 aivMode CheckAttrAndSetTiling Failed"),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(MatmulReduceScatterV2CheckShapeAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(context->GetNodeName(), "MatmulReduceScatterV2 aivMode CheckShapeAndSetTiling Failed"),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(MatmulReduceScatterV2CheckDtypeAndSetTiling(context) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(context->GetNodeName(), "MatmulReduceScatterV2 aivMode CheckDtypeAndSetTiling Failed"),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(MatmulReduceScatterV2GetPlatformInfoAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(context->GetNodeName(), "MatmulReduceScatterV2 aivMode GetPlatformInfoAndSetTiling Failed"),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        MatmulReduceScatterV2CheckAttrAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
+        OP_LOGE_WITHOUT_REPORT(context->GetNodeName(), "MatmulReduceScatterV2 aivMode CheckAttrAndSetTiling Failed"),
+        return ge::GRAPH_FAILED);
+    MatmulReduceScatterV2FillShapeTiling(context, info);
+    OP_TILING_CHECK(
+        MatmulReduceScatterV2CheckDtypeAndSetTiling(context) != ge::GRAPH_SUCCESS,
+        OP_LOGE_WITHOUT_REPORT(context->GetNodeName(), "MatmulReduceScatterV2 aivMode CheckDtypeAndSetTiling Failed"),
+        return ge::GRAPH_FAILED);
+    MatmulReduceScatterV2FillPlatformInfo(context, info);
     auto attrs = context->GetAttrs();
     auto group = attrs->GetAttrPointer<char>(static_cast<int>(ATTR_GROUP_INDEX));
     const char* opName = context->GetNodeName();
@@ -1139,8 +1145,11 @@ ge::graphStatus MatmulReduceScatterTilingV2AivModeFunc(gert::TilingContext* cont
     auto cclRet = mc2tiling::GetCclBufferSize(group, &hcclBuffSize, opName);
     if (cclRet == ge::GRAPH_SUCCESS) {
         OP_TILING_CHECK(hcclBuffSize < CCL_BUFFER_MIN_BYTES,
-                        OP_LOGE(opName, "HCCL_BUFFSIZE (%lu Bytes) too small, min required %lu Bytes (%dMB)",
-                                hcclBuffSize, CCL_BUFFER_MIN_BYTES, CCL_BUFFER_MIN_BYTES / MB_BYTES),
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                            opName, "HCCL_BUFFSIZE", std::to_string(hcclBuffSize).c_str(),
+                            ("CCL buffer bytes must be at least " + std::to_string(CCL_BUFFER_MIN_BYTES) +
+                             "; increase HCCL_BUFFSIZE before creating the communication group")
+                                .c_str()),
                         return ge::GRAPH_FAILED);
     } else {
         OP_LOGW(opName, "Can't get HCCL_BUFFSIZE, skip CCL buffer size validation.");
@@ -1190,9 +1199,10 @@ ge::graphStatus MatmulReduceScatterTilingV2AivModeFunc(gert::TilingContext* cont
     OP_TILING_CHECK(workSpaces == nullptr, OP_LOGE_WITH_INVALID_INPUT(context->GetNodeName(), "workSpaces"),
                     return ge::GRAPH_FAILED);
     if (info.quantFlag) {
-        OP_TILING_CHECK(!CheckDtype_X2(context, info, cType),
-                        OP_LOGE(context->GetNodeName(), "MatmulReduceScatterV2 aivMode Invalid x2Scale."),
-                        return ge::GRAPH_FAILED);
+        OP_TILING_CHECK(
+            !CheckDtype_X2(context, info, cType),
+            OP_LOGE_WITHOUT_REPORT(context->GetNodeName(), "MatmulReduceScatterV2 aivMode Invalid x2Scale."),
+            return ge::GRAPH_FAILED);
         info.dequant_type = DequantType::PER_CHANNEL;
         if (CheckDtype_X1(context)) {
             info.dequant_type = DequantType::PER_TOKEN;
@@ -1203,7 +1213,8 @@ ge::graphStatus MatmulReduceScatterTilingV2AivModeFunc(gert::TilingContext* cont
         SetTilingData_SmallM(tilingData->cocTiling, info, rankSize);
         OP_TILING_CHECK(
             checkAndResetTilingData_SmallM(tilingData->cocTiling, info, context, rankSize) != ge::GRAPH_SUCCESS,
-            OP_LOGE(context->GetNodeName(), "MatmulReduceScatterV2 aivMode checkAndResetTilingData_SmallM Failed"),
+            OP_LOGE_WITHOUT_REPORT(context->GetNodeName(),
+                                   "MatmulReduceScatterV2 aivMode checkAndResetTilingData_SmallM Failed"),
             return ge::GRAPH_FAILED);
     } else {
         SetTilingData(tilingData->cocTiling, info, rankSize);

@@ -11,13 +11,69 @@
 #include <string>
 #include <vector>
 #include <gtest/gtest.h>
+#include <initializer_list>
+#include <utility>
+#include "experiment/metadef/common/util/error_manager/error_manager.h"
 #include "../matmul_reduce_scatter_v2_host_ut_param.h"
 #include "mc2_tiling_case_executor.h"
 
 namespace matmul_reduce_scatter_v2_ut {
 
-class MatmulReduceScatterV2Arch22TilingTest : public testing::TestWithParam<MatmulReduceScatterV2TilingUtParam> {
+namespace {
+template <typename Reports>
+void CheckFormalReport(const Reports& reports, const std::string& errorId,
+                       std::initializer_list<std::pair<std::string, std::string>> exactFields,
+                       std::initializer_list<std::string> nonEmptyFields = {},
+                       std::initializer_list<std::pair<std::string, std::string>> containsFields = {})
+{
+    ASSERT_EQ(reports.size(), 1U);
+    ASSERT_EQ(reports[0].error_id, errorId);
+    const auto& fields = reports[0].args_map;
+    for (const auto& item : exactFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        ASSERT_EQ(fields.count(key), 1U) << key;
+    }
+    for (const auto& item : containsFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& item : exactFields) {
+        EXPECT_EQ(fields.at(item.first), item.second) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        EXPECT_FALSE(fields.at(key).empty()) << key;
+    }
+    for (const auto& item : containsFields) {
+        EXPECT_NE(fields.at(item.first).find(item.second), std::string::npos) << item.first;
+    }
+}
+
+} // namespace
+
+struct MatmulReduceScatterV2Arch22Param : public MatmulReduceScatterV2TilingUtParam {
+    std::string expectedErrorId;
+    std::string expectedParamName;
+    explicit MatmulReduceScatterV2Arch22Param(const csv_map& csvMap)
+        : MatmulReduceScatterV2TilingUtParam(csvMap),
+          expectedErrorId(ReadMap(csvMap, "expectedErrorId")),
+          expectedParamName(ReadMap(csvMap, "expectedParamName"))
+    {}
+};
+
+class MatmulReduceScatterV2Arch22TilingTest : public testing::TestWithParam<MatmulReduceScatterV2Arch22Param> {
 protected:
+    void SetUp() override
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+    void TearDown() override
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+
     static void SetUpTestCase()
     {
         std::cout << "MatmulReduceScatterV2 Arch22TilingTest SetUp" << std::endl;
@@ -63,11 +119,21 @@ TEST_P(MatmulReduceScatterV2Arch22TilingTest, param)
     Mc2Hcom::MockValues hcomTopologyMockValues{{"rankNum", param.rank_size}};
     Mc2ExecuteTestCase(tilingContextPara, hcomTopologyMockValues, param.expectResult, param.expectTilingKey,
                        param.expectTilingDataHash, {}, MC2_TILING_DATA_RESERVED_LEN, true);
+    if (!param.expectedErrorId.empty()) {
+        ASSERT_TRUE(param.expectedErrorId == "EZ0004" || param.expectedErrorId == "EZ0020") << param.expectedErrorId;
+        const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+        if (param.expectedErrorId == "EZ0020") {
+            CheckFormalReport(reports, param.expectedErrorId, {{"param_name", param.expectedParamName}},
+                              {"incorrect_dtype"}, {{"reason", "FLOAT16"}});
+        } else {
+            CheckFormalReport(reports, param.expectedErrorId, {{"param_name", param.expectedParamName}});
+        }
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(
     MatmulReduceScatterV2, MatmulReduceScatterV2Arch22TilingTest,
-    testing::ValuesIn(GetCasesFromCsv<MatmulReduceScatterV2TilingUtParam>(ReplaceFileExtension2Csv(__FILE__))),
-    GetCaseInfoString<MatmulReduceScatterV2TilingUtParam>);
+    testing::ValuesIn(GetCasesFromCsv<MatmulReduceScatterV2Arch22Param>(ReplaceFileExtension2Csv(__FILE__))),
+    GetCaseInfoString<MatmulReduceScatterV2Arch22Param>);
 
 } // namespace matmul_reduce_scatter_v2_ut

@@ -275,9 +275,10 @@ static ge::graphStatus AllGatherMatmulAIVModeCheckAttrAndSetTiling(const gert::T
     auto groupPtr = attrs->GetAttrPointer<char>(static_cast<int>(ATTR_GROUP_INDEX));
     auto isTransposeX1 = attrs->GetAttrPointer<bool>(ATTR_IS_TRANS_X1);
     auto isTransposeX2 = attrs->GetAttrPointer<bool>(ATTR_IS_TRANS_X2);
-    OP_CHECK_NULL_WITH_CONTEXT(context, groupPtr);
+    OP_TILING_CHECK(groupPtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(context->GetNodeName(), "group"),
+                    return ge::GRAPH_FAILED);
     if (strlen(groupPtr) == 0) {
-        OP_LOGE(context->GetNodeName(), "The length of group string is 0.");
+        OP_LOGE_FOR_INVALID_VALUE(context->GetNodeName(), "group", "empty string", "non-empty communication group");
         return GRAPH_FAILED;
     }
     OP_CHECK_NULL_WITH_CONTEXT(context, isTransposeX2);
@@ -351,16 +352,13 @@ static ge::graphStatus AllGatherMatmulAIVModeCheckShapeAndSetTiling(const gert::
     return ge::GRAPH_SUCCESS;
 }
 
-static ge::graphStatus AllGatherMatmulAIVModeGetPlatformInfoAndSetTiling(const gert::TilingContext* context,
-                                                                         AllGatherMatmulAIVModeInfo& info)
+static void AllGatherMatmulAIVModeFillPlatformInfo(const gert::TilingContext* context, AllGatherMatmulAIVModeInfo& info)
 {
     const auto platformInfo = mc2tiling::GetAivPlatformInfo(context);
     info.aivNum = platformInfo.aivNum;
     info.totalUbSize = platformInfo.ubSize;
     OP_LOGD(K_INNER_DEBUG, "aivNum=%d", info.aivNum);
     OP_LOGD(K_INNER_DEBUG, "ubSize=%lu", info.totalUbSize);
-
-    return ge::GRAPH_SUCCESS;
 }
 
 static ge::graphStatus PrintfTilingData(AllGatherMatmulAIVModeInfo& info, CoCTiling& coctiling)
@@ -520,15 +518,15 @@ ge::graphStatus AllGatherMatmulTilingAIVModeFunc(gert::TilingContext* context)
     CoCTiling& coctiling = tilingData->cocTiling;
     OP_LOGI(nodeName, "AllGatherMatmulAIVMode get CoCTiling info.");
 
-    OP_TILING_CHECK(AllGatherMatmulAIVModeCheckAttrAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(context->GetNodeName(), "AllGatherMatmulAIVMode CheckShapeAndSetTiling Failed"),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(AllGatherMatmulAIVModeCheckShapeAndSetTiling(context, info, coctiling) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(context->GetNodeName(), "AllGatherMatmulAIVMode CheckAttrAndSetTiling Failed"),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(AllGatherMatmulAIVModeGetPlatformInfoAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(context->GetNodeName(), "AllGatherMatmulAIVMode GetPlatformInfoAndSetTiling Failed"),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        AllGatherMatmulAIVModeCheckAttrAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
+        OP_LOGE_WITHOUT_REPORT(context->GetNodeName(), "AllGatherMatmulAIVMode CheckAttrAndSetTiling Failed"),
+        return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        AllGatherMatmulAIVModeCheckShapeAndSetTiling(context, info, coctiling) != ge::GRAPH_SUCCESS,
+        OP_LOGE_WITHOUT_REPORT(context->GetNodeName(), "AllGatherMatmulAIVMode CheckShapeAndSetTiling Failed"),
+        return ge::GRAPH_FAILED);
+    AllGatherMatmulAIVModeFillPlatformInfo(context, info);
 
     auto attrs = context->GetAttrs();
     auto group = attrs->GetAttrPointer<char>(static_cast<int>(ATTR_GROUP_INDEX));
@@ -541,7 +539,8 @@ ge::graphStatus AllGatherMatmulTilingAIVModeFunc(gert::TilingContext* context)
     coctiling.rankSize = rankSize;
     OP_TILING_CHECK(
         rankSize != 2 && rankSize != 4 && rankSize != 8,
-        OP_LOGE(context->GetNodeName(), "Unsupported rankSize %d. Supported rankSizes are 2, 4 and 8.", rankSize),
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(context->GetNodeName(), "group", std::to_string(rankSize).c_str(),
+                                              "communication group must contain 2, 4 or 8 ranks for AIV mode"),
         return ge::GRAPH_FAILED);
 
     // 2. set numBlocks

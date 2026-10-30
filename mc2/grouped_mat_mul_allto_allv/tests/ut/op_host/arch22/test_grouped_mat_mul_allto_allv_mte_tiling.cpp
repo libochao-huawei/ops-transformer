@@ -10,11 +10,47 @@
 #include <iostream>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <initializer_list>
+#include <string>
+#include <utility>
+#include "experiment/metadef/common/util/error_manager/error_manager.h"
 #include "../../../../op_host/op_tiling/arch22/grouped_mat_mul_allto_allv_mte_tiling.h"
 #include "../../../../op_kernel/arch22/grouped_mat_mul_allto_allv_mte_tiling.h"
 #include "mc2_tiling_case_executor.h"
 
 namespace GroupedMatMulAlltoAllvMteUT {
+
+namespace {
+template <typename Reports>
+void CheckFormalReport(const Reports& reports, const std::string& errorId,
+                       std::initializer_list<std::pair<std::string, std::string>> exactFields,
+                       std::initializer_list<std::string> nonEmptyFields = {},
+                       std::initializer_list<std::pair<std::string, std::string>> containsFields = {})
+{
+    ASSERT_EQ(reports.size(), 1U);
+    ASSERT_EQ(reports[0].error_id, errorId);
+    const auto& fields = reports[0].args_map;
+    for (const auto& item : exactFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        ASSERT_EQ(fields.count(key), 1U) << key;
+    }
+    for (const auto& item : containsFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& item : exactFields) {
+        EXPECT_EQ(fields.at(item.first), item.second) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        EXPECT_FALSE(fields.at(key).empty()) << key;
+    }
+    for (const auto& item : containsFields) {
+        EXPECT_NE(fields.at(item.first).find(item.second), std::string::npos) << item.first;
+    }
+}
+
+} // namespace
 
 constexpr uint64_t DEFAULT_CCL_BUFFER_SIZE = 6000ULL * 1024ULL * 1024ULL;
 constexpr uint64_t SAMPLE_OUTPUT_SIZE = 4096ULL * 4096ULL * sizeof(uint16_t);
@@ -33,6 +69,7 @@ struct TestParam {
     uint32_t expectedChunkRows{0U};
     ge::DataType dtype{ge::DT_BF16};
     std::string commMode{"aiv"};
+    std::string expectedParamName{};
 };
 
 struct TilingParams {
@@ -106,6 +143,17 @@ std::unordered_map<string, std::function<void(TilingParams& tilingParams, const 
 
 class GroupedMatMulAlltoAllvMteArch22TilingTest : public testing::TestWithParam<TestParam> {
 protected:
+    void SetUp() override
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+    void TearDown() override
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+
     static void SetUpTestCase()
     {
         std::cout << "GroupedMatMulAlltoAllvMteArch22TilingTest SetUp" << std::endl;
@@ -189,6 +237,11 @@ TEST_P(GroupedMatMulAlltoAllvMteArch22TilingTest, ShapeSize)
         Mc2Hcom::MockValues hcomTopologyMockValues{{"rankNum", testParam.communicatorRankSize},
                                                    {"cclBufferSize", testParam.cclBufferSize}};
         Mc2ExecuteTestCase(tilingContextPara, hcomTopologyMockValues);
+        if (!testParam.expectedParamName.empty()) {
+            const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+            CheckFormalReport(reports, "EZ0026", {{"param_name", testParam.expectedParamName}},
+                              {"incorrect_value", "reason"});
+        }
     } else {
         Mc2Hcom::MockValues hcomTopologyMockValues{{"rankNum", tilingParams.epWorldSize},
                                                    {"cclBufferSize", testParam.cclBufferSize}};
@@ -373,8 +426,30 @@ static TestParam g_testParams[] = {
      ge::DT_FLOAT},
     {"Test_sample", {}, {}, {}, ge::GRAPH_SUCCESS},
     {"Test_ccl_buffer_exact", {}, {}, {}, ge::GRAPH_SUCCESS, SAMPLE_REQUIRED_CCL_BUFFER_SIZE},
-    {"Test_ccl_buffer_too_small", {}, {}, {}, ge::GRAPH_FAILED, SAMPLE_REQUIRED_CCL_BUFFER_SIZE - 1ULL},
-    {"Test_ccl_buffer_unaligned", {}, {}, {}, ge::GRAPH_FAILED, SAMPLE_REQUIRED_CCL_BUFFER_SIZE + 1ULL},
+    {"Test_ccl_buffer_too_small",
+     {},
+     {},
+     {},
+     ge::GRAPH_FAILED,
+     SAMPLE_REQUIRED_CCL_BUFFER_SIZE - 1ULL,
+     8UL,
+     "Ascend910B",
+     0U,
+     ge::DT_BF16,
+     "aiv",
+     "HCCL buffer size"},
+    {"Test_ccl_buffer_unaligned",
+     {},
+     {},
+     {},
+     ge::GRAPH_FAILED,
+     SAMPLE_REQUIRED_CCL_BUFFER_SIZE + 1ULL,
+     8UL,
+     "Ascend910B",
+     0U,
+     ge::DT_BF16,
+     "aiv",
+     "HCCL buffer size"},
     {"Test_overlap_a3_dense", {}, {}, {}, ge::GRAPH_SUCCESS, DEFAULT_CCL_BUFFER_SIZE, 8UL, "Ascend910_93", 1536U},
     {"Test_overlap_a2_rank16_rejected",
      {{"epWorldSize", "16"}},
@@ -452,7 +527,18 @@ static TestParam g_testParams[] = {
     {"Test_H2", {{"H2", "12889"}, {"mmWeightDim0", "12889"}}, {}, {}, ge::GRAPH_FAILED},
     {"Test_N1", {{"N1", "65536"}}, {}, {}, ge::GRAPH_FAILED},
     {"Test_N2", {{"N2", "65536"}}, {}, {}, ge::GRAPH_FAILED},
-    {"Test_ep_world_size", {{"epWorldSize", "4"}}, {}, {}, ge::GRAPH_FAILED},
+    {"Test_ep_world_size",
+     {{"epWorldSize", "4"}},
+     {},
+     {},
+     ge::GRAPH_FAILED,
+     DEFAULT_CCL_BUFFER_SIZE,
+     8UL,
+     "Ascend910B",
+     0U,
+     ge::DT_BF16,
+     "aiv",
+     "ep_world_size"},
     {"Test_send_counts_size", {{"epWorldSize", "16"}, {"e", "32"}}, {}, {}, ge::GRAPH_FAILED},
     {"Test_H_1", {{"H1", "7168"}, {"gmmWeightDim1", "7169"}}, {}, {}, ge::GRAPH_FAILED},
     {"Test_H_3", {{"H2", "7168"}, {"mmWeightDim0", "7169"}}, {}, {}, ge::GRAPH_FAILED},

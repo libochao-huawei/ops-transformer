@@ -868,7 +868,7 @@ ge::graphStatus AlltoAllMatmulTiling910b::CheckAndSetAttrsInfo(AlltoAllMatmulInf
     OP_TILING_CHECK(commMode == nullptr, OP_LOGE_WITH_INVALID_INPUT(opName_, "comm_mode"), return ge::GRAPH_FAILED);
     const size_t maxLength = 4UL;
     OP_TILING_CHECK((strncmp(commMode, "aiv", maxLength) != 0),
-                    OP_LOGE_WITH_INVALID_ATTR(opName_, "comm_mode", commMode, "aiv"), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_VALUE(opName_, "comm_mode", commMode, "aiv"), return ge::GRAPH_FAILED);
     info.rankSize = mc2tiling::MatmulFormulaicTiling::GetRankSize(group);
     rankSize = info.rankSize;
     OP_TILING_CHECK(
@@ -940,7 +940,7 @@ ge::graphStatus AlltoAllMatmulTiling910b::CheckQuantScaleDataType(const AlltoAll
     // 校验 scale 张量，量化模式
     if ((x1Dtype == ge::DT_FLOAT16 || x1Dtype == ge::DT_BF16) && x2Dtype == ge::DT_INT8) {
         OP_TILING_CHECK(CheckA16ScaleDtype(context_, info, x1Dtype, opName_) != ge::GRAPH_SUCCESS,
-                        OP_LOGE(opName_, "Tiling check scale Dtype failed."), return ge::GRAPH_FAILED);
+                        OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check scale Dtype failed."), return ge::GRAPH_FAILED);
         quantType = TILINGKEY_TPL_A16W8;
     }
 
@@ -967,7 +967,7 @@ ge::graphStatus AlltoAllMatmulTiling910b::CheckQuantScaleDataType(const AlltoAll
     // A16W4检测
     if ((x1Dtype == ge::DT_FLOAT16 || x1Dtype == ge::DT_BF16) && x2Dtype == ge::DT_INT4) {
         OP_TILING_CHECK(CheckA16ScaleDtype(context_, info, x1Dtype, opName_) != ge::GRAPH_SUCCESS,
-                        OP_LOGE(opName_, "Tiling check scale Dtype failed."), return ge::GRAPH_FAILED);
+                        OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check scale Dtype failed."), return ge::GRAPH_FAILED);
         quantType = TILINGKEY_TPL_A16W4;
     }
 
@@ -1224,12 +1224,12 @@ ge::graphStatus AlltoAllMatmulTiling910b::CheckShapeInfo(AlltoAllMatmulInfo& inf
  */
 ge::graphStatus AlltoAllMatmulTiling910b::CheckOpInputInfo(AlltoAllMatmulInfo& info)
 {
-    OP_TILING_CHECK(CheckAndSetAttrsInfo(info) != ge::GRAPH_SUCCESS, OP_LOGE(opName_, "Tiling check Attrs failed."),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(CheckTensorDataType(info) != ge::GRAPH_SUCCESS, OP_LOGE(opName_, "Tiling check Dtype failed."),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(CheckShapeInfo(info) != ge::GRAPH_SUCCESS, OP_LOGE(opName_, "Tiling check shape failed."),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(CheckAndSetAttrsInfo(info) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check Attrs failed."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(CheckTensorDataType(info) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check Dtype failed."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(CheckShapeInfo(info) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check shape failed."), return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -1476,7 +1476,11 @@ ge::graphStatus AlltoAllMatmulTiling910b::DoOpTiling()
     AlltoAllMatmulInfo& info = tilingData->allToAllMatmulInfo;
     OPS_LOG_I(opName_, "AllToAllMatmul get tilingData info.");
 
-    MC2_CHECK_LOG_RET(opName_, CheckOpInputInfo(info));
+    const ge::graphStatus inputCheckStatus = CheckOpInputInfo(info);
+    OP_TILING_CHECK(
+        inputCheckStatus != ge::GRAPH_SUCCESS,
+        OP_LOGE_WITHOUT_REPORT(opName_, "input validation failed, status=%d", static_cast<int>(inputCheckStatus)),
+        return ge::FAILED);
     MC2_CHECK_LOG_RET(opName_, DoMmCommTiling(tilingData->cocTiling, info));
     MC2_CHECK_LOG_RET(opName_, SetHcclTiling(tilingData));
     // 校验HCCL BUFF空间大小

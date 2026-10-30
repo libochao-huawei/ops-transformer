@@ -93,17 +93,19 @@ static ge::graphStatus MoeDistributeDispatchA2CheckCommAlg(const gert::TilingCon
     OP_TILING_CHECK(attrs == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_INNER_DEBUG, "attrs"), return ge::GRAPH_FAILED);
     auto commAlg = attrs->GetAttrPointer<char>(static_cast<int>(ATTR_COMM_ALG_INDEX));
     const bool useDefaultCommAlg = (commAlg == nullptr) || (commAlg[0] == '\0');
-    OP_TILING_CHECK(!useDefaultCommAlg && strcmp(commAlg, "fullmesh") != 0 && strcmp(commAlg, "hierarchy") != 0,
-                    OP_LOGE_WITH_INVALID_ATTR(K_INNER_DEBUG, "comm_alg", commAlg, "\"fullmesh\" or \"hierarchy\""),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        !useDefaultCommAlg && strcmp(commAlg, "fullmesh") != 0 && strcmp(commAlg, "hierarchy") != 0,
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_INNER_DEBUG, "comm_alg", commAlg, "\"fullmesh\" or \"hierarchy\""),
+        return ge::GRAPH_FAILED);
     auto epWorldSizePtr = attrs->GetAttrPointer<int64_t>(ATTR_EP_WORLD_SIZE_INDEX);
     if (useDefaultCommAlg && (epWorldSizePtr != nullptr) && (*epWorldSizePtr <= RANK_NUM_PER_NODE_A2)) {
         OP_LOGD(K_INNER_DEBUG, "epWorldSize <= 8, use default fullmesh algorithm.");
         return ge::GRAPH_SUCCESS;
     }
-    OP_TILING_CHECK(mc2tiling::ParseCommAlgWithEnvFallback(K_INNER_DEBUG, commAlg, isLayered) != ge::GRAPH_SUCCESS,
-                    OP_LOGE_WITH_INVALID_ATTR(K_INNER_DEBUG, "comm_alg", commAlg, "\"fullmesh\" or \"hierarchy\""),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        mc2tiling::ParseCommAlgWithEnvFallback(K_INNER_DEBUG, commAlg, isLayered) != ge::GRAPH_SUCCESS,
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_INNER_DEBUG, "comm_alg", commAlg, "\"fullmesh\" or \"hierarchy\""),
+        return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -357,8 +359,8 @@ static ge::graphStatus MoeDistributeDispatchA2CheckAttrAndSetTiling(const gert::
     OP_TILING_CHECK(tpWorldSizePtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_INNER_DEBUG, "tpWorldSize"),
                     return GRAPH_FAILED);
     OP_TILING_CHECK(*tpWorldSizePtr >= 2,
-                    OP_LOGE_WITH_INVALID_ATTR(K_INNER_DEBUG, "tp_world_size", std::to_string(*tpWorldSizePtr).c_str(),
-                                              "less than 2"),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_INNER_DEBUG, "tp_world_size",
+                                                          std::to_string(*tpWorldSizePtr).c_str(), "less than 2"),
                     return GRAPH_FAILED);
     OP_TILING_CHECK(tpRankIdPtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_INNER_DEBUG, "tpRankId"), return GRAPH_FAILED);
     OP_TILING_CHECK(expertSharedTypePtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_INNER_DEBUG, "expertSharedType"),
@@ -904,8 +906,8 @@ ge::graphStatus MoeDistributeDispatchV2TilingFuncA2A3::CheckQuantModeMatchScales
                                                                                  DispatchV2Config& config)
 {
     OP_TILING_CHECK(quantMode == static_cast<uint32_t>(QuantModeA5::STATIC_QUANT),
-                    OP_LOGE_WITH_INVALID_ATTR(nodeName, "quant_mode", std::to_string(quantMode).c_str(),
-                                              "a supported non-static quantization mode"),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(nodeName, "quant_mode", std::to_string(quantMode).c_str(),
+                                                          "a supported non-static quantization mode"),
                     return ge::GRAPH_FAILED);
     if ((isScales && (quantMode == static_cast<uint32_t>(QuantModeA5::NON_QUANT))) ||
         ((!isScales) && (quantMode == static_cast<uint32_t>(QuantModeA5::STATIC_QUANT)))) {
@@ -923,8 +925,8 @@ ge::graphStatus MoeDistributeDispatchV2TilingFuncA2A3::CheckCommAlgPtr(const cha
 {
     if ((commAlgPtr != nullptr) && (strlen(commAlgPtr) != 0) && (strcmp(commAlgPtr, "fullmesh_v1") != 0) &&
         (strcmp(commAlgPtr, "fullmesh_v2") != 0) && (strcmp(commAlgPtr, "hierarchy") != 0)) {
-        OP_LOGE_WITH_INVALID_ATTR(nodeName, "comm_alg", commAlgPtr,
-                                  "\"hierarchy\", \"fullmesh_v1\" or \"fullmesh_v2\"");
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(nodeName, "comm_alg", commAlgPtr,
+                                              "\"hierarchy\", \"fullmesh_v1\" or \"fullmesh_v2\"");
         return ge::GRAPH_FAILED;
     }
     return ge::GRAPH_SUCCESS;

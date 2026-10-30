@@ -456,15 +456,16 @@ ge::graphStatus MoeDistributeCombineTilingA2A3::MoeDistributeCombineA3TilingFunc
 bool MoeDistributeCombineTilingA2A3::CheckEpWorldSize(const char* nodeName, uint32_t epWorldSize)
 {
     // 检验epWorldSize是否是8的倍数
-    OP_TILING_CHECK(
-        epWorldSize % 8 != 0,
-        OP_LOGE_WITH_INVALID_ATTR(nodeName, "ep_world_size", std::to_string(epWorldSize).c_str(), "divisible by 8"),
-        return false);
-
-    OP_TILING_CHECK((256 % epWorldSize != 0) && (epWorldSize % 144 != 0),
-                    OP_LOGE_WITH_INVALID_ATTR(nodeName, "ep_world_size", std::to_string(epWorldSize).c_str(),
-                                              "one of [8, 16, 32, 64, 128, 144, 256, 288]"),
+    OP_TILING_CHECK(epWorldSize % 8 != 0,
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(nodeName, "ep_world_size",
+                                                          std::to_string(epWorldSize).c_str(), "divisible by 8"),
                     return false);
+
+    OP_TILING_CHECK(
+        (256 % epWorldSize != 0) && (epWorldSize % 144 != 0),
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(nodeName, "ep_world_size", std::to_string(epWorldSize).c_str(),
+                                              "one of [8, 16, 32, 64, 128, 144, 256, 288]"),
+        return false);
 
     return true;
 }

@@ -16,12 +16,49 @@
 
 #include <iostream>
 #include <gtest/gtest.h>
+#include <initializer_list>
+#include <string>
+#include <utility>
+#include "experiment/metadef/common/util/error_manager/error_manager.h"
 
 #include "mc2_tiling_case_executor.h"
 
 using namespace std;
 
 namespace AlltoAllvGroupedMatMulUT {
+
+namespace {
+template <typename Reports>
+void CheckFormalReport(const Reports& reports, const std::string& errorId,
+                       std::initializer_list<std::pair<std::string, std::string>> exactFields,
+                       std::initializer_list<std::string> nonEmptyFields = {},
+                       std::initializer_list<std::pair<std::string, std::string>> containsFields = {})
+{
+    ASSERT_EQ(reports.size(), 1U);
+    ASSERT_EQ(reports[0].error_id, errorId);
+    const auto& fields = reports[0].args_map;
+    for (const auto& item : exactFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        ASSERT_EQ(fields.count(key), 1U) << key;
+    }
+    for (const auto& item : containsFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& item : exactFields) {
+        EXPECT_EQ(fields.at(item.first), item.second) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        EXPECT_FALSE(fields.at(key).empty()) << key;
+    }
+    for (const auto& item : containsFields) {
+        EXPECT_NE(fields.at(item.first).find(item.second), std::string::npos) << item.first;
+    }
+}
+
+} // namespace
+
 struct TestParam {
     string testName{};
     std::vector<std::pair<string, string>> tilingParamsStrPair{};
@@ -176,6 +213,17 @@ std::vector<std::pair<std::string, Ops::Transformer::AnyValue>> CreateAttrs(cons
 
 class AlltoAllvGroupedMatMulArch22TilingTest : public testing::TestWithParam<TestParam> {
 protected:
+    void SetUp() override
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+    void TearDown() override
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+
     static void SetUpTestCase()
     {
         std::cout << "AlltoAllvGroupedMatMulArch22TilingTest SetUp" << std::endl;
@@ -1496,8 +1544,11 @@ TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, A2AivRejectsEp16AndAbove)
     for (const int64_t rankSize : {16, 32, 64, 128}) {
         const std::vector<int64_t> counts = MakeAivCounts(rankSize);
         TilingInfo tilingInfo;
+        ErrorManager::GetInstance().GetRawErrorMessages();
         EXPECT_FALSE(ExecuteAivHostCase(ge::DT_BF16, rankSize, counts, counts, false, false, false, tilingInfo,
                                         "Ascend910B", 24));
+        const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+        CheckFormalReport(reports, "EZ0026", {{"param_name", "ep_world_size"}}, {"incorrect_value", "reason"});
     }
 }
 
@@ -1564,11 +1615,24 @@ TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivSupportsFp16)
     EXPECT_TRUE(ExecuteAivHostCase(ge::DT_FLOAT16, 4, counts, counts, false, false, false, tilingInfo));
 }
 
+TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivRejectsFloatDtypeWithFormalError)
+{
+    const std::vector<int64_t> counts(8, 2);
+    TilingInfo tilingInfo;
+    ErrorManager::GetInstance().GetRawErrorMessages();
+    EXPECT_FALSE(ExecuteAivHostCase(ge::DT_FLOAT, 4, counts, counts, false, false, false, tilingInfo));
+    const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+    CheckFormalReport(reports, "EZ0021", {{"param_names", "gmm_x/gmm_weight/gmm_y"}}, {"incorrect_dtypes", "reason"});
+}
+
 TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivRejectsCountLengthMismatch)
 {
     const std::vector<int64_t> invalidCounts(7, 2);
     TilingInfo tilingInfo;
+    ErrorManager::GetInstance().GetRawErrorMessages();
     EXPECT_FALSE(ExecuteAivHostCase(ge::DT_BF16, 4, invalidCounts, invalidCounts, false, false, false, tilingInfo));
+    const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+    CheckFormalReport(reports, "EZ0037", {{"param_name", "send_counts/recv_counts"}}, {"reason"});
 }
 
 TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivRejectsNegativeCount)
@@ -1578,7 +1642,10 @@ TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivRejectsNegativeCount)
     sendCounts[0] = -1;
     sendCounts[1] = 5;
     TilingInfo tilingInfo;
+    ErrorManager::GetInstance().GetRawErrorMessages();
     EXPECT_FALSE(ExecuteAivHostCase(ge::DT_BF16, 4, sendCounts, recvCounts, false, false, false, tilingInfo));
+    const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+    CheckFormalReport(reports, "EZ0037", {{"param_name", "send_counts/recv_counts"}}, {"reason"});
 }
 
 TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivRejectsCountSumMismatch)
@@ -1587,20 +1654,33 @@ TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivRejectsCountSumMismatch)
     const std::vector<int64_t> recvCounts(8, 2);
     sendCounts[0] = 1;
     TilingInfo tilingInfo;
+    ErrorManager::GetInstance().GetRawErrorMessages();
     EXPECT_FALSE(ExecuteAivHostCase(ge::DT_BF16, 4, sendCounts, recvCounts, false, false, false, tilingInfo));
+    const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+    CheckFormalReport(reports, "EZ0037", {{"param_name", "send_counts/recv_counts"}}, {"reason"});
 }
 
 TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivRejectsDimensionConstraints)
 {
     const std::vector<int64_t> counts(8, 2);
     TilingInfo tilingInfo;
+    const auto checkShapeReport = []() {
+        const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+        CheckFormalReport(reports, "EZ0010", {}, {"incorrect_shapes", "reason"}, {{"param_names", "gmm_x/gmm_"}});
+    };
 
+    ErrorManager::GetInstance().GetRawErrorMessages();
     EXPECT_FALSE(ExecuteAivHostCase(ge::DT_BF16, 4, counts, counts, false, false, false, tilingInfo, "Ascend910_93", 20,
                                     5000001));
+    checkShapeReport();
+    ErrorManager::GetInstance().GetRawErrorMessages();
     EXPECT_FALSE(ExecuteAivHostCase(ge::DT_BF16, 4, counts, counts, false, false, false, tilingInfo, "Ascend910_93", 20,
                                     16, 65536, 128));
+    checkShapeReport();
+    ErrorManager::GetInstance().GetRawErrorMessages();
     EXPECT_FALSE(ExecuteAivHostCase(ge::DT_BF16, 4, counts, counts, false, false, false, tilingInfo, "Ascend910_93", 20,
                                     16, 256, 65536));
+    checkShapeReport();
 }
 
 TEST_F(AlltoAllvGroupedMatMulArch22TilingTest, AivRejectsTooManyLocalExperts)

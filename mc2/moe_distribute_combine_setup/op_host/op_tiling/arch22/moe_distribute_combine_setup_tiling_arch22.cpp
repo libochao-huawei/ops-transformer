@@ -47,12 +47,13 @@ ge::graphStatus MoeDistributeCombineSetupTilingA3::CheckEpWorldSize()
     auto attrs = context_->GetAttrs();
     auto epWorldSizePtr = attrs->GetAttrPointer<int64_t>(ATTR_EP_WORLD_SIZE_INDEX);
 
-    OP_TILING_CHECK(((*epWorldSizePtr < MIN_GROUP_EP_SIZE) || (*epWorldSizePtr > MAX_GROUP_EP_SIZE)),
-                    OP_LOGE_WITH_INVALID_ATTR(nodeName_, "epWorldSize", std::to_string(*epWorldSizePtr).c_str(),
-                                              (std::string("[") + std::to_string(MIN_GROUP_EP_SIZE) + ", " +
-                                               std::to_string(MAX_GROUP_EP_SIZE) + "]")
-                                                  .c_str()),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        ((*epWorldSizePtr < MIN_GROUP_EP_SIZE) || (*epWorldSizePtr > MAX_GROUP_EP_SIZE)),
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+            nodeName_, "epWorldSize", std::to_string(*epWorldSizePtr).c_str(),
+            (std::string("[") + std::to_string(MIN_GROUP_EP_SIZE) + ", " + std::to_string(MAX_GROUP_EP_SIZE) + "]")
+                .c_str()),
+        return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -62,10 +63,11 @@ ge::graphStatus MoeDistributeCombineSetupTilingA3::CheckMoeExpertNum()
     auto attrs = context_->GetAttrs();
     auto moeExpertNumPtr = attrs->GetAttrPointer<int64_t>(ATTR_MOE_EXPERT_NUM_INDEX);
 
-    OP_TILING_CHECK(((*moeExpertNumPtr <= 0) || (*moeExpertNumPtr > MAX_MOE_EXPERT_NUM)),
-                    OP_LOGE_WITH_INVALID_ATTR(nodeName_, "moeExpertNum", std::to_string(*moeExpertNumPtr).c_str(),
+    OP_TILING_CHECK(
+        ((*moeExpertNumPtr <= 0) || (*moeExpertNumPtr > MAX_MOE_EXPERT_NUM)),
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(nodeName_, "moeExpertNum", std::to_string(*moeExpertNumPtr).c_str(),
                                               (std::string("(0, ") + std::to_string(MAX_MOE_EXPERT_NUM) + "]").c_str()),
-                    return ge::GRAPH_FAILED);
+        return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -77,19 +79,19 @@ ge::graphStatus MoeDistributeCombineSetupTilingA3::CheckSharedExpertAttr()
     auto sharedExpertNumPtr = attrs->GetAttrPointer<int64_t>(ATTR_SHARED_EXPERT_NUM_INDEX);
     auto sharedExpertRankNumPtr = attrs->GetAttrPointer<int64_t>(ATTR_SHARED_EXPERT_RANK_NUM_INDEX);
 
-    OP_TILING_CHECK(
-        (*expertShardTypePtr != 0),
-        OP_LOGE_WITH_INVALID_ATTR(nodeName_, "expertShardType", std::to_string(*expertShardTypePtr).c_str(), "0"),
-        return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(
-        ((*sharedExpertNumPtr < 0) || (*sharedExpertNumPtr > MAX_SHARED_EXPERT_NUM)),
-        OP_LOGE_WITH_INVALID_ATTR(nodeName_, "sharedExpertNum", std::to_string(*sharedExpertNumPtr).c_str(),
-                                  (std::string("[0, ") + std::to_string(MAX_SHARED_EXPERT_NUM) + "]").c_str()),
-        return ge::GRAPH_FAILED);
+    OP_TILING_CHECK((*expertShardTypePtr != 0),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(nodeName_, "expertShardType",
+                                                          std::to_string(*expertShardTypePtr).c_str(), "0"),
+                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(((*sharedExpertNumPtr < 0) || (*sharedExpertNumPtr > MAX_SHARED_EXPERT_NUM)),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        nodeName_, "sharedExpertNum", std::to_string(*sharedExpertNumPtr).c_str(),
+                        (std::string("[0, ") + std::to_string(MAX_SHARED_EXPERT_NUM) + "]").c_str()),
+                    return ge::GRAPH_FAILED);
     OP_TILING_CHECK(
         ((*sharedExpertRankNumPtr < 0) ||
          (*sharedExpertRankNumPtr > (tilingData_->moeDistributeCombineSetupInfo.epWorldSize / 2))),
-        OP_LOGE_WITH_INVALID_ATTR(
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
             nodeName_, "sharedExpertRankNum", std::to_string(*sharedExpertRankNumPtr).c_str(),
             (std::string("[0, ") + std::to_string(tilingData_->moeDistributeCombineSetupInfo.epWorldSize / 2) + "]")
                 .c_str()),

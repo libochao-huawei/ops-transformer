@@ -114,18 +114,19 @@ ge::graphStatus AllToAllFpMatmulTilingBaseA3::CheckOpInputInfo()
 {
     OP_TILING_CHECK(
         MatmulAlltoAllTilingUtil::CheckAttrsInfo(context_, opName_, ALLTOALL_MATMUL_INDEX_SCHEMA) != ge::GRAPH_SUCCESS,
-        OP_LOGE(opName_, "Tiling check Attrs failed."), return ge::GRAPH_FAILED);
+        OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check Attrs failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(MatmulAlltoAllTilingUtil::CheckTensorFormat(context_, opName_) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Tiling check format failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check format failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(CheckA3NonQuantTensorDataType(context_, opName_) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Tiling check Dtype failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check Dtype failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(
         MatmulAlltoAllTilingUtil::CheckShapeInfo(context_, opName_, ALLTOALL_MATMUL_INDEX_SCHEMA) != ge::GRAPH_SUCCESS,
-        OP_LOGE(opName_, "Tiling check shape failed."), return ge::GRAPH_FAILED);
+        OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check shape failed."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(CheckMatrixMulShapes(context_, opName_) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Tiling check shape input and output shape failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check shape input and output shape failed."),
+                    return ge::GRAPH_FAILED);
     OP_TILING_CHECK(CheckAlltoAllOut(context_, opName_) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Tiling check allToAllOut failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check allToAllOut failed."), return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -151,7 +152,11 @@ ge::graphStatus AllToAllFpMatmulTilingBaseA3::InitTilingContextParameters()
 ge::graphStatus AllToAllFpMatmulTilingBaseA3::DoOpTiling()
 {
     // 输入参数的校验:Attrs,Dtype,Shape等
-    MC2_CHECK_LOG_RET(opName_, CheckOpInputInfo());
+    const ge::graphStatus inputCheckStatus = CheckOpInputInfo();
+    OP_TILING_CHECK(
+        inputCheckStatus != ge::GRAPH_SUCCESS,
+        OP_LOGE_WITHOUT_REPORT(opName_, "input validation failed, status=%d", static_cast<int>(inputCheckStatus)),
+        return ge::FAILED);
     // 参数校验通过后赋值给全局上下文变量
     MC2_CHECK_LOG_RET(opName_, InitTilingContextParameters());
     // 进行通算切分
@@ -195,12 +200,12 @@ ge::graphStatus AllToAllFpMatmulTilingBaseA3::SetHcclTiling()
                             static_cast<int32_t>(contextInfo_.args_.geCType)),
                     return ge::GRAPH_FAILED;);
     auto commMode = context_->GetAttrs()->GetAttrPointer<char>(ALLTOALLMATMUL_ATTR_COMM_MODE_INDEX);
-    OP_TILING_CHECK(commMode == nullptr,
-                    OP_LOGE(context_->GetNodeName(), "GetAttrPointer for ALLTOALLMATMUL_ATTR_COMM_MODE_INDEX failed"),
+    OP_TILING_CHECK(commMode == nullptr, OP_LOGE_WITH_INVALID_INPUT(context_->GetNodeName(), "comm_mode"),
                     return ge::GRAPH_FAILED);
     const size_t maxLength = 7UL;
     OP_TILING_CHECK((strncmp(commMode, "ai_cpu", maxLength) != 0),
-                    OP_LOGE(context_->GetNodeName(), "comm_mode only support 'ai_cpu'."), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_VALUE(context_->GetNodeName(), "comm_mode", commMode, "ai_cpu"),
+                    return ge::GRAPH_FAILED);
     Mc2CcTilingConfigBuilder allToAllBuilder =
         Mc2CcTilingConfigBuilder::create(contextInfo_.group, mc2tiling::AicpuComType::HCCL_CMD_ALLTOALL,
                                          Mc2CcTilingConfigBuilder::AlgConfigType::ALL_TO_ALL);

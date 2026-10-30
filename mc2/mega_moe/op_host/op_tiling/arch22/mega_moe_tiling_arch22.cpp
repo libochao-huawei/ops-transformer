@@ -190,35 +190,33 @@ static int64_t CalcLeastCclBufferSize(int64_t maxRecvTokenNum, int64_t h, int64_
 
 static ge::graphStatus CheckMoeExpertNumAttr(const int64_t* ptr)
 {
-    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "moe_expert_num", "null", "not null"),
+    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "moe_expert_num"), return GRAPH_FAILED);
+    OP_TILING_CHECK(*ptr < MIN_MOE_EXPERT_NUM || *ptr > MAX_MOE_EXPERT_NUM,
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "moe_expert_num", std::to_string(*ptr).c_str(),
+                                                          "in [1, 1024]"),
                     return GRAPH_FAILED);
-    OP_TILING_CHECK(
-        *ptr < MIN_MOE_EXPERT_NUM || *ptr > MAX_MOE_EXPERT_NUM,
-        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "moe_expert_num", std::to_string(*ptr).c_str(), "in [1, 1024]"),
-        return GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
 static ge::graphStatus CheckEpWorldSizeAttr(const int64_t* ptr)
 {
-    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "ep_world_size", "null", "not null"),
-                    return GRAPH_FAILED);
+    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "ep_world_size"), return GRAPH_FAILED);
     bool isValidEpWorldSize = std::find(std::begin(VALID_EP_WORLD_SIZE), std::end(VALID_EP_WORLD_SIZE), *ptr) !=
                               std::end(VALID_EP_WORLD_SIZE);
     OP_TILING_CHECK(!isValidEpWorldSize,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "ep_world_size", std::to_string(*ptr).c_str(),
-                                              "one of {2, 4, 8, 16, 32, 48, 64, 96, 128}"),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "ep_world_size", std::to_string(*ptr).c_str(),
+                                                          "one of {2, 4, 8, 16, 32, 48, 64, 96, 128}"),
                     return GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
 static ge::graphStatus CheckMaxRecvTokenNumAttr(const int64_t* ptr)
 {
-    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "max_recv_token_num", "null", "not null"),
-                    return GRAPH_FAILED);
-    OP_TILING_CHECK(*ptr < 0,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "max_recv_token_num", std::to_string(*ptr).c_str(), ">= 0"),
-                    return GRAPH_FAILED);
+    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "max_recv_token_num"), return GRAPH_FAILED);
+    OP_TILING_CHECK(
+        *ptr < 0,
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "max_recv_token_num", std::to_string(*ptr).c_str(), ">= 0"),
+        return GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -226,12 +224,10 @@ static ge::graphStatus CheckMaxRecvTokenNumAttr(const int64_t* ptr)
 static ge::graphStatus CheckDispatchQuantAttrs(gert::TilingContext* context, const int64_t* dispatchQuantModePtr,
                                                const int64_t* dispatchQuantOutDtypePtr)
 {
-    OP_TILING_CHECK(dispatchQuantModePtr == nullptr,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "dispatch_quant_mode", "null", "not null"),
+    OP_TILING_CHECK(dispatchQuantModePtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "dispatch_quant_mode"),
                     return GRAPH_FAILED);
     OP_TILING_CHECK(dispatchQuantOutDtypePtr == nullptr,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "dispatch_quant_out_dtype", "null", "not null"),
-                    return GRAPH_FAILED);
+                    OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "dispatch_quant_out_dtype"), return GRAPH_FAILED);
 
     auto w1Desc = context->GetDynamicInputDesc(WEIGHT1_INDEX, 0);
     OP_TILING_CHECK(w1Desc == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "weight1"), return GRAPH_FAILED);
@@ -246,7 +242,7 @@ static ge::graphStatus CheckDispatchQuantAttrs(gert::TilingContext* context, con
     }
     OP_TILING_CHECK(
         *dispatchQuantModePtr != expectedDispatchQuantMode,
-        OP_LOGE_WITH_INVALID_ATTR(
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
             K_OP_NAME, "dispatch_quant_mode", std::to_string(*dispatchQuantModePtr).c_str(),
             (std::to_string(expectedDispatchQuantMode) + " for weight1 dtype " + Ops::Base::ToString(w1DataType))
                 .c_str()),
@@ -264,7 +260,7 @@ static ge::graphStatus CheckDispatchQuantAttrs(gert::TilingContext* context, con
         }
         OP_TILING_CHECK(
             *dispatchQuantOutDtypePtr != expectedQuantOutType,
-            OP_LOGE_WITH_INVALID_ATTR(
+            OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
                 K_OP_NAME, "dispatch_quant_out_dtype", std::to_string(*dispatchQuantOutDtypePtr).c_str(),
                 (std::to_string(expectedQuantOutType) + " for weight1 dtype " + Ops::Base::ToString(w1DataType))
                     .c_str()),
@@ -275,39 +271,39 @@ static ge::graphStatus CheckDispatchQuantAttrs(gert::TilingContext* context, con
 
 static ge::graphStatus CheckCombineQuantModeAttr(const int64_t* ptr)
 {
-    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "combine_quant_mode", "null", "not null"),
-                    return GRAPH_FAILED);
-    OP_TILING_CHECK(*ptr != 0,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "combine_quant_mode", std::to_string(*ptr).c_str(), "0"),
-                    return GRAPH_FAILED);
+    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "combine_quant_mode"), return GRAPH_FAILED);
+    OP_TILING_CHECK(
+        *ptr != 0,
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "combine_quant_mode", std::to_string(*ptr).c_str(), "0"),
+        return GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
 // 校验 num_max_tokens_per_rank，需要从 x shape 获取 bs
 static ge::graphStatus CheckNumMaxTokensPerRankAttr(gert::TilingContext* context, const int64_t* ptr)
 {
-    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "num_max_tokens_per_rank", "null", "not null"),
+    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "num_max_tokens_per_rank"),
                     return GRAPH_FAILED);
     const gert::StorageShape* xStorageShape = context->GetInputShape(X_INDEX);
     OP_TILING_CHECK(xStorageShape == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "x"), return GRAPH_FAILED);
     int64_t bs = xStorageShape->GetStorageShape().GetDim(0);
     if (*ptr > 0) {
-        OP_TILING_CHECK(*ptr < bs,
-                        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "num_max_tokens_per_rank", std::to_string(*ptr).c_str(),
-                                                  (">= bs (" + std::to_string(bs) + ")").c_str()),
-                        return GRAPH_FAILED);
         OP_TILING_CHECK(
-            *ptr < MIN_BS,
-            OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "num_max_tokens_per_rank", std::to_string(*ptr).c_str(), ">= 1"),
+            *ptr < bs,
+            OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "num_max_tokens_per_rank", std::to_string(*ptr).c_str(),
+                                                  (">= bs (" + std::to_string(bs) + ")").c_str()),
             return GRAPH_FAILED);
+        OP_TILING_CHECK(*ptr < MIN_BS,
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "num_max_tokens_per_rank",
+                                                              std::to_string(*ptr).c_str(), ">= 1"),
+                        return GRAPH_FAILED);
     }
     return ge::GRAPH_SUCCESS;
 }
 
 static ge::graphStatus CheckActivationAttr(const char* ptr, uint32_t& activationCode)
 {
-    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation", "null", "not null"),
-                    return GRAPH_FAILED);
+    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "activation"), return GRAPH_FAILED);
     std::string activationStr(ptr);
     if (activationStr == "swiglu") {
         activationCode = ACTIVATION_CODE_SWIGLU;
@@ -318,7 +314,8 @@ static ge::graphStatus CheckActivationAttr(const char* ptr, uint32_t& activation
     } else if (activationStr == "swigluoai") {
         activationCode = ACTIVATION_CODE_SWIGLU_OAI;
     } else {
-        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation", ptr, "one of {swiglu, swiglustep, swigluoai, situglu}");
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "activation", ptr,
+                                              "one of {swiglu, swiglustep, swigluoai, situglu}");
         return GRAPH_FAILED;
     }
     return ge::GRAPH_SUCCESS;
@@ -339,16 +336,26 @@ static bool IsValidSituScale(float value)
     return std::isfinite(value) && value > 0.0f;
 }
 
+// Keep the registered Arglist: the upstream list-size convenience macro uses
+// paramName, while EZ0038 is registered with param_name.
+static void ReportActivationParamCount(const char* opName, const char* paramName, const char* actualCount,
+                                       const char* reason)
+{
+    OP_LOGE_WITHOUT_REPORT(opName, "%s has invalid element count %s: %s", paramName, actualCount, reason);
+    const std::vector<const char*> keys = {"param_name", "op_name", "incorrect_size", "reason"};
+    const std::vector<const char*> values = {paramName, opName, actualCount, reason};
+    REPORT_PREDEFINED_ERR_MSG("EZ0038", keys, values);
+}
+
 static ge::graphStatus CheckActivationParamCount(uint32_t activationCode, size_t actualCount, size_t minCount,
                                                  size_t maxCount)
 {
-    OP_TILING_CHECK(
-        actualCount < minCount || actualCount > maxCount,
-        OP_LOGE_WITH_INVALID_ATTR_SIZE(K_OP_NAME, "activation_params", std::to_string(actualCount).c_str(),
-                                       ("in [" + std::to_string(minCount) + ", " + std::to_string(maxCount) +
-                                        "] for activation code " + std::to_string(activationCode))
-                                           .c_str()),
-        return GRAPH_FAILED);
+    OP_TILING_CHECK(actualCount < minCount || actualCount > maxCount,
+                    ReportActivationParamCount(K_OP_NAME, "activation_params", std::to_string(actualCount).c_str(),
+                                               ("in [" + std::to_string(minCount) + ", " + std::to_string(maxCount) +
+                                                "] for activation code " + std::to_string(activationCode))
+                                                   .c_str()),
+                    return GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -379,32 +386,33 @@ static ge::graphStatus SetActivationParams(const float* data, size_t paramCount,
 static ge::graphStatus ValidateActivationParams(size_t paramCount, const MegaMoeA2A3TilingData& info)
 {
     if (info.activationCode != ACTIVATION_CODE_SITU) {
-        OP_TILING_CHECK(!IsValidActivationClamp(info.activationClamp),
-                        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation_params[0]",
+        OP_TILING_CHECK(
+            !IsValidActivationClamp(info.activationClamp),
+            OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "activation_params[0]",
                                                   std::to_string(info.activationClamp).c_str(), ">= 0 and not NaN"),
-                        return GRAPH_FAILED);
+            return GRAPH_FAILED);
     }
     if (info.activationCode == ACTIVATION_CODE_SWIGLU_OAI) {
         OP_TILING_CHECK(!IsFiniteActivationParam(info.activationParams1),
-                        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation_params[1]",
-                                                  std::to_string(info.activationParams1).c_str(), "finite"),
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "activation_params[1]",
+                                                              std::to_string(info.activationParams1).c_str(), "finite"),
                         return GRAPH_FAILED);
         OP_TILING_CHECK(!IsFiniteActivationParam(info.activationParams2),
-                        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation_params[2]",
-                                                  std::to_string(info.activationParams2).c_str(), "finite"),
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "activation_params[2]",
+                                                              std::to_string(info.activationParams2).c_str(), "finite"),
                         return GRAPH_FAILED);
     }
     if (info.activationCode == ACTIVATION_CODE_SITU) {
-        OP_TILING_CHECK(
-            !IsValidSituScale(info.activationParams1),
-            OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation_params[0]", std::to_string(info.activationParams1).c_str(),
-                                      "finite and greater than 0"),
-            return GRAPH_FAILED);
-        OP_TILING_CHECK(
-            paramCount == 2U && !IsValidSituScale(info.activationParams2),
-            OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation_params[1]", std::to_string(info.activationParams2).c_str(),
-                                      "finite and greater than 0"),
-            return GRAPH_FAILED);
+        OP_TILING_CHECK(!IsValidSituScale(info.activationParams1),
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "activation_params[0]",
+                                                              std::to_string(info.activationParams1).c_str(),
+                                                              "finite and greater than 0"),
+                        return GRAPH_FAILED);
+        OP_TILING_CHECK(paramCount == 2U && !IsValidSituScale(info.activationParams2),
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "activation_params[1]",
+                                                              std::to_string(info.activationParams2).c_str(),
+                                                              "finite and greater than 0"),
+                        return GRAPH_FAILED);
     }
     return ge::GRAPH_SUCCESS;
 }
@@ -412,8 +420,7 @@ static ge::graphStatus ValidateActivationParams(size_t paramCount, const MegaMoe
 static ge::graphStatus CheckActivationParamsAttr(const gert::TypedContinuousVector<float>* params,
                                                  MegaMoeA2A3TilingData& info)
 {
-    OP_TILING_CHECK(params == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation_params", "null", "not null"),
-                    return GRAPH_FAILED);
+    OP_TILING_CHECK(params == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "activation_params"), return GRAPH_FAILED);
     size_t paramCount = params->GetSize();
     info.activationClamp = DEFAULT_ACTIVATION_CLAMP;
     info.activationParams1 = DEFAULT_ACTIVATION_PARAMS1;
@@ -439,49 +446,48 @@ static ge::graphStatus CheckActivationParamsAttr(const gert::TypedContinuousVect
 
 static ge::graphStatus CheckActivationOutDtypeAttr(const int64_t* ptr)
 {
-    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation_out_dtype", "null", "not null"),
-                    return GRAPH_FAILED);
-    OP_TILING_CHECK(*ptr != static_cast<int64_t>(ge::DT_UNDEFINED),
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "activation_out_dtype", std::to_string(*ptr).c_str(),
+    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "activation_out_dtype"), return GRAPH_FAILED);
+    OP_TILING_CHECK(
+        *ptr != static_cast<int64_t>(ge::DT_UNDEFINED),
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "activation_out_dtype", std::to_string(*ptr).c_str(),
                                               std::to_string(static_cast<int64_t>(ge::DT_UNDEFINED)).c_str()),
-                    return GRAPH_FAILED);
+        return GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
 static ge::graphStatus CheckTransposeWeightAttr(const bool* w1, const bool* w2)
 {
-    OP_TILING_CHECK(w1 == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "transpose_weight1", "null", "not null"),
-                    return GRAPH_FAILED);
-    OP_TILING_CHECK(w2 == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "transpose_weight2", "null", "not null"),
+    OP_TILING_CHECK(w1 == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "transpose_weight1"), return GRAPH_FAILED);
+    OP_TILING_CHECK(w2 == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "transpose_weight2"), return GRAPH_FAILED);
+    OP_TILING_CHECK(*w1 != *w2,
+                    OP_LOGE_FOR_INVALID_VALUES_WITH_REASON(K_OP_NAME, "transpose_weight1, transpose_weight2",
+                                                           (std::to_string(*w1) + ", " + std::to_string(*w2)).c_str(),
+                                                           "the same value"),
                     return GRAPH_FAILED);
     OP_TILING_CHECK(
-        *w1 != *w2,
-        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "transpose_weight1, transpose_weight2",
-                                  (std::to_string(*w1) + ", " + std::to_string(*w2)).c_str(), "the same value"),
-        return GRAPH_FAILED);
-    OP_TILING_CHECK(*w1 == true,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "transpose_weight1", "true",
+        *w1 == true,
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "transpose_weight1", "true",
                                               "false because transpose weight is unsupported on the current SoC"),
-                    return GRAPH_FAILED);
+        return GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
 // 校验 weight1_interleave，需要从 weight1 tensor 获取 N
 static ge::graphStatus CheckWeight1InterleaveAttr(gert::TilingContext* context, const int64_t* ptr)
 {
-    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "weight1_interleave", "null", "not null"),
-                    return GRAPH_FAILED);
-    OP_TILING_CHECK(*ptr < 0,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "weight1_interleave", std::to_string(*ptr).c_str(), ">= 0"),
-                    return GRAPH_FAILED);
+    OP_TILING_CHECK(ptr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "weight1_interleave"), return GRAPH_FAILED);
+    OP_TILING_CHECK(
+        *ptr < 0,
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "weight1_interleave", std::to_string(*ptr).c_str(), ">= 0"),
+        return GRAPH_FAILED);
     auto w1Tensor = context->GetDynamicInputTensor(WEIGHT1_INDEX, 0);
     OP_TILING_CHECK(w1Tensor == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "weight1"), return GRAPH_FAILED);
     uint32_t w1TensorDims = w1Tensor->GetOriginShape().GetDimNum();
     uint32_t N = w1Tensor->GetStorageShape().GetDim(w1TensorDims - 1);
     uint32_t maxInterleave = N / 2;
     OP_TILING_CHECK(static_cast<uint32_t>(*ptr) > maxInterleave,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "weight1_interleave", std::to_string(*ptr).c_str(),
-                                              ("in [0, " + std::to_string(maxInterleave) + "]").c_str()),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "weight1_interleave", std::to_string(*ptr).c_str(),
+                                                          ("in [0, " + std::to_string(maxInterleave) + "]").c_str()),
                     return GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
@@ -501,8 +507,8 @@ static ge::graphStatus CheckExpertAndBufferAttrs(gert::TilingContext* context, M
     info.epWorldSize = static_cast<uint32_t>(*epWorldSizePtr);
 
     // 3. ccl_buffer_size
-    OP_TILING_CHECK(cclBufferSizePtr == nullptr,
-                    OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "ccl_buffer_size", "null", "not null"), return GRAPH_FAILED);
+    OP_TILING_CHECK(cclBufferSizePtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "ccl_buffer_size"),
+                    return GRAPH_FAILED);
     info.cclBufferSize = static_cast<int64_t>(*cclBufferSizePtr);
 
     // 4. max_recv_token_num
@@ -543,22 +549,33 @@ static ge::graphStatus CheckRoutingQuantAttrs(gert::TilingContext* context, Mega
     return ge::GRAPH_SUCCESS;
 }
 
+static void ReportUnsupportedMaskBuffer(const std::string& socVersion)
+{
+    const std::string reason = "mask_buffer requires Ascend910_93; actual SoC=" + socVersion;
+    OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(K_OP_NAME, "mask_buffer", reason.c_str());
+}
+
 static ge::graphStatus CheckRankMaskAttr(gert::TilingContext* context, MegaMoeA2A3TilingData& info,
                                          const std::string& socVersion)
 {
     auto maskBuffer = context->GetOptionalInputTensor(MASK_BUFFER_INDEX);
-    OP_TILING_CHECK(socVersion != "Ascend910_93" && maskBuffer != nullptr,
-                    OP_LOGE(K_INNER_DEBUG, "mask_buffer is supported on A3 only."), return GRAPH_FAILED);
+    OP_TILING_CHECK(socVersion != "Ascend910_93" && maskBuffer != nullptr, ReportUnsupportedMaskBuffer(socVersion),
+                    return GRAPH_FAILED);
     if (maskBuffer != nullptr) {
         auto maskShape = context->GetOptionalInputShape(MASK_BUFFER_INDEX);
         auto maskDesc = context->GetOptionalInputDesc(MASK_BUFFER_INDEX);
         OP_TILING_CHECK(maskShape == nullptr || maskDesc == nullptr,
-                        OP_LOGE(K_INNER_DEBUG, "mask_buffer shape/desc is null."), return GRAPH_FAILED);
+                        OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "mask_buffer"), return GRAPH_FAILED);
         OP_TILING_CHECK(maskShape->GetStorageShape().GetDimNum() != ONE_DIM ||
                             maskShape->GetStorageShape().GetDim(0) != static_cast<int64_t>(info.epWorldSize),
-                        OP_LOGE(K_INNER_DEBUG, "mask_buffer shape must be [ep_world_size]."), return GRAPH_FAILED);
+                        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(
+                            K_OP_NAME, "mask_buffer", Ops::Base::ToString(maskShape->GetStorageShape()).c_str(),
+                            ("shape must be [ep_world_size=" + std::to_string(info.epWorldSize) + "]").c_str()),
+                        return GRAPH_FAILED);
         OP_TILING_CHECK(maskDesc->GetDataType() != ge::DT_INT32,
-                        OP_LOGE(K_INNER_DEBUG, "mask_buffer dtype must be int32."), return GRAPH_FAILED);
+                        OP_LOGE_FOR_INVALID_DTYPE(K_OP_NAME, "mask_buffer",
+                                                  Ops::Base::ToString(maskDesc->GetDataType()).c_str(), "DT_INT32"),
+                        return GRAPH_FAILED);
     }
     return ge::GRAPH_SUCCESS;
 }
@@ -1374,11 +1391,10 @@ static ge::graphStatus MegaMoeA2A3CommAlg(const gert::TilingContext* context)
     OP_TILING_CHECK(attrs == nullptr, OP_LOGE_WITHOUT_REPORT(K_INNER_DEBUG, "Failed to get operator attributes."),
                     return ge::GRAPH_FAILED);
     auto commAlg = attrs->GetAttrPointer<char>(static_cast<int>(ATTR_COMM_ALG_INDEX));
-    OP_TILING_CHECK(commAlg == nullptr, OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", "null", "not null"),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(commAlg == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "comm_alg"), return ge::GRAPH_FAILED);
 
     if (strlen(commAlg) > 0) {
-        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "comm_alg", commAlg, "empty string");
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "comm_alg", commAlg, "empty string");
         return ge::GRAPH_FAILED;
     }
 
@@ -1409,7 +1425,7 @@ static ge::graphStatus MegaMoeA2A3CheckHcclBuffSize(const gert::TilingContext* c
 
     int64_t leastTotalCclBufferSize = leastCclBufferSize * 2;
     OP_TILING_CHECK(cclBufferSize < leastCclBufferSize,
-                    OP_LOGE_WITH_INVALID_ATTR(
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
                         K_OP_NAME, "ccl_buffer_size", std::to_string(info.cclBufferSize).c_str(),
                         (">= " + std::to_string(leastTotalCclBufferSize) + " Bytes (suggest at least " +
                          std::to_string(ops::CeilDiv(leastTotalCclBufferSize, static_cast<int64_t>(MB_SIZE))) +
@@ -1552,16 +1568,16 @@ static ge::graphStatus SetMegaMoeTilingKey(gert::TilingContext* context, MegaMoe
     }
     if (quantMode == MEGA_MOE_QUANT_MODE_NO_QUANT) {
         OP_TILING_CHECK(quantOutType != MEGA_MOE_QUANT_OUT_TYPE_UNDEFINED,
-                        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "dispatch_quant_out_dtype",
-                                                  std::to_string(info.dispatchQuantOutDtype).c_str(),
-                                                  "DT_UNDEFINED in non-quant mode"),
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "dispatch_quant_out_dtype",
+                                                              std::to_string(info.dispatchQuantOutDtype).c_str(),
+                                                              "DT_UNDEFINED in non-quant mode"),
                         return ge::GRAPH_FAILED);
     } else {
-        OP_TILING_CHECK(
-            quantOutType != MEGA_MOE_QUANT_OUT_TYPE_INT8,
-            OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "dispatch_quant_out_dtype",
-                                      std::to_string(info.dispatchQuantOutDtype).c_str(), "DT_INT8 in quant mode"),
-            return ge::GRAPH_FAILED);
+        OP_TILING_CHECK(quantOutType != MEGA_MOE_QUANT_OUT_TYPE_INT8,
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "dispatch_quant_out_dtype",
+                                                              std::to_string(info.dispatchQuantOutDtype).c_str(),
+                                                              "DT_INT8 in quant mode"),
+                        return ge::GRAPH_FAILED);
     }
     // archCode 在910B时为0, 910_93时为1
     std::string socVersion = mc2tiling::GetSocVersion(context);

@@ -15,6 +15,7 @@
 #include <cstdlib>
 
 #include <gtest/gtest.h>
+#include "experiment/metadef/common/util/error_manager/error_manager.h"
 
 #include "exe_graph/runtime/storage_format.h"
 #include "exe_graph/runtime/storage_shape.h"
@@ -5236,6 +5237,36 @@ TEST_F(MoeDistributeDispatchV2Arch22TilingTest, A2CommAlgRejectsUnsupportedValue
         for (int64_t epWorldSize : {2, 8, 16}) {
             SCOPED_TRACE(epWorldSize);
             CheckA2CommAlg(commAlg, epWorldSize, ge::GRAPH_FAILED);
+        }
+    }
+}
+
+TEST_F(MoeDistributeDispatchV2Arch22TilingTest, A2InvalidCommAlgReportsSingleFormalError)
+{
+    struct ErrorReportsScope {
+        ErrorReportsScope()
+        {
+            ErrorManager::GetInstance().GetRawErrorMessages();
+        }
+        ~ErrorReportsScope()
+        {
+            ErrorManager::GetInstance().GetRawErrorMessages();
+        }
+    } reportsScope;
+    // Keep the upstream small-domain validation and verify its formal first report.
+    for (const int64_t epWorldSize : {2, 8, 16}) {
+        SCOPED_TRACE(epWorldSize);
+        CheckA2CommAlg("bad", epWorldSize, ge::GRAPH_FAILED);
+        const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+        ASSERT_EQ(reports.size(), 1U);
+        const auto& report = reports.front();
+        ASSERT_EQ(report.error_id, "EZ0026");
+        const std::map<std::string, std::string> expected = {
+            {"param_name", "comm_alg"}, {"incorrect_value", "bad"}, {"reason", "\"fullmesh\" or \"hierarchy\""}};
+        for (const auto& field : expected) {
+            const auto value = report.args_map.find(field.first);
+            ASSERT_NE(value, report.args_map.end()) << "Missing diagnostic field: " << field.first;
+            EXPECT_EQ(value->second, field.second) << field.first;
         }
     }
 }

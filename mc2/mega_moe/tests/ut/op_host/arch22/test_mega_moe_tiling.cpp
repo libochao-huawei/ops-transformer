@@ -16,6 +16,8 @@
 #include <utility>
 
 #include <gtest/gtest.h>
+#include <initializer_list>
+#include "experiment/metadef/common/util/error_manager/error_manager.h"
 
 #include "exe_graph/runtime/storage_format.h"
 #include "exe_graph/runtime/storage_shape.h"
@@ -23,8 +25,52 @@
 #include "mc2_tiling_case_executor.h"
 
 namespace MegaMoeUT {
+
+namespace {
+template <typename Reports>
+void CheckFormalReport(const Reports& reports, const std::string& errorId,
+                       std::initializer_list<std::pair<std::string, std::string>> exactFields,
+                       std::initializer_list<std::string> nonEmptyFields = {},
+                       std::initializer_list<std::pair<std::string, std::string>> containsFields = {})
+{
+    ASSERT_EQ(reports.size(), 1U);
+    ASSERT_EQ(reports[0].error_id, errorId);
+    const auto& fields = reports[0].args_map;
+    for (const auto& item : exactFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        ASSERT_EQ(fields.count(key), 1U) << key;
+    }
+    for (const auto& item : containsFields) {
+        ASSERT_EQ(fields.count(item.first), 1U) << item.first;
+    }
+    for (const auto& item : exactFields) {
+        EXPECT_EQ(fields.at(item.first), item.second) << item.first;
+    }
+    for (const auto& key : nonEmptyFields) {
+        EXPECT_FALSE(fields.at(key).empty()) << key;
+    }
+    for (const auto& item : containsFields) {
+        EXPECT_NE(fields.at(item.first).find(item.second), std::string::npos) << item.first;
+    }
+}
+
+} // namespace
+
 class MegaMoeArch22TilingTest : public testing::Test {
 protected:
+    void SetUp() override
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+    void TearDown() override
+    {
+        Mc2Hcom::MC2HcomTopologyMocker::GetInstance().Reset();
+        (void)ErrorManager::GetInstance().GetRawErrorMessages();
+    }
+
     static void SetUpTestCase()
     {
         std::cout << "MegaMoeArch22TilingTest SetUp" << std::endl;
@@ -134,6 +180,7 @@ TEST_F(MegaMoeArch22TilingTest, ActivationParamValidationWithLargeIntermediateHi
         std::string activation;
         std::vector<float> params;
         ge::graphStatus expectedStatus;
+        const char* expectedCode = "EZ0026";
     };
     const std::vector<ActivationCase> activationCases = {
         {"swiglu", {}, ge::GRAPH_SUCCESS},
@@ -148,6 +195,7 @@ TEST_F(MegaMoeArch22TilingTest, ActivationParamValidationWithLargeIntermediateHi
         {"situglu", {2.0f}, ge::GRAPH_SUCCESS},
         {"situglu", {2.0f, 2.0f}, ge::GRAPH_SUCCESS},
         {"swiglu", {-1.0f}, ge::GRAPH_FAILED},
+        {"swiglu", {1.0f, 2.0f}, ge::GRAPH_FAILED, "EZ0038"},
         {"swigluoai",
          {std::numeric_limits<float>::max(), std::numeric_limits<float>::quiet_NaN(), 1.0f},
          ge::GRAPH_FAILED},
@@ -160,6 +208,8 @@ TEST_F(MegaMoeArch22TilingTest, ActivationParamValidationWithLargeIntermediateHi
         {"situglu", {1.0f, std::numeric_limits<float>::infinity()}, ge::GRAPH_FAILED},
     };
     for (const auto& activationCase : activationCases) {
+        SCOPED_TRACE(activationCase.activation + " params=" + std::to_string(activationCase.params.size()));
+        ErrorManager::GetInstance().GetRawErrorMessages();
         gert::TilingContextPara tilingContextPara(
             "MegaMoe", inputs,
             {
@@ -190,6 +240,49 @@ TEST_F(MegaMoeArch22TilingTest, ActivationParamValidationWithLargeIntermediateHi
 
         Mc2Hcom::MockValues hcomTopologyMockValues{{"rankNum", 8}};
         Mc2ExecuteTestCase(tilingContextPara, hcomTopologyMockValues, activationCase.expectedStatus, UINT64_MAX);
+        const auto reports = ErrorManager::GetInstance().GetRawErrorMessages();
+        if (activationCase.expectedStatus == ge::GRAPH_FAILED) {
+            const char* actualKey =
+                std::string(activationCase.expectedCode) == "EZ0038" ? "incorrect_size" : "incorrect_value";
+            CheckFormalReport(reports, activationCase.expectedCode, {{"op_name", "MegaMoe"}}, {actualKey, "reason"},
+                              {{"param_name", "activation_params"}});
+        } else {
+            EXPECT_TRUE(reports.empty());
+        }
+        if (activationCase.activation == "swiglu" && activationCase.params.empty()) {
+            const auto checkFailure = [&](const gert::TilingContextPara& invalid, const char* code, const char* field,
+                                          const char* expected) {
+                SCOPED_TRACE(code);
+                ErrorManager::GetInstance().GetRawErrorMessages();
+                Mc2ExecuteTestCase(invalid, hcomTopologyMockValues, ge::GRAPH_FAILED, UINT64_MAX);
+                const auto errors = ErrorManager::GetInstance().GetRawErrorMessages();
+                CheckFormalReport(errors, code, {{field, expected}});
+            };
+            auto missingAttr = tilingContextPara;
+            missingAttr.attrs_.pop_back();
+            checkFailure(missingAttr, "EZ0004", "param_name", "weight1_interleave");
+
+            auto mismatchedTranspose = tilingContextPara;
+            for (auto& attr : mismatchedTranspose.attrs_) {
+                if (attr.attrName_ == "transpose_weight1") {
+                    attr.attr_ = Ops::Transformer::AnyValue::CreateFrom<bool>(true);
+                }
+            }
+            checkFailure(mismatchedTranspose, "EZ0027", "param_names", "transpose_weight1, transpose_weight2");
+
+            auto maskCase = tilingContextPara;
+            maskCase.inputInstanceNum_.resize(19, 0);
+            maskCase.inputInstanceNum_[18] = 1;
+            int32_t maskValues[8] = {};
+            maskCase.inputTensorDesc_.push_back({{{8}, {8}}, ge::DT_INT32, ge::FORMAT_ND, true, maskValues});
+            checkFailure(maskCase, "EZ0037", "param_name", "mask_buffer");
+            maskCase.socVersion_ = "Ascend910_93";
+            maskCase.inputTensorDesc_.back().shape_ = gert::StorageShape({7}, {7});
+            checkFailure(maskCase, "EZ0009", "param_name", "mask_buffer");
+            maskCase.inputTensorDesc_.back().shape_ = gert::StorageShape({8}, {8});
+            maskCase.inputTensorDesc_.back().dtype_ = ge::DT_FLOAT;
+            checkFailure(maskCase, "EZ0019", "param_name", "mask_buffer");
+        }
     }
 }
 

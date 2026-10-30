@@ -73,9 +73,21 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::DoOpTiling()
     // core is launched as one batch.
     constexpr uint32_t batchMode = 1U;
     MC2_CHECK_LOG_RET(opName_, context_->SetScheduleMode(batchMode));
-    MC2_CHECK_LOG_RET(opName_, CheckAndSetInputOutputInfo());
+    {
+        const ge::graphStatus status = CheckAndSetInputOutputInfo();
+        if (status != ge::GRAPH_SUCCESS) {
+            OP_LOGE_WITHOUT_REPORT(opName_, "CheckAndSetInputOutputInfo() failed, status=%d", static_cast<int>(status));
+            return ge::FAILED;
+        }
+    }
     MC2_CHECK_LOG_RET(opName_, SetTilingCommonInfo());
-    MC2_CHECK_LOG_RET(opName_, SetMteWorkspaceInfo());
+    {
+        const ge::graphStatus status = SetMteWorkspaceInfo();
+        if (status != ge::GRAPH_SUCCESS) {
+            OP_LOGE_WITHOUT_REPORT(opName_, "SetMteWorkspaceInfo() failed, status=%d", static_cast<int>(status));
+            return ge::FAILED;
+        }
+    }
     return ge::GRAPH_SUCCESS;
 }
 
@@ -84,10 +96,10 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::SetMteWorkspaceInfo()
     const uint64_t dtypeSize = mc2tiling::GetDataTypeSize(opName_, localParams_.gmmYDtype);
     const uint64_t rowBytes = localParams_.N1 * dtypeSize;
     OP_TILING_CHECK(rowBytes > MC2KernelTemplate::Gmma2avMteTiling::PAYLOAD_UB_REGION_BYTES,
-                    OP_LOGE(opName_,
-                            "MTE peer copy requires one complete output row in payload UB: row=%lu bytes, "
-                            "capacity=%lu bytes.",
-                            rowBytes, MC2KernelTemplate::Gmma2avMteTiling::PAYLOAD_UB_REGION_BYTES),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        opName_, "y row bytes", std::to_string(rowBytes),
+                        "a complete output row must fit MTE payload UB capacity=" +
+                            std::to_string(MC2KernelTemplate::Gmma2avMteTiling::PAYLOAD_UB_REGION_BYTES) + " bytes"),
                     return ge::GRAPH_FAILED);
     const uint64_t gmmOutputWorkspaceSize = mc2tiling::AlignUp(
         localParams_.A * localParams_.N1 * dtypeSize, MC2KernelTemplate::Gmma2avMteTiling::WORKSPACE_ALIGNMENT);
@@ -418,15 +430,17 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::CheckParamsAttrEpAndSetLocalPar
                     return ge::GRAPH_FAILED);
     int64_t communicatorRankDim = 0;
     OP_TILING_CHECK(!mc2tiling::GetRankSize(opName_, group, communicatorRankDim),
-                    OP_LOGE(opName_, "GetRankSize failed."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "GetRankSize failed."), return ge::GRAPH_FAILED);
     rankDim = (*epWorldSizePtr == RANK_DEFAULT_NUM) ? communicatorRankDim : *epWorldSizePtr;
-    OP_TILING_CHECK(
-        rankDim != communicatorRankDim,
-        OP_LOGE(opName_, "epWorldSize=%ld does not match communicator rank size=%ld.", rankDim, communicatorRankDim),
-        return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(rankDim != communicatorRankDim,
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        opName_, "ep_world_size", std::to_string(rankDim),
+                        "must equal communicator rank size=" + std::to_string(communicatorRankDim)),
+                    return ge::GRAPH_FAILED);
     OP_TILING_CHECK(rankDim <= 0 || static_cast<uint64_t>(rankDim) > MC2KernelTemplate::Gmma2avMteTiling::MAX_RANK_SIZE,
-                    OP_LOGE(opName_, "rankSize=%ld must be in [1, %u].", rankDim,
-                            MC2KernelTemplate::Gmma2avMteTiling::MAX_RANK_SIZE),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        opName_, "ep_world_size", std::to_string(rankDim),
+                        "must be in [1, " + std::to_string(MC2KernelTemplate::Gmma2avMteTiling::MAX_RANK_SIZE) + "]"),
                     return ge::GRAPH_FAILED);
 
     std::string supportRankSizeRange;
@@ -466,8 +480,10 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::CheckAndSetSendRecvCountsAttr()
     const uint64_t sendCountsSize = sendCountsPtr->GetSize();
     const uint64_t recvCountsSize = recvCountsPtr->GetSize();
     OP_TILING_CHECK(sendCountsSize != expertNum || recvCountsSize != expertNum,
-                    OP_LOGE(opName_, "sendCounts and recvCounts must both contain %lu elements, got %lu and %lu.",
-                            expertNum, sendCountsSize, recvCountsSize),
+                    OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+                        opName_, "send_counts/recv_counts",
+                        "lengths=" + std::to_string(sendCountsSize) + "/" + std::to_string(recvCountsSize) +
+                            "; both must equal expert count=" + std::to_string(expertNum)),
                     return ge::GRAPH_FAILED);
 
     const int64_t* sendCounts = static_cast<const int64_t*>(sendCountsPtr->GetData());
@@ -478,22 +494,29 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::CheckAndSetSendRecvCountsAttr()
     uint64_t recvCountsSum = 0UL;
     for (uint64_t i = 0UL; i < expertNum; ++i) {
         OP_TILING_CHECK(sendCounts[i] < 0 || sendCounts[i] > static_cast<int64_t>(localParams_.A),
-                        OP_LOGE(opName_, "sendCounts[%lu]=%ld is outside [0, %lu].", i, sendCounts[i], localParams_.A),
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                            opName_, "send_counts", std::to_string(sendCounts[i]),
+                            "element " + std::to_string(i) + " must be in [0, " + std::to_string(localParams_.A) + "]"),
                         return ge::GRAPH_FAILED);
-        OP_TILING_CHECK(
-            recvCounts[i] < 0 || recvCounts[i] > static_cast<int64_t>(localParams_.BsK),
-            OP_LOGE(opName_, "recvCounts[%lu]=%ld is outside [0, %lu].", i, recvCounts[i], localParams_.BsK),
-            return ge::GRAPH_FAILED);
+        OP_TILING_CHECK(recvCounts[i] < 0 || recvCounts[i] > static_cast<int64_t>(localParams_.BsK),
+                        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "recv_counts", std::to_string(recvCounts[i]),
+                                                              "element " + std::to_string(i) + " must be in [0, " +
+                                                                  std::to_string(localParams_.BsK) + "]"),
+                        return ge::GRAPH_FAILED);
         sendCounts_[i] = static_cast<int32_t>(sendCounts[i]);
         recvCounts_[i] = static_cast<int32_t>(recvCounts[i]);
         sendCountsSum += static_cast<uint64_t>(sendCounts[i]);
         recvCountsSum += static_cast<uint64_t>(recvCounts[i]);
     }
     OP_TILING_CHECK(sendCountsSum != localParams_.A,
-                    OP_LOGE(opName_, "sendCounts sum must equal A=%lu, got %lu.", localParams_.A, sendCountsSum),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        opName_, "send_counts", std::to_string(sendCountsSum),
+                        "sum must equal gmm_x first dimension A=" + std::to_string(localParams_.A)),
                     return ge::GRAPH_FAILED);
     OP_TILING_CHECK(recvCountsSum != localParams_.BsK,
-                    OP_LOGE(opName_, "recvCounts sum must equal BSK=%lu, got %lu.", localParams_.BsK, recvCountsSum),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        opName_, "recv_counts", std::to_string(recvCountsSum),
+                        "sum must equal y first dimension BSK=" + std::to_string(localParams_.BsK)),
                     return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
@@ -515,8 +538,17 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::CheckTopK(uint64_t topK)
 
 ge::graphStatus GroupedMatmulAllToAllvMteTiling::CheckLocalParams()
 {
-    MC2_CHECK_LOG_RET(opName_,
-                      Mc2Tiling::Mc2GroupedMatmul::QuantGroupedMatmulAllToAllvTilingCommon::CheckLocalParams());
+    {
+        const ge::graphStatus status =
+            Mc2Tiling::Mc2GroupedMatmul::QuantGroupedMatmulAllToAllvTilingCommon::CheckLocalParams();
+        if (status != ge::GRAPH_SUCCESS) {
+            OP_LOGE_WITHOUT_REPORT(opName_,
+                                   "Mc2Tiling::Mc2GroupedMatmul::QuantGroupedMatmulAllToAllvTilingCommon::"
+                                   "CheckLocalParams() failed, status=%d",
+                                   static_cast<int>(status));
+            return ge::FAILED;
+        }
+    }
     OP_TILING_CHECK(localParams_.A == 0UL || localParams_.A > MAX_TOKEN_NUM,
                     OP_LOGE_FOR_INVALID_VALUE(opName_, "A", std::to_string(localParams_.A).c_str(), "[1, 5000000]"),
                     return ge::GRAPH_FAILED);
@@ -583,7 +615,8 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::FillCommTiling(
     OP_TILING_CHECK(mc2InitConfig.GetTiling(outData.mc2CcTiling) != 0,
                     OP_LOGE(opName_, "Failed to generate the MTE Mc2CcTiling descriptor."), return ge::GRAPH_FAILED);
     OP_TILING_CHECK(mc2tiling::GetCclBufferSize(group, &outData.commBufferSize, opName_) != ge::GRAPH_SUCCESS,
-                    OP_LOGE(opName_, "Failed to get CCL buffer size for MTE communication."), return ge::GRAPH_FAILED);
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Failed to get CCL buffer size for MTE communication."),
+                    return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -615,21 +648,24 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::CheckCommBuffer(
             dataAndControlBytes :
             MC2KernelTemplate::Gmma2avMteTiling::MIN_CCL_BUFFER_BYTES;
     OP_TILING_CHECK(outData.commBufferSize < requiredCclBufferSize,
-                    OP_LOGE(opName_,
-                            "CCL buffer is too small for MTE communication: actual=%lu bytes, required=%lu bytes "
-                            "(send=%lu bytes, control including count matrix=%lu bytes, "
-                            "arch22 minimum=%lu bytes).",
-                            outData.commBufferSize, requiredCclBufferSize, sendBytes,
-                            MC2KernelTemplate::Gmma2avMteTiling::CONTROL_REGION_BYTES,
-                            MC2KernelTemplate::Gmma2avMteTiling::MIN_CCL_BUFFER_BYTES),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        opName_, "HCCL buffer size", std::to_string(outData.commBufferSize),
+                        "MTE requires at least " + std::to_string(requiredCclBufferSize) +
+                            " bytes (send=" + std::to_string(sendBytes) +
+                            ", control=" + std::to_string(MC2KernelTemplate::Gmma2avMteTiling::CONTROL_REGION_BYTES) +
+                            "); increase the communication buffer"),
                     return ge::GRAPH_FAILED);
     OP_TILING_CHECK(outData.commBufferSize < MC2KernelTemplate::Gmma2avMteTiling::SYNC_REGION_FROM_TAIL,
-                    OP_LOGE(opName_, "CCL buffer=%lu bytes is smaller than the MTE sync-tail offset=%lu bytes.",
-                            outData.commBufferSize, MC2KernelTemplate::Gmma2avMteTiling::SYNC_REGION_FROM_TAIL),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        opName_, "HCCL buffer size", std::to_string(outData.commBufferSize),
+                        "must be at least the MTE sync-tail offset=" +
+                            std::to_string(MC2KernelTemplate::Gmma2avMteTiling::SYNC_REGION_FROM_TAIL) + " bytes"),
                     return ge::GRAPH_FAILED);
     OP_TILING_CHECK(outData.commBufferSize % MC2KernelTemplate::Gmma2avMteTiling::SYNC_SLOT_BYTES != 0UL,
-                    OP_LOGE(opName_, "CCL buffer=%lu bytes does not preserve %lu-byte sync-slot alignment.",
-                            outData.commBufferSize, MC2KernelTemplate::Gmma2avMteTiling::SYNC_SLOT_BYTES),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
+                        opName_, "HCCL buffer size", std::to_string(outData.commBufferSize),
+                        "must preserve sync-slot alignment=" +
+                            std::to_string(MC2KernelTemplate::Gmma2avMteTiling::SYNC_SLOT_BYTES) + " bytes"),
                     return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
@@ -637,7 +673,13 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::CheckCommBuffer(
 ge::graphStatus GroupedMatmulAllToAllvMteTiling::FinishPostTiling(
     MC2KernelTemplate::GroupedMatMulAlltoAllvMteTilingData& outData)
 {
-    MC2_CHECK_LOG_RET(opName_, CheckExpertPipeline());
+    {
+        const ge::graphStatus status = CheckExpertPipeline();
+        if (status != ge::GRAPH_SUCCESS) {
+            OP_LOGE_WITHOUT_REPORT(opName_, "CheckExpertPipeline() failed, status=%d", static_cast<int>(status));
+            return ge::FAILED;
+        }
+    }
     MC2_CHECK_LOG_RET(opName_, SetExpertChunkRows(outData.expertChunkRows));
     const uint64_t dtypeSize = mc2tiling::GetDataTypeSize(opName_, localParams_.gmmYDtype);
 
@@ -688,18 +730,20 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::PostTiling()
 
 ge::graphStatus GroupedMatmulAllToAllvMteTiling::CheckExpertPipeline() const
 {
-    OP_TILING_CHECK(!isA3_ && localParams_.epWorldSize > A2_EXPERT_OVERLAP_MAX_RANK_SIZE,
-                    OP_LOGE(opName_, "Expert-overlap mode on Ascend 910B only supports W=2, 4 or 8, got W=%lu.",
-                            localParams_.epWorldSize),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(
+        !isA3_ && localParams_.epWorldSize > A2_EXPERT_OVERLAP_MAX_RANK_SIZE,
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "ep_world_size", std::to_string(localParams_.epWorldSize),
+                                              "expert-overlap mode on Ascend 910B supports 2, 4 or 8"),
+        return ge::GRAPH_FAILED);
     OP_TILING_CHECK(
         localParams_.epWorldSize > MC2KernelTemplate::Gmma2avMteTiling::MAX_RANK_SIZE ||
             localParams_.ep > MC2KernelTemplate::Gmma2avMteTiling::MAX_COUNT_NUM / localParams_.epWorldSize,
-        OP_LOGE(opName_,
-                "Expert-overlap sync layout capacity exceeded: W=%lu, E=%lu, maxW=%u, "
-                "max(W*E)=%u.",
-                localParams_.epWorldSize, localParams_.ep, MC2KernelTemplate::Gmma2avMteTiling::MAX_RANK_SIZE,
-                MC2KernelTemplate::Gmma2avMteTiling::MAX_COUNT_NUM),
+        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+            opName_, "ep_world_size/gmm_weight",
+            "rankSize=" + std::to_string(localParams_.epWorldSize) +
+                ", local experts=" + std::to_string(localParams_.ep) +
+                "; rank size must be <= " + std::to_string(MC2KernelTemplate::Gmma2avMteTiling::MAX_RANK_SIZE) +
+                " and their product <= " + std::to_string(MC2KernelTemplate::Gmma2avMteTiling::MAX_COUNT_NUM)),
         return ge::GRAPH_FAILED);
     OP_TILING_CHECK(MC2KernelTemplate::Gmma2avMteTiling::FIXED_SYNC_BYTES >
                         MC2KernelTemplate::Gmma2avMteTiling::SYNC_REGION_FROM_TAIL,
@@ -773,7 +817,7 @@ ge::graphStatus GroupedMatmulAllToAllvMteTiling::GetAndConvertCommMode(gert::Til
         OP_LOGE(context->GetNodeName(), "GroupedMatMulAlltoAllv AIV-driven MTE mode only supports Atlas A2/A3."),
         return ge::GRAPH_FAILED);
     OP_TILING_CHECK(strncmp(commModeStr, "aiv", maxLength) != 0,
-                    OP_LOGE(context->GetNodeName(), "This tiling only supports commMode 'aiv', got %s.", commModeStr),
+                    OP_LOGE_FOR_INVALID_VALUE(context->GetNodeName(), "comm_mode", commModeStr, "aiv"),
                     return ge::GRAPH_FAILED);
     commMode = COMM_MODE_AIV;
     return ge::GRAPH_SUCCESS;

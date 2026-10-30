@@ -243,10 +243,10 @@ static ge::graphStatus CheckA2CommunicationAttrs(const int64_t* tpWorldSizePtr, 
 {
     OP_TILING_CHECK(tpWorldSizePtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "tpWorldSize"),
                     return GRAPH_FAILED);
-    OP_TILING_CHECK(
-        *tpWorldSizePtr >= 2,
-        OP_LOGE_WITH_INVALID_ATTR(K_OP_NAME, "tp_world_size", std::to_string(*tpWorldSizePtr).c_str(), "less than 2"),
-        return GRAPH_FAILED);
+    OP_TILING_CHECK(*tpWorldSizePtr >= 2,
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(K_OP_NAME, "tp_world_size",
+                                                          std::to_string(*tpWorldSizePtr).c_str(), "less than 2"),
+                    return GRAPH_FAILED);
     OP_TILING_CHECK(expertSharedTypePtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "expertSharedType"),
                     return GRAPH_FAILED);
     OP_TILING_CHECK(sharedExpertRankNumPtr == nullptr, OP_LOGE_WITH_INVALID_INPUT(K_OP_NAME, "sharedExpertRankNum"),

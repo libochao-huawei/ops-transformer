@@ -416,16 +416,16 @@ ge::graphStatus MatmulAlltoAllTiling910B::CheckAndSetAttrsInfo(MatmulAlltoAllInf
     OP_TILING_CHECK(commMode == nullptr, OP_LOGE_WITH_INVALID_INPUT(opName_, "comm_mode"), return ge::GRAPH_FAILED);
     const size_t maxLength = 4UL;
     OP_TILING_CHECK((strncmp(commMode, "aiv", maxLength) != 0),
-                    OP_LOGE_WITH_INVALID_ATTR(opName_, "comm_mode", commMode, "aiv"), return ge::GRAPH_FAILED);
+                    OP_LOGE_FOR_INVALID_VALUE(opName_, "comm_mode", commMode, "aiv"), return ge::GRAPH_FAILED);
 
     info.worldSize = mc2tiling::MatmulFormulaicTiling::GetRankSize(group);
     OP_TILING_CHECK(SUPPORT_RANK_SIZE_910B.find(info.worldSize) == SUPPORT_RANK_SIZE_910B.end(),
-                    OP_LOGE_WITH_INVALID_ATTR(opName_, "world_size", std::to_string(info.worldSize).c_str(), "2/4/8"),
+                    OP_LOGE_FOR_INVALID_VALUE(opName_, "world_size", std::to_string(info.worldSize).c_str(), "2/4/8"),
                     return ge::GRAPH_FAILED);
 
     const bool* isTransX1 = attrs->GetAttrPointer<bool>(ATTR_X1_TRANSPOSE_INDEX);
     bool x1TransposeFlag = (isTransX1 != nullptr) ? *isTransX1 : false;
-    OP_TILING_CHECK(x1TransposeFlag, OP_LOGE_WITH_INVALID_ATTR(opName_, "transpose_x1", "true", "false"),
+    OP_TILING_CHECK(x1TransposeFlag, OP_LOGE_FOR_INVALID_VALUE(opName_, "transpose_x1", "true", "false"),
                     return ge::GRAPH_FAILED);
 
     const bool* isTransX2 = attrs->GetAttrPointer<bool>(ATTR_X2_TRANSPOSE_INDEX);
@@ -472,7 +472,7 @@ ge::graphStatus MatmulAlltoAllTiling910B::CheckTensorDataType(MatmulAlltoAllInfo
 
         OP_TILING_CHECK(
             (quantType != SUPPORT_QUANT_MODE),
-            OP_LOGE_WITH_INVALID_ATTR(
+            OP_LOGE_FOR_INVALID_VALUE(
                 opName_, "quant_mode",
                 (std::to_string(quantType / X1_QUANT_SIGN) + "/" + std::to_string(quantType % X1_QUANT_SIGN)).c_str(),
                 "x1=PerToken(3)/x2=PerChannel(2)"),
@@ -686,12 +686,12 @@ ge::graphStatus MatmulAlltoAllTiling910B::CheckShapeInfo(MatmulAlltoAllInfo& inf
  */
 ge::graphStatus MatmulAlltoAllTiling910B::CheckOpInputInfo(MatmulAlltoAllInfo& info)
 {
-    OP_TILING_CHECK(CheckAndSetAttrsInfo(info) != ge::GRAPH_SUCCESS, OP_LOGE(opName_, "Tiling check Attrs failed."),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(CheckTensorDataType(info) != ge::GRAPH_SUCCESS, OP_LOGE(opName_, "Tiling check Dtype failed."),
-                    return ge::GRAPH_FAILED);
-    OP_TILING_CHECK(CheckShapeInfo(info) != ge::GRAPH_SUCCESS, OP_LOGE(opName_, "Tiling check shape failed."),
-                    return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(CheckAndSetAttrsInfo(info) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check Attrs failed."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(CheckTensorDataType(info) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check Dtype failed."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(CheckShapeInfo(info) != ge::GRAPH_SUCCESS,
+                    OP_LOGE_WITHOUT_REPORT(opName_, "Tiling check shape failed."), return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -772,7 +772,11 @@ ge::graphStatus MatmulAlltoAllTiling910B::DoOpTiling()
     MatmulAlltoAllInfo& info = tilingData->matmulAlltoAllInfo;
     OPS_LOG_I(opName_, "MatmulAlltoAll get tilingData info.");
 
-    MC2_CHECK_LOG_RET(opName_, CheckOpInputInfo(info));
+    const ge::graphStatus inputCheckStatus = CheckOpInputInfo(info);
+    OP_TILING_CHECK(
+        inputCheckStatus != ge::GRAPH_SUCCESS,
+        OP_LOGE_WITHOUT_REPORT(opName_, "input validation failed, status=%d", static_cast<int>(inputCheckStatus)),
+        return ge::FAILED);
     MC2_CHECK_LOG_RET(opName_, DoMmCommTiling(tilingData->cocTiling, info));
     MC2_CHECK_LOG_RET(opName_, SetHcclTiling(tilingData));
     // 校验HCCL BUFF空间大小
