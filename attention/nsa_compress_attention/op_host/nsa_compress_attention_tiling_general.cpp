@@ -442,7 +442,7 @@ bool NsaCompressAttentionTilingBase::AnalyzeAttrs()
     auto scaleValuePtr = attrs->GetAttrPointer<float>(idx++);
     auto n1SizePtr = attrs->GetAttrPointer<uint32_t>(idx++);
     inputLayout = attrs->GetAttrPointer<char>(idx++);
-    auto sparseModePtr = attrs->GetAttrPointer<char>(idx++);
+    auto sparseModePtr = attrs->GetAttrPointer<int64_t>(idx++);
     auto compressBlockSizePtr = attrs->GetAttrPointer<char>(idx++);
     auto compressStridePtr = attrs->GetAttrPointer<char>(idx++);
     auto selectBlockSizePtr = attrs->GetAttrPointer<char>(idx++);
@@ -459,6 +459,9 @@ bool NsaCompressAttentionTilingBase::AnalyzeAttrs()
     selectBlockCount = *selectBlockCountPtr;
 
     OP_CHECK_IF(n1Size == 0, OPS_REPORT_VECTOR_INNER_ERR(opName, "Head num is zero."), return false);
+    OP_CHECK_IF(sparseMode != static_cast<int64_t>(NO_MASK) && sparseMode != static_cast<int64_t>(ALL_MASK),
+                OPS_REPORT_VECTOR_INNER_ERR(opName, "sparseMode[%ld] is invalid, only support 0 and 1.", sparseMode),
+                return false);
     OP_LOGD(context_,
             "attrs: scale_value[%f]"
             " head_num[%ld] input_layout[%s] sparse_mode[%ld], select_block_count[%ld].",

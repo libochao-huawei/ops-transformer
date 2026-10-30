@@ -31,6 +31,8 @@ static const uint64_t DIM_NUM_4 = 4;
 static const uint64_t DIM_0 = 0;
 static const uint64_t DIM_1 = 1;
 static const uint64_t DIM_2 = 2;
+static const int64_t SPARSE_MODE_NO_MASK = 0;
+static const int64_t SPARSE_MODE_ALL_MASK = 1;
 
 aclnnStatus CheckNsaCmpAttnParam(const aclTensor* query, const aclTensor* key, const aclTensor* value,
                                  const char* inputLayout, const aclTensor* softmaxMaxOut,
@@ -49,6 +51,15 @@ aclnnStatus CheckNsaCmpAttnParam(const aclTensor* query, const aclTensor* key, c
     CHECK_RET(softmaxSumOut != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(attentionOutOut != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(topkIndicesOut != nullptr, ACLNN_ERR_PARAM_NULLPTR);
+    return ACLNN_SUCCESS;
+}
+
+aclnnStatus CheckNsaCmpAttnSparseMode(int64_t sparseMode)
+{
+    if (sparseMode != SPARSE_MODE_NO_MASK && sparseMode != SPARSE_MODE_ALL_MASK) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "sparseMode %ld is invalid, only support 0 and 1.", sparseMode);
+        return ACLNN_ERR_PARAM_INVALID;
+    }
     return ACLNN_SUCCESS;
 }
 
@@ -196,6 +207,8 @@ aclnnStatus aclnnNsaCompressAttentionVarLenScoreGetWorkspaceSize(
                           sparseMode, compressBlockSize, compressStride, selectBlockSize, selectBlockCount),
                    DFX_OUT(softmaxMaxOut, softmaxSumOut, attentionOutOut, topkIndicesOut));
 
+    CHECK_RET(CheckNsaCmpAttnSparseMode(sparseMode) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
+
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
@@ -272,6 +285,8 @@ aclnnStatus aclnnNsaCompressAttentionGetWorkspaceSize(
                           actualCmpSeqKvLenOptional, actualSelSeqKvLenOptional, scaleValue, headNum, inputLayout,
                           sparseMode, compressBlockSize, compressStride, selectBlockSize, selectBlockCount),
                    DFX_OUT(softmaxMaxOut, softmaxSumOut, attentionOutOut, topkIndicesOut));
+
+    CHECK_RET(CheckNsaCmpAttnSparseMode(sparseMode) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
 
     auto uniqueExecutor = CREATE_EXECUTOR();
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
