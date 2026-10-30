@@ -23,7 +23,7 @@
   $$
 
   $$
-  out(i,j)=x1_{i,j}+x2Optional_{i,j}+\sum_{k=0}^{K}(scales_{i,k}*(expandedX_{expandedRowIdx_{i+k*num_rows},j}+bias_{expertid,j}))
+  out(i,j)=x1_{i,j}+x2Optional_{i,j}+\sum_{k=0}^{K-1}(scales_{i,k}*(expandedX_{expandedRowIdx_{i+k*num_rows},j}+bias_{expertid,j}))
   $$
 
 ## 参数说明
@@ -98,11 +98,15 @@
     </tbody>
   </table>
 
-- <term>Kirin X90处理器系列产品</term>、<term>Kirin 9030处理器系列产品</term>: 不支持BFLOAT16。
-
 ## 约束说明
 
-无。
+- 输入 expandedX、x1、x2Optional、bias、scales、expandedExpertIdx 为 2D Tensor，expandedRowIdx 为 1D Tensor，其中 x2Optional 为可选输入。
+- x1、x2Optional、scales、expandedExpertIdx 的 0 轴大小相同。
+- x1、x2Optional、expandedX、bias 的 1 轴大小相同。
+- scales 与 expandedExpertIdx 的 1 轴大小相同，即公式中的 K。
+- expandedX 与 expandedRowIdx 的 0 轴大小相同。
+- expandedRowIdx、expandedExpertIdx 的数据类型为 INT32，其余输入与输出 out 的数据类型为 FLOAT16、BFLOAT16 或 FLOAT32。
+- <term>Kirin X90处理器系列产品</term>、<term>Kirin 9030处理器系列产品</term>: 不支持BFLOAT16。
 
 ## 调用说明
 
