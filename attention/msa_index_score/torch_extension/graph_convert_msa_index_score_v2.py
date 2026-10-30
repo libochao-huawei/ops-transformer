@@ -49,7 +49,7 @@ if _TORCHAIR_AVAILABLE:
         init_blocks: int = 0,
         local_blocks: int = 1,
         layout_query: str = "TND",
-        block_size: int = 128,
+        pool_block_size: int = 128,
         dependencies=None,
         node_name=None,
     ):
@@ -72,7 +72,7 @@ if _TORCHAIR_AVAILABLE:
             "init_blocks": attr.Int(init_blocks),
             "local_blocks": attr.Int(local_blocks),
             "layout_query": attr.Str(layout_query),
-            "block_size": attr.Int(block_size),
+            "pool_block_size": attr.Int(pool_block_size),
         }
         outputs = ["score"]
         return ge_op(
@@ -101,7 +101,7 @@ if _TORCHAIR_AVAILABLE:
             .attr("init_blocks", attr.Int(0))
             .attr("local_blocks", attr.Int(1))
             .attr("layout_query", attr.Str("TND"))
-            .attr("block_size", attr.Int(128))
+            .attr("pool_block_size", attr.Int(128))
             .output("score", "DT_FLOAT"),
         )
 
@@ -123,7 +123,7 @@ if _TORCHAIR_AVAILABLE:
         init_blocks: int = 0,
         local_blocks: int = 1,
         layout_query: str = "TND",
-        block_size: int = 128,
+        pool_block_size: int = 128,
         meta_outputs: TensorSpec = None,
     ):
         return MsaIndexScoreV2(
@@ -140,7 +140,7 @@ if _TORCHAIR_AVAILABLE:
             init_blocks=init_blocks,
             local_blocks=local_blocks,
             layout_query=layout_query,
-            block_size=block_size,
+            pool_block_size=pool_block_size,
         )
 
 else:

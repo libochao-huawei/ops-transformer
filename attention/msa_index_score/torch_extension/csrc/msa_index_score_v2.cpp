@@ -11,7 +11,6 @@
 /*!
  * \file msa_index_score_v2.cpp
  * \brief torch_extension 适配：aclnnMsaIndexScoreV2 C++ wrapper。
- *        新需求（BSND/BNSD、block_size 16、layout_query）固定走 V2。
  *        key 支持 PA BBND/BNBD 与 TND / BSND / BNSD。
  *        950 另支持 query/key 同型 HIFLOAT8 / FLOAT8_E5M2 / FLOAT8_E4M3FN；
  *        PA key 允许 dim0 非连续（torch view stride 经 ConvertType 传入）。
@@ -245,7 +244,7 @@ at::Tensor msa_index_score_v2(const at::Tensor& query, const at::Tensor& key,
                               const c10::optional<at::Tensor>& actual_seq_qlen,
                               const c10::optional<at::Tensor>& actual_seq_klen, const at::Tensor& start_loc,
                               c10::string_view layout_key, int64_t sparse_mode, int64_t init_blocks,
-                              int64_t local_blocks, c10::string_view layout_query, int64_t block_size)
+                              int64_t local_blocks, c10::string_view layout_query, int64_t pool_block_size)
 {
     CheckMsaRequiredTensors(query, key, start_loc, actual_seq_qlen, actual_seq_klen);
     const std::string layoutKeyStr = ParseLayoutKey(layout_key);
@@ -261,19 +260,19 @@ at::Tensor msa_index_score_v2(const at::Tensor& query, const at::Tensor& key,
     const at::Tensor& kv_len = actual_seq_klen.value();
     CheckMsaLayoutRanks(query, key, block_table, layoutKeyStr, layoutQueryStr, cu_q, kv_len, start_loc);
     CheckMsaSparseAndDtypes(query, key, scale, atten_mask, cu_q, kv_len, start_loc, sparse_mode, seq_key);
-    // block_size 只允许 16 / 128；BSND/BNSD 固定 16。存储页长（key 的页维度）与打分块长解耦，
+    // pool_block_size 只允许 16 / 128；BSND/BNSD 固定 16。存储页长（key 的页维度）与打分块长解耦，
     // 但打分块不能超过存储页容量（kernel 按页表取每块前 bs 个 token）。
     const int64_t keyPage = seq_key ? 0 : (layoutKeyStr == "BBND") ? key.size(1) : key.size(DIM_2);
-    const int64_t blockSize = block_size;
-    TORCH_CHECK(blockSize == SUPPORTED_BLOCK_SIZE || blockSize == BLOCK16_SIZE, "block_size must be 16 or 128, got ",
-                blockSize);
+    const int64_t poolBlockSize = pool_block_size;
+    TORCH_CHECK(poolBlockSize == SUPPORTED_BLOCK_SIZE || poolBlockSize == BLOCK16_SIZE,
+                "pool_block_size must be 16 or 128, got ", poolBlockSize);
     if (layoutKeyStr == "BSND" || layoutKeyStr == "BNSD") {
-        TORCH_CHECK(blockSize == BLOCK16_SIZE, "BSND/BNSD requires block_size=16, got ", blockSize);
+        TORCH_CHECK(poolBlockSize == BLOCK16_SIZE, "BSND/BNSD requires pool_block_size=16, got ", poolBlockSize);
     } else if (!seq_key) {
-        TORCH_CHECK(blockSize <= keyPage, "block_size(", blockSize, ") must not exceed BBND/BNBD page size(", keyPage,
-                    ")");
+        TORCH_CHECK(poolBlockSize <= keyPage, "pool_block_size(", poolBlockSize,
+                    ") must not exceed BBND/BNBD page size(", keyPage, ")");
     }
-    const int64_t seqBlock = blockSize;
+    const int64_t seqBlock = poolBlockSize;
     const int64_t keySeqCap = (layoutKeyStr == "BSND") ? key.size(1) : (layoutKeyStr == "BNSD") ? key.size(2) : 0;
     MsaKeyMeta meta =
         seq_key ? ResolveTndKeyMeta(key, cu_q, kv_len, start_loc, init_blocks, local_blocks, seqBlock, keySeqCap) :
@@ -311,14 +310,14 @@ at::Tensor msa_index_score_v2(const at::Tensor& query, const at::Tensor& key,
         TORCH_CHECK(key.scalar_type() == query.scalar_type(), "BSND/BNSD key dtype must match query.");
     }
     // 块长 16（TND 16、BSND/BNSD、页长 16）做 head 间 max，N1 必须整除 128。
-    if (blockSize == BLOCK16_SIZE) {
+    if (poolBlockSize == BLOCK16_SIZE) {
         TORCH_CHECK(num_q_heads > 0 && (128 % num_q_heads) == 0,
-                    "block_size 16 requires num_q_heads to divide 128, got ", num_q_heads);
+                    "pool_block_size 16 requires num_q_heads to divide 128, got ", num_q_heads);
     }
     const int64_t score_stride = ((meta.maxBlocks + SCORE_STRIDE_ALIGN - 1) / SCORE_STRIDE_ALIGN) * SCORE_STRIDE_ALIGN;
     at::Tensor score = at::empty({num_q_heads, total_q, score_stride}, query.options().dtype(at::kFloat));
     ACLNN_CMD(aclnnMsaIndexScoreV2, query, key, block_table, scale, atten_mask, actual_seq_qlen, actual_seq_klen,
-              start_loc, layoutKeyStr, sparse_mode, init_blocks, local_blocks, layoutQueryStr, blockSize, score);
+              start_loc, layoutKeyStr, sparse_mode, init_blocks, local_blocks, layoutQueryStr, poolBlockSize, score);
     return score;
 }
 

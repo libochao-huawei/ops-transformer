@@ -25,27 +25,29 @@ BLOCK16_SIZE = 16
 PA_BLOCK_SIZE = 128
 
 
-def _resolve_block_size(layout: str, key: torch.Tensor, block_size: int) -> int:
-    """block_size 只允许 16 / 128，不做推导；BSND/BNSD 固定 16。
+def _resolve_pool_block_size(
+    layout: str, key: torch.Tensor, pool_block_size: int
+) -> int:
+    """pool_block_size 只允许 16 / 128，不做推导；BSND/BNSD 固定 16。
     存储页长（key 的页维度）与打分块长解耦，但打分块不能超过存储页容量。"""
-    block_size = int(block_size)
-    if block_size not in (BLOCK16_SIZE, PA_BLOCK_SIZE):
+    pool_block_size = int(pool_block_size)
+    if pool_block_size not in (BLOCK16_SIZE, PA_BLOCK_SIZE):
         raise ValueError(
-            f"block_size must be {BLOCK16_SIZE} or {PA_BLOCK_SIZE}, got {block_size}"
+            f"pool_block_size must be {BLOCK16_SIZE} or {PA_BLOCK_SIZE}, got {pool_block_size}"
         )
     if layout in ("BSND", "BNSD"):
-        if block_size != BLOCK16_SIZE:
+        if pool_block_size != BLOCK16_SIZE:
             raise ValueError(
-                f"BSND/BNSD requires block_size={BLOCK16_SIZE}, got {block_size}"
+                f"BSND/BNSD requires pool_block_size={BLOCK16_SIZE}, got {pool_block_size}"
             )
-        return block_size
+        return pool_block_size
     if layout not in SEQ_LAYOUT_KEYS:
         page = int(key.size(2) if layout == "BNBD" else key.size(1))
-        if block_size > page:
+        if pool_block_size > page:
             raise ValueError(
-                f"block_size({block_size}) must not exceed BBND/BNBD page size({page})"
+                f"pool_block_size({pool_block_size}) must not exceed BBND/BNBD page size({page})"
             )
-    return block_size
+    return pool_block_size
 
 
 def _round_up(value: int, align: int) -> int:
@@ -120,7 +122,7 @@ class MsaIndexScoreV2OpBuilder(OpBuilder):
             "Tensor? block_table=None, Tensor? scale=None, Tensor? atten_mask=None, "
             'Tensor? actual_seq_qlen=None, Tensor? actual_seq_klen=None, *, str layout_key="BBND", '
             'int sparse_mode=3, int init_blocks=0, int local_blocks=1, str layout_query="TND", '
-            "int block_size=128) -> Tensor"
+            "int pool_block_size=128) -> Tensor"
         )
 
     def register_meta(self):
@@ -140,7 +142,7 @@ class MsaIndexScoreV2OpBuilder(OpBuilder):
             init_blocks: int = DEFAULT_INIT_BLOCKS,
             local_blocks: int = DEFAULT_LOCAL_BLOCKS,
             layout_query: str = "TND",
-            block_size: int = 128,
+            pool_block_size: int = 128,
         ):
             layout_query = _normalize_layout_query(layout_query)
             torch._check(
@@ -171,7 +173,7 @@ class MsaIndexScoreV2OpBuilder(OpBuilder):
                     lambda: "layout_key=TND requires actual_seq_klen [B+1]",
                 )
                 pref = [int(v) for v in actual_seq_klen.tolist()]
-                blk = _resolve_block_size(layout, key, block_size)
+                blk = _resolve_pool_block_size(layout, key, pool_block_size)
                 max_blocks = 0
                 for i in range(len(pref) - 1):
                     kv = pref[i + 1] - pref[i]
@@ -216,11 +218,11 @@ def _msa_index_score_v2(
     init_blocks: int = DEFAULT_INIT_BLOCKS,
     local_blocks: int = DEFAULT_LOCAL_BLOCKS,
     layout_query: str = "TND",
-    block_size: int = 128,
+    pool_block_size: int = 128,
 ) -> torch.Tensor:
     layout = _normalize_layout_key(layout_key)
     layout_query = _normalize_layout_query(layout_query)
-    block_size = _resolve_block_size(layout, key, block_size)
+    pool_block_size = _resolve_pool_block_size(layout, key, pool_block_size)
     if layout == "BBND" and key.dim() == 3 and int(key.size(1)) == 128:
         key = key.unsqueeze(2)
     # C++ wrapper still follows aclnn order: optionals then start_loc.
@@ -238,7 +240,7 @@ def _msa_index_score_v2(
         init_blocks,
         local_blocks,
         layout_query,
-        block_size,
+        pool_block_size,
     )
 
 
@@ -257,7 +259,7 @@ def msa_index_score_v2(
     init_blocks: int = DEFAULT_INIT_BLOCKS,
     local_blocks: int = DEFAULT_LOCAL_BLOCKS,
     layout_query: str = "TND",
-    block_size: int = 128,
+    pool_block_size: int = 128,
 ) -> torch.Tensor:
     """MSA Index Branch block score，封装 aclnnMsaIndexScoreV2。
 
@@ -267,7 +269,8 @@ def msa_index_score_v2(
     TND ``[T2, N2, D]``、BSND ``[B, S2, N2, D]``、BNSD ``[B, N2, S2, D]``。
     query 由 ``layout_query`` 指定 TND / BSND / BNSD，默认 TND。非分页 key 必须与 query 相同；
     分页 key 可配任意 query。BSND、BNSD 仅 Ascend 950，逻辑块长 16，仅 fp16 / bf16。
-    ``block_size`` 为逻辑块长：缺省（0）按布局自动推导；显式值只允许 16 / 128。
+    ``pool_block_size`` 是每个 score 归约的 token 数，只允许 16 / 128，默认 128。
+    与 BBND / BNBD 的存储页长不是同一个量；分页时不能超过页长。
     128 走原单次块内 maxpool（TND 默认）；16 仅 Ascend 950、fp16 / bf16，
     先在每个 head 内对 block 取 max，再对每个 block 取 head 间 max，
     输出在 ``N1`` 维上是同一个值的复制，且 ``N1`` 必须整除 128。
@@ -285,7 +288,8 @@ def msa_index_score_v2(
         layout_key: ``TND`` / ``BSND`` / ``BNSD`` / ``BBND`` / ``BNBD``，默认 ``BBND``
         sparse_mode: 0 或 3
         init_blocks / local_blocks: local_mask 强制选块；与 Triton raw score 对齐时置 0
-        block_size: 逻辑块长，只允许 16 / 128。默认 128。BSND / BNSD 必须为 16；BBND / BNBD 不能超过物理页长。
+        pool_block_size: 打分池化块长，只允许 16 / 128，默认 128。BSND / BNSD 必须为 16；
+            BBND / BNBD 不能超过存储页长。
 
     Returns:
         ``[N1, T1, RoundUp(MB, 16)]`` float32
@@ -296,7 +300,7 @@ def msa_index_score_v2(
         raise ValueError(
             f"non-paged key layout must match layout_query, got query={layout_query} key={layout_key}"
         )
-    block_size = _resolve_block_size(layout_key, key, block_size)
+    pool_block_size = _resolve_pool_block_size(layout_key, key, pool_block_size)
     return torch.ops.cann_ops_transformer.msa_index_score_v2(
         query,
         key,
@@ -311,5 +315,5 @@ def msa_index_score_v2(
         init_blocks=init_blocks,
         local_blocks=local_blocks,
         layout_query=layout_query,
-        block_size=block_size,
+        pool_block_size=pool_block_size,
     )

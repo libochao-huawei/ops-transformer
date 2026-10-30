@@ -52,6 +52,7 @@
 - [moe_re_routing](../../moe/moe_re_routing_v2/docs/torchapi_moe_re_routing.md)
 - [moe_token_permute](../../moe/moe_token_permute/docs/torchapi_moe_token_permute.md)
 - [msa_index_score](../../attention/msa_index_score/docs/torchapi_msa_index_score.md)
+- [msa_index_score_v2](../../attention/msa_index_score/docs/torchapi_msa_index_score_v2.md)
 - [pool_key_indexer](../../attention/pool_key_indexer/docs/pool_key_indexer.md)
 - [qkv_rms_norm_rope_cache_with_k_scale](../../posembedding/qkv_rms_norm_rope_cache_with_k_scale/docs/torchapi_qkv_rms_norm_rope_cache_with_k_scale.md)
 - [quant_all_reduce](../../mc2/quant_all_reduce/docs/torchapi_quant_all_reduce.md)
