@@ -80,3 +80,68 @@ TEST_F(NsaCompressApiTest, invalid_input_and_weight_ranks)
         EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_INVALID);
     }
 }
+
+TEST_F(NsaCompressApiTest, null_actual_sequence_lengths)
+{
+    auto input = TensorDesc({64, 4, 32}, ACL_FLOAT16, ACL_FORMAT_ND);
+    auto weight = TensorDesc({32, 4}, ACL_FLOAT16, ACL_FORMAT_ND);
+    char layout[] = "TND";
+    auto output = TensorDesc({2, 4, 32}, ACL_FLOAT16, ACL_FORMAT_ND);
+    auto ut = OP_API_UT(aclnnNsaCompress, INPUT(input, weight, nullptr, layout, 32, 32, 0), OUTPUT(output));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_NULLPTR);
+}
+
+TEST_F(NsaCompressApiTest, matching_unsupported_dtypes)
+{
+    for (auto dtype : {ACL_FLOAT, ACL_INT32, ACL_DOUBLE}) {
+        SCOPED_TRACE(dtype);
+        auto input = TensorDesc({64, 4, 32}, dtype, ACL_FORMAT_ND);
+        auto weight = TensorDesc({32, 4}, dtype, ACL_FORMAT_ND);
+        IntArrayDesc actSeqLen(std::vector<int64_t>{64});
+        char layout[] = "TND";
+        auto output = TensorDesc({2, 4, 32}, dtype, ACL_FORMAT_ND);
+        auto ut = OP_API_UT(aclnnNsaCompress, INPUT(input, weight, actSeqLen, layout, 32, 32, 0), OUTPUT(output));
+        uint64_t workspaceSize = 0;
+        EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_INVALID);
+    }
+}
+
+TEST_F(NsaCompressApiTest, mismatched_supported_dtypes)
+{
+    for (size_t i = 0; i < 2; ++i) {
+        SCOPED_TRACE(i);
+        auto input = TensorDesc({64, 4, 32}, ACL_FLOAT16, ACL_FORMAT_ND);
+        auto weight = TensorDesc({32, 4}, i == 0 ? ACL_BF16 : ACL_FLOAT16, ACL_FORMAT_ND);
+        IntArrayDesc actSeqLen(std::vector<int64_t>{64});
+        char layout[] = "TND";
+        auto output = TensorDesc({2, 4, 32}, i == 1 ? ACL_BF16 : ACL_FLOAT16, ACL_FORMAT_ND);
+        auto ut = OP_API_UT(aclnnNsaCompress, INPUT(input, weight, actSeqLen, layout, 32, 32, 0), OUTPUT(output));
+        uint64_t workspaceSize = 0;
+        EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_INVALID);
+    }
+}
+
+TEST_F(NsaCompressApiTest, empty_actual_sequence_lengths)
+{
+    auto input = TensorDesc({64, 4, 32}, ACL_FLOAT16, ACL_FORMAT_ND);
+    auto weight = TensorDesc({32, 4}, ACL_FLOAT16, ACL_FORMAT_ND);
+    IntArrayDesc actSeqLen(std::vector<int64_t>{});
+    char layout[] = "TND";
+    auto output = TensorDesc({2, 4, 32}, ACL_FLOAT16, ACL_FORMAT_ND);
+    auto ut = OP_API_UT(aclnnNsaCompress, INPUT(input, weight, actSeqLen, layout, 32, 32, 0), OUTPUT(output));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_INVALID);
+}
+
+TEST_F(NsaCompressApiTest, valid_bf16)
+{
+    auto input = TensorDesc({64, 4, 32}, ACL_BF16, ACL_FORMAT_ND);
+    auto weight = TensorDesc({32, 4}, ACL_BF16, ACL_FORMAT_ND);
+    IntArrayDesc actSeqLen(std::vector<int64_t>{64});
+    char layout[] = "TND";
+    auto output = TensorDesc({2, 4, 32}, ACL_BF16, ACL_FORMAT_ND);
+    auto ut = OP_API_UT(aclnnNsaCompress, INPUT(input, weight, actSeqLen, layout, 32, 32, 0), OUTPUT(output));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_SUCCESS);
+}

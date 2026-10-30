@@ -38,6 +38,16 @@ void RunArch35BnsdTilingCase(int64_t s, int64_t s_kv, int64_t blockX, int64_t bl
     optiling::BlockSparseAttentionGradCompileInfo compileInfo;
     compileInfo.socVersion = platform_ascendc::SocVersion::ASCEND950;
 
+    // Arch35 NonZero tiling requires separate cube/vector core counts and vector register width.
+    const std::string socInfo = R"({
+        "hardware_info": {
+            "CORE_NUM": 36, "cube_core_cnt": 36, "vector_core_cnt": 72,
+            "UB_SIZE": 253952, "VECTOR_REG_WIDTH": 256,
+            "L2_SIZE": 33554432, "L1_SIZE": 524288,
+            "L0A_SIZE": 65536, "L0B_SIZE": 65536, "L0C_SIZE": 131072
+        }
+    })";
+
     int64_t b = 1, n = 4, n_kv = 2, d = 128;
     int64_t ceilQ = (s + blockX - 1) / blockX;
     int64_t ceilKv = (s_kv + blockY - 1) / blockY;
@@ -75,7 +85,7 @@ void RunArch35BnsdTilingCase(int64_t s, int64_t s_kv, int64_t blockX, int64_t bl
          {"scaleValue", Ops::Transformer::AnyValue::CreateFrom<float>(0.088388f)},
          {"preTokens", Ops::Transformer::AnyValue::CreateFrom<int64_t>(2147483647)},
          {"nextTokens", Ops::Transformer::AnyValue::CreateFrom<int64_t>(2147483647)}},
-        &compileInfo, "3510", 32, 262144);
+        &compileInfo, "3510", socInfo, 4096);
 
     constexpr uint64_t expectTilingKey = 1003UL; // FP16 BNSD on DAV_3510.
     ExecuteTestCase(tilingContextPara, expectedResult, expectTilingKey);

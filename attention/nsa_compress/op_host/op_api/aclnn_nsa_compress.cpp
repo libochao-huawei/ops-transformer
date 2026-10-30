@@ -10,6 +10,7 @@
 #include "aclnn_nsa_compress.h"
 
 #include <dlfcn.h>
+#include <initializer_list>
 #include <new>
 
 #include "aclnn_kernels/transdata.h"
@@ -62,12 +63,14 @@ struct CompressShapeInfo {
     int64_t actSeqLenType = 0;
 };
 
-static aclnnStatus CheckNsaCompressParam(const aclTensor* input, const aclTensor* weight, const aclTensor* output,
+static aclnnStatus CheckNsaCompressParam(const aclTensor* input, const aclTensor* weight,
+                                         const aclIntArray* actSeqLenOptional, const aclTensor* output,
                                          const uint64_t* workspaceSize, aclOpExecutor** const executor)
 {
     // 必须的参数指针判空
     CHECK_RET(input != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(weight != nullptr, ACLNN_ERR_PARAM_NULLPTR);
+    OP_CHECK_NULL(actSeqLenOptional, return ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(output != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(workspaceSize != nullptr, ACLNN_ERR_PARAM_NULLPTR);
     CHECK_RET(executor != nullptr, ACLNN_ERR_PARAM_NULLPTR);
@@ -76,6 +79,10 @@ static aclnnStatus CheckNsaCompressParam(const aclTensor* input, const aclTensor
 
 static aclnnStatus InputDtypeCheck(const aclTensor* input, const aclTensor* weight, const aclTensor* output)
 {
+    static const std::initializer_list<op::DataType> supportedDtypes = {op::DataType::DT_FLOAT16,
+                                                                        op::DataType::DT_BF16};
+    OP_CHECK_DTYPE_NOT_SUPPORT(input, supportedDtypes, return ACLNN_ERR_PARAM_INVALID);
+
     auto inputDtype = input->GetDataType();
     auto weightDtype = weight->GetDataType();
     auto outputDtype = output->GetDataType();
@@ -152,15 +159,15 @@ static aclnnStatus AnalysisAxis(const aclTensor* input, const aclTensor* weight,
 
 static aclnnStatus AnalysisInput(const aclTensor* input, const aclTensor* weight, char* layoutOptional,
                                  int64_t compressBlockSize, int64_t compressStride, int64_t actSeqLenType,
-                                 CompressShapeInfo& shapeInfo, const aclIntArray* actSeqLenOptional = nullptr)
+                                 CompressShapeInfo& shapeInfo, const aclIntArray* actSeqLenOptional)
 {
     // 从shape中取需要的值到shapeInfo
     CHECK_RET(
         AnalysisAxis(input, weight, layoutOptional, compressBlockSize, compressStride, shapeInfo) == ACLNN_SUCCESS,
         ACLNN_ERR_PARAM_INVALID);
 
-    if (actSeqLenOptional == nullptr || actSeqLenOptional->Size() == 0) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "actSeqLenOptional is not currently support null");
+    if (actSeqLenOptional->Size() == 0) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "actSeqLenOptional must contain at least one sequence length.");
         return ACLNN_ERR_PARAM_INVALID;
     }
 
@@ -179,7 +186,7 @@ aclnnStatus aclnnNsaCompressGetWorkspaceSize(const aclTensor* input, const aclTe
                                              aclTensor* output, uint64_t* workspaceSize, aclOpExecutor** executor)
 {
     // 检查入参
-    CHECK_RET(CheckNsaCompressParam(input, weight, output, workspaceSize, executor) == ACLNN_SUCCESS,
+    CHECK_RET(CheckNsaCompressParam(input, weight, actSeqLenOptional, output, workspaceSize, executor) == ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_NULLPTR);
     // L2接口阶段1
     L2_DFX_PHASE_1(

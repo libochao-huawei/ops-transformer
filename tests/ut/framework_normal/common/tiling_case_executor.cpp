@@ -289,6 +289,7 @@ static void GetPlatFormInfos(const char* compileInfoStr, map<string, string>& so
                                           {"l0_c_size", "L0C_SIZE"},
                                           {"l1_size", "L1_SIZE"},
                                           {"bt_size", "BT_SIZE"},
+                                          {"vector_reg_width", "VECTOR_REG_WIDTH"},
                                           {"load3d_constraints", "load3d_constraints"}};
     aicoreSpec["cube_freq"] = "cube_freq";
     for (auto& t : aicoreSpecKeys) {
