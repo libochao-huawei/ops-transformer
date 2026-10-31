@@ -45,6 +45,144 @@ TEST_P(flash_attention_score_tnd_head_num_ut, rejects_mismatched_query_head_num)
 // Include a multiple of the KV head count: divisibility alone cannot detect this error.
 INSTANTIATE_TEST_SUITE_P(query_n_is_four, flash_attention_score_tnd_head_num_ut, testing::Values(1, 2, 8));
 
+TEST(flash_attention_score_v1_op_api_ut, rejects_attention_out_dtype_mismatch)
+{
+    auto query = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto key = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto value = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto softmaxMax = TensorDesc({1, 2, 64, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto softmaxSum = TensorDesc({1, 2, 64, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto attentionOut = TensorDesc({1, 2, 64, 64}, ACL_FLOAT, ACL_FORMAT_ND);
+    char layout[] = "BNSD";
+
+    auto ut = OP_API_UT(aclnnFlashAttentionScore,
+                        INPUT(query, key, value, nullptr, nullptr, nullptr, nullptr, nullptr, 0.125, 1.0, INT32_MAX,
+                              INT32_MAX, 2, layout, 0, 0),
+                        OUTPUT(softmaxMax, softmaxSum, nullptr, attentionOut));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_INVALID);
+}
+
+TEST(flash_attention_score_v1_op_api_ut, rejects_pse_head_dim_not_equal_to_query_heads)
+{
+    auto query = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto key = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto value = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto pse = TensorDesc({1, 1, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND);
+    auto softmaxMax = TensorDesc({1, 2, 64, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto softmaxSum = TensorDesc({1, 2, 64, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto attentionOut = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND);
+    char layout[] = "BNSD";
+
+    auto ut = OP_API_UT(aclnnFlashAttentionScore,
+                        INPUT(query, key, value, pse, nullptr, nullptr, nullptr, nullptr, 0.125, 1.0, INT32_MAX,
+                              INT32_MAX, 2, layout, 0, 0),
+                        OUTPUT(softmaxMax, softmaxSum, nullptr, attentionOut));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_INVALID);
+}
+
+TEST(flash_attention_score_v1_op_api_ut, accepts_broadcast_pse_shape)
+{
+    auto query = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto key = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto value = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto pse = TensorDesc({1, 2, 1, 64}, ACL_FLOAT16, ACL_FORMAT_ND);
+    auto softmaxMax = TensorDesc({1, 2, 64, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto softmaxSum = TensorDesc({1, 2, 64, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto attentionOut = TensorDesc({1, 2, 64, 64}, ACL_FLOAT16, ACL_FORMAT_ND);
+    char layout[] = "BNSD";
+
+    auto ut = OP_API_UT(aclnnFlashAttentionScore,
+                        INPUT(query, key, value, pse, nullptr, nullptr, nullptr, nullptr, 0.125, 1.0, INT32_MAX,
+                              INT32_MAX, 2, layout, 0, 0),
+                        OUTPUT(softmaxMax, softmaxSum, nullptr, attentionOut));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_SUCCESS);
+}
+
+class flash_attention_score_compressed_mask_ut : public testing::TestWithParam<int64_t> {};
+
+TEST_P(flash_attention_score_compressed_mask_ut, rejects_compressed_mask_shape_mismatch)
+{
+    auto query = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto key = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto value = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto mask = TensorDesc({128, 128}, ACL_UINT8, ACL_FORMAT_ND).Value(vector<uint8_t>{0});
+    auto softmaxMax = TensorDesc({1, 2, 128, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto softmaxSum = TensorDesc({1, 2, 128, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto attentionOut = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND);
+    char layout[] = "BNSD";
+
+    auto ut = OP_API_UT(aclnnFlashAttentionScore,
+                        INPUT(query, key, value, nullptr, nullptr, nullptr, mask, nullptr, 0.125, 1.0, INT32_MAX,
+                              INT32_MAX, 2, layout, 0, GetParam()),
+                        OUTPUT(softmaxMax, softmaxSum, nullptr, attentionOut));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_INVALID);
+}
+
+INSTANTIATE_TEST_SUITE_P(compressed_modes, flash_attention_score_compressed_mask_ut, testing::Values(2, 3, 4));
+
+TEST(flash_attention_score_v1_op_api_ut, accepts_compressed_mask_shape)
+{
+    auto query = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto key = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto value = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto mask = TensorDesc({2048, 2048}, ACL_UINT8, ACL_FORMAT_ND).Value(vector<uint8_t>{0});
+    auto softmaxMax = TensorDesc({1, 2, 128, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto softmaxSum = TensorDesc({1, 2, 128, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto attentionOut = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND);
+    char layout[] = "BNSD";
+
+    auto ut = OP_API_UT(aclnnFlashAttentionScore,
+                        INPUT(query, key, value, nullptr, nullptr, nullptr, mask, nullptr, 0.125, 1.0, INT32_MAX,
+                              INT32_MAX, 2, layout, 0, 2),
+                        OUTPUT(softmaxMax, softmaxSum, nullptr, attentionOut));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_SUCCESS);
+}
+
+TEST(flash_attention_score_v1_op_api_ut, rejects_prefix_compress_mask_shape_mismatch)
+{
+    auto query = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto key = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto value = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto mask = TensorDesc({128, 128}, ACL_UINT8, ACL_FORMAT_ND).Value(vector<uint8_t>{0});
+    auto prefix = IntArrayDesc(vector<int64_t>{64});
+    auto softmaxMax = TensorDesc({1, 2, 128, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto softmaxSum = TensorDesc({1, 2, 128, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto attentionOut = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND);
+    char layout[] = "BNSD";
+
+    auto ut = OP_API_UT(aclnnFlashAttentionScore,
+                        INPUT(query, key, value, nullptr, nullptr, nullptr, mask, prefix, 0.125, 1.0, INT32_MAX,
+                              INT32_MAX, 2, layout, 0, 6),
+                        OUTPUT(softmaxMax, softmaxSum, nullptr, attentionOut));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_ERR_PARAM_INVALID);
+}
+
+TEST(flash_attention_score_v1_op_api_ut, accepts_prefix_compress_mask_shape)
+{
+    auto query = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto key = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto value = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-1, 1);
+    auto mask = TensorDesc({3072, 2048}, ACL_UINT8, ACL_FORMAT_ND).Value(vector<uint8_t>{0});
+    auto prefix = IntArrayDesc(vector<int64_t>{64});
+    auto softmaxMax = TensorDesc({1, 2, 128, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto softmaxSum = TensorDesc({1, 2, 128, 8}, ACL_FLOAT, ACL_FORMAT_ND);
+    auto attentionOut = TensorDesc({1, 2, 128, 64}, ACL_FLOAT16, ACL_FORMAT_ND);
+    char layout[] = "BNSD";
+
+    auto ut = OP_API_UT(aclnnFlashAttentionScore,
+                        INPUT(query, key, value, nullptr, nullptr, nullptr, mask, prefix, 0.125, 1.0, INT32_MAX,
+                              INT32_MAX, 2, layout, 0, 6),
+                        OUTPUT(softmaxMax, softmaxSum, nullptr, attentionOut));
+    uint64_t workspaceSize = 0;
+    EXPECT_EQ(ut.TestGetWorkspaceSize(&workspaceSize), ACLNN_SUCCESS);
+}
+
 class flash_attention_score_tnd_kv_head_num_ut : public testing::TestWithParam<int64_t> {};
 
 TEST_P(flash_attention_score_tnd_kv_head_num_ut, accepts_matching_query_head_num)

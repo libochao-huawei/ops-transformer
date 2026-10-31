@@ -38,6 +38,12 @@ static const uint64_t DIM_NUM_3 = 3;
 static const uint64_t DIM_NUM_2 = 2;
 static const int64_t HEAD_DIM_MAX = 768;
 static const int64_t PSE_TYPE_V1 = 1; // add and mul
+static const int64_t PSE_ALIBI_S_SIZE = 1024;
+static const int64_t ATTEN_MASK_COMPRESS_LIMIT = 2048L;
+static const int64_t ATTEN_MASK_COMPRESS_PREFIX_LIMIT = 3072L;
+static const int64_t SPARSE_LEFT_UP_CAUSAL = 2;
+static const int64_t SPARSE_BAND = 4;
+static const int64_t SPARSE_PREFIX_COMPRESS = 6;
 static const int64_t PSE_INNER_MUL_ADD = 2;
 static const int64_t PSE_INNER_MUL_ADD_SQRT = 3;
 static const int64_t HEAD_DIM_64 = 64;
@@ -694,6 +700,79 @@ static aclnnStatus AnalysisInput(const aclTensor* query, const aclTensor* key, c
     return ACLNN_SUCCESS;
 }
 
+static aclnnStatus CheckV1OptionalInputShape(const aclTensor* pse, const aclTensor* attenMask, int64_t sparseMode,
+                                             const FaShapeInfo& shapeInfo)
+{
+    if (shapeInfo.inputLayout == InputLayout::TND) {
+        return ACLNN_SUCCESS;
+    }
+
+    if (pse != nullptr && pse->GetViewShape().GetDimNum() != 0) {
+        const auto& pseShape = pse->GetViewShape();
+        bool shapeValid = pseShape.GetDimNum() == DIM_NUM_4;
+        if (shapeValid) {
+            bool batchValid = pseShape.GetDim(0) == 1 || pseShape.GetDim(0) == shapeInfo.axes.b;
+            bool s1Valid = pseShape.GetDim(2) == shapeInfo.axes.s1 || pseShape.GetDim(2) == 1 ||
+                           (pseShape.GetDim(2) == PSE_ALIBI_S_SIZE && shapeInfo.axes.s1 >= PSE_ALIBI_S_SIZE);
+            shapeValid = batchValid && pseShape.GetDim(1) == shapeInfo.axes.n1 && s1Valid &&
+                         pseShape.GetDim(3) == shapeInfo.axes.s2;
+        }
+        if (!shapeValid) {
+            std::string pseShapeMsg = "[";
+            for (size_t i = 0; i < pseShape.GetDimNum(); ++i) {
+                pseShapeMsg += (i == 0 ? "" : ", ") + std::to_string(pseShape.GetDim(i));
+            }
+            pseShapeMsg += "]";
+            OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(op::internal::GetLogApiInfo().c_str(), "pse", pseShapeMsg.c_str(),
+                                                  "The pse shape should be [B/N, Nq, S1, Skv], [B/N, Nq, 1, Skv], or "
+                                                  "[B/N, Nq, 1024, Skv] when S1 is at least 1024");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+    }
+
+    if (attenMask == nullptr || attenMask->GetViewShape().GetDimNum() == 0) {
+        return ACLNN_SUCCESS;
+    }
+
+    const auto& attenMaskShape = attenMask->GetViewShape();
+    const size_t dimNum = attenMaskShape.GetDimNum();
+    bool shapeValid = dimNum == DIM_NUM_2 || dimNum == DIM_NUM_4;
+    if (shapeValid) {
+        int64_t expectedS1 = shapeInfo.axes.s1;
+        int64_t expectedS2 = shapeInfo.axes.s2;
+        if (sparseMode >= SPARSE_LEFT_UP_CAUSAL && sparseMode <= SPARSE_BAND) {
+            expectedS1 = ATTEN_MASK_COMPRESS_LIMIT;
+            expectedS2 = ATTEN_MASK_COMPRESS_LIMIT;
+        } else if (sparseMode == SPARSE_PREFIX_COMPRESS) {
+            expectedS1 = ATTEN_MASK_COMPRESS_PREFIX_LIMIT;
+            expectedS2 = ATTEN_MASK_COMPRESS_LIMIT;
+        }
+        shapeValid = attenMaskShape.GetDim(dimNum - 2) == expectedS1 && attenMaskShape.GetDim(dimNum - 1) == expectedS2;
+    }
+    if (!shapeValid) {
+        int64_t expectedS1 = shapeInfo.axes.s1;
+        int64_t expectedS2 = shapeInfo.axes.s2;
+        if (sparseMode >= SPARSE_LEFT_UP_CAUSAL && sparseMode <= SPARSE_BAND) {
+            expectedS1 = ATTEN_MASK_COMPRESS_LIMIT;
+            expectedS2 = ATTEN_MASK_COMPRESS_LIMIT;
+        } else if (sparseMode == SPARSE_PREFIX_COMPRESS) {
+            expectedS1 = ATTEN_MASK_COMPRESS_PREFIX_LIMIT;
+            expectedS2 = ATTEN_MASK_COMPRESS_LIMIT;
+        }
+        std::string attenMaskShapeMsg = "[";
+        for (size_t i = 0; i < dimNum; ++i) {
+            attenMaskShapeMsg += (i == 0 ? "" : ", ") + std::to_string(attenMaskShape.GetDim(i));
+        }
+        attenMaskShapeMsg += "]";
+        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(
+            op::internal::GetLogApiInfo().c_str(), "attenMask", attenMaskShapeMsg.c_str(),
+            "The last two dims should be [" + std::to_string(expectedS1) + ", " + std::to_string(expectedS2) +
+                "] for sparseMode " + std::to_string(sparseMode));
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    return ACLNN_SUCCESS;
+}
+
 static inline const aclTensor* GeneratePaddings(int32_t dimNum, int32_t padNum, aclOpExecutor* executor)
 {
     // 2代表每根轴的前后都可以补0
@@ -1174,11 +1253,14 @@ aclnnStatus aclnnFlashAttentionScoreGetWorkspaceSize(
                         attenMaskOptional, sinkOptional, softmaxMaxOut, softmaxSumOut, attentionOutOut),
             ACLNN_ERR_PARAM_INVALID);
     }
+    CHECK_RET(InputOutputDtypeCheck(query, attentionOutOut) == ACLNN_SUCCESS, ACLNN_ERR_PARAM_INVALID);
     CHECK_RET(InputDtypeCheck(query, key, value, attentionOutOut, realShiftOptional, PSE_TYPE_V1, sinkOptional) ==
                   ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
     FaShapeInfo shapeInfo;
     CHECK_RET(AnalysisInput(query, key, value, inputLayout, headNum, shapeInfo) == ACLNN_SUCCESS,
+              ACLNN_ERR_PARAM_INVALID);
+    CHECK_RET(CheckV1OptionalInputShape(realShiftOptional, attenMaskOptional, sparseMode, shapeInfo) == ACLNN_SUCCESS,
               ACLNN_ERR_PARAM_INVALID);
 
     aclOpExecutor* l0Executor = uniqueExecutor.get();
