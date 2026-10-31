@@ -52,14 +52,14 @@
       <td>sin</td>
       <td>输入</td>
       <td>公式中的输入张量sin，shape为(MaxS, D)，MaxS指最大序列长度</td>
-      <td>FLOAT</td>
+      <td>BFLOAT16/HALF</td>
       <td>ND</td>
     </tr>
 	<tr>
       <td>cos</td>
       <td>输入</td>
-      <td>公式中的输入张量x，shape为(MaxS, D)，MaxS指最大序列长度</td>
-      <td>FLOAT</td>
+      <td>公式中的输入张量cos，shape为(MaxS, D)，MaxS指最大序列长度</td>
+      <td>BFLOAT16/HALF</td>
       <td>ND</td>
     </tr>
 	<tr>
@@ -80,7 +80,7 @@
 
 ## 约束说明
 
-- x/y仅支持BFLOAT16/HALF类型。
+- in/out仅支持BFLOAT16/HALF类型。
 - stride >= head_dim。
 
 ## 调用说明
