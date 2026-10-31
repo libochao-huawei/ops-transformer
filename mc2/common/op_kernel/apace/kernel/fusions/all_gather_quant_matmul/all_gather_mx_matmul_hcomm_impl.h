@@ -109,9 +109,32 @@ public:
                                 GM_ADDR cGM, GM_ADDR gatherOut, GM_ADDR workspaceGM);
     __aicore__ inline void Run();
 
+    // Layout 定义
+    using LayoutA = asc::te::nd_ext_layout_ptn;
+    // MX 场景恒为转置, HiF4 场景转置/非转置均支持
+    using LayoutB = AscendC::Std::conditional_t<TransB, asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn>;
+    using LayoutC = asc::te::nd_ext_layout_ptn;
+    using ProblemShape = asc::te::shape<int64_t, int64_t, int64_t, int64_t>;
+
+    // 组件定义
+    using BlockMmadFrag = Blaze::Gemm::Block::QmmMxBlockMmadFragment<0, false, AType, LayoutA, BType, LayoutB, CType,
+                                                                     LayoutC, float, LayoutC>;
+    // Reuse MXFP4's B4 scheduler geometry for HiFP4; MMAD keeps the real type.
+#if APACE_HIF4_TYPE_SUPPORTED
+    using SchedulerAType =
+        AscendC::Std::conditional_t<AscendC::IsSameType<AType, hifloat4x2_t>::value, fp4x2_e2m1_t, AType>;
+#else
+    using SchedulerAType = AType;
+#endif
+    using BlockScheduler =
+        Blaze::Gemm::Block::BlockSchedulerQuantBatchMatmulV3<ProblemShape, 0, LayoutA, LayoutB, SchedulerAType>;
     using QuantMatmulKernelImpl =
-        AllGatherQbmmMxKernel<AType, BType, CType, HcommCommWaitPolicy<ServerType>, false, TransB>;
-    using KernelParams = typename QuantMatmulKernelImpl::Params;
+        AllGatherQbmmMxKernel<BlockMmadFrag, BlockScheduler, HcommCommWaitPolicy<ServerType>, false>;
+
+    // 参数类型
+    using Params = typename QuantMatmulKernelImpl::Params;
+    using BlockSchedulerParams = typename QuantMatmulKernelImpl::BlockSchedulerParams;
+    using FragL1Params = typename QuantMatmulKernelImpl::FragL1Params;
 
     QuantMatmulKernelImpl quantMatmulKernelImpl_;
     HcommCommState<ServerType> commState_;
@@ -120,7 +143,7 @@ public:
 private:
     __aicore__ inline void InitBaseParams();
     __aicore__ inline void CommitAllGather();
-    __aicore__ inline void SetupKernelParams(KernelParams& params);
+    __aicore__ inline void SetupKernelParams(Params& params);
 
     Apace::hcommAllGatherMatmulTilingData* tilingData_;
 
@@ -273,12 +296,15 @@ AllGatherMxQuantMatmulHcommImpl<AType, BType, CType, ServerType, IsMxFp4, TransB
 }
 
 template <typename AType, typename BType, typename CType, AscendC::HcclServerType ServerType, bool IsMxFp4, bool TransB>
-__aicore__ inline void AllGatherMxQuantMatmulHcommImpl<AType, BType, CType, ServerType, IsMxFp4,
-                                                       TransB>::SetupKernelParams(KernelParams& params)
+__aicore__ inline void
+AllGatherMxQuantMatmulHcommImpl<AType, BType, CType, ServerType, IsMxFp4, TransB>::SetupKernelParams(Params& params)
 {
-    params.mmTile = &(tilingData_->mmTile);
-    params.qbmmParams = {tilingData_->mmTile.baseM, tilingData_->mmTile.baseN, tilingData_->mmTile.baseK,
-                         tilingData_->mmTile.dbL0c};
+    const auto& mmT = tilingData_->mmTile;
+    params.schParams = BlockSchedulerParams{
+        mmT.baseM,     mmT.baseN,    mmT.mTailTile, mmT.nTailTile, mmT.mBaseTailSplitCnt, mmT.nBaseTailSplitCnt,
+        mmT.mTailMain, mmT.nTailMain};
+    params.qbmmParams = {mmT.baseM, mmT.baseN, mmT.baseK, mmT.dbL0c};
+    params.l1Params = FragL1Params{static_cast<uint64_t>(mmT.stepK) * mmT.baseK, mmT.scaleKL1, mmT.nBufferNum};
     params.fragParams = {tileCnt_,
                          tileM_,
                          tailCnt_,
@@ -292,13 +318,7 @@ __aicore__ inline void AllGatherMxQuantMatmulHcommImpl<AType, BType, CType, Serv
                          static_cast<uint64_t>(k_),
                          static_cast<uint64_t>(n_),
                          scaleKLen_};
-    params.aGM = aGM_;
-    params.aScaleGM = aScaleGM_;
-    params.bGM = bGM_;
-    params.bScaleGM = bScaleGM_;
-    params.biasGM = biasGM_;
-    params.isBias = (biasGM_ != nullptr); // bias optional 输入缺失时框架传 nullptr（同 gatherOut 判空惯例）
-    params.cGM = cGM_;
+    params.mmadParams = {aGM_, bGM_, cGM_, biasGM_, aScaleGM_, bScaleGM_};
     params.winDataBase = gatherDataAddr_;
     params.winScaleBase = gatherScaleAddr_;
     params.dataBytesPerMRow = dataBytesPerMRow_;
@@ -309,7 +329,7 @@ __aicore__ inline void AllGatherMxQuantMatmulHcommImpl<AType, BType, CType, Serv
 template <typename AType, typename BType, typename CType, AscendC::HcclServerType ServerType, bool IsMxFp4, bool TransB>
 __aicore__ inline void AllGatherMxQuantMatmulHcommImpl<AType, BType, CType, ServerType, IsMxFp4, TransB>::Run()
 {
-    KernelParams params;
+    Params params;
     SetupKernelParams(params);
     quantMatmulKernelImpl_(params, opStateDump_);
     AscendC::CrossCoreSetFlag<0, PIPE_FIX>(3);

@@ -40,17 +40,16 @@
 #include "apace/basic/fragment_tensor/fragment_tensor.h"
 #include "apace/basic/fragment_tensor/fragment_tensor_api.h"
 #include "apace/basic/buffer/buffer_channel.h"
-#include "apace/tiling/matmul_tiling/quant_matmul_tiling_data.h"
 #include "../../../utils/op_state_dump.h"
 
 namespace Apace {
 
 using namespace AscendC;
 
-using LayoutA = asc::te::nd_ext_layout_ptn;
-using LayoutB = asc::te::dn_ext_layout_ptn;
-using LayoutC = asc::te::nd_ext_layout_ptn;
-using ProblemShape = asc::te::shape<int64_t, int64_t, int64_t, int64_t>;
+#define ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS \
+    template <class BlockMmadFrag, class BlockScheduler, class BufferSyncManager, bool enableBufferReuse>
+
+#define ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS BlockMmadFrag, BlockScheduler, BufferSyncManager, enableBufferReuse
 
 enum RegionTag {
     HEAD,
@@ -65,36 +64,28 @@ enum RegionTag {
  * enableBufferReuse=true（urma）：win 区 remote 紧凑 + data 槽回绕复用，A/scaleA 连续读，
  *   消费后 Release 通知写端可覆盖；false（hcomm）：保持 rank-major 全量 frag 读。
  */
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
+template <class BlockMmadFrag, class BlockScheduler, class BufferSyncManager, bool enableBufferReuse>
 class AllGatherQbmmMxKernel {
 public:
     __aicore__ inline AllGatherQbmmMxKernel() {}
     __aicore__ inline ~AllGatherQbmmMxKernel() {}
 
-    // ---- B layout: TransB -> DN (x2 [N,K]), non-TransB -> ND (x2 [K,N]) ----
-    static constexpr bool transB = TransB;
-    using LayoutB = AscendC::Std::conditional_t<TransB, asc::te::dn_ext_layout_ptn, asc::te::nd_ext_layout_ptn>;
-
     // ---- Component types ----
-    using DispatchPolicy = Blaze::Gemm::MatmulWithScaleMx<0, 0>;
-    using BlockEpilogue = Blaze::Gemm::Block::BlockEpilogueEmpty;
-    // Reuse MXFP4's B4 scheduler geometry for HiFP4; MMAD keeps the real type.
-#if APACE_HIF4_TYPE_SUPPORTED
-    using SchedulerAType =
-        AscendC::Std::conditional_t<AscendC::IsSameType<AType, hifloat4x2_t>::value, fp4x2_e2m1_t, AType>;
-#else
-    using SchedulerAType = AType;
-#endif
-    using BlockScheduler =
-        Blaze::Gemm::Block::BlockSchedulerQuantBatchMatmulV3<ProblemShape, 0, LayoutA, LayoutB, SchedulerAType>;
-    using BlockMmad =
-        Blaze::Gemm::Block::BlockMmad<DispatchPolicy, AType, LayoutA, BType, LayoutB, CType, LayoutC, float, LayoutC>;
-    using BlockMmadParams = typename BlockMmad::Params;
-    using L1Params = typename BlockMmad::L1Params;
+    using FragL1Params = typename BlockMmadFrag::L1Params;
+    using BlockMmadParams = typename BlockMmadFrag::Params;
+    using AType = typename BlockMmadFrag::AType;
+    using BType = typename BlockMmadFrag::BType;
+    using CType = typename BlockMmadFrag::CType;
+    using BiasType = typename BlockMmadFrag::BiasType;
     using BlockSchedulerParams = typename BlockScheduler::Params;
+    using BlockShape = typename BlockMmadFrag::BlockShape;
+    using BlockCoord = asc::te::coord<int64_t, int64_t, int64_t, int64_t>;
+    using LayoutA = typename BlockMmadFrag::LayoutA;
+    using LayoutB = typename BlockMmadFrag::LayoutB;
+    using LayoutC = typename BlockMmadFrag::LayoutC;
+    using ProblemShape = typename BlockMmadFrag::ProblemShape;
+    static constexpr bool transB = BlockMmadFrag::transB;
 
-    // ---- Compile-time constants ----
 #if APACE_HIF4_TYPE_SUPPORTED
     static constexpr bool IS_HIF4 = AscendC::IsSameType<AType, hifloat4x2_t>::value;
     using ScaleType = AscendC::Std::conditional_t<IS_HIF4, AscendC::hif4_scale, AscendC::fp8_e8m0_t>;
@@ -102,27 +93,23 @@ public:
     static constexpr bool IS_HIF4 = false;
     using ScaleType = AscendC::fp8_e8m0_t;
 #endif
-    static constexpr int64_t kC0Size =
+
+    // ---- Compile-time constants ----
+    static constexpr bool weightNz = BlockMmadFrag::weightNz;
+    static constexpr int64_t C0_SIZE =
         (IS_HIF4 || Blaze::Gemm::IsFp4<AType>()) ? Blaze::Gemm::C0_SIZE_B4 : Blaze::Gemm::C0_SIZE_B8;
-    static constexpr int64_t kCacheLineAlignMask = (IS_HIF4 || Blaze::Gemm::IsFp4<AType>()) ? 0xff : 0x7f;
+    static constexpr int64_t kCacheLineAlignMask = (IS_HIF4 || Blaze::Gemm::IsFp4<AType>()) ? 0xffUL : 0x7fUL;
     static constexpr int32_t kScaleC0 = IS_HIF4 ? 1 : 2;
     static constexpr uint32_t DIMS_NUM = 2UL;
 
     // ---- Layout factories ----
-    using MakeLayoutA = asc::te::frame_layout_format<LayoutA, AscendC::Std::Int<kC0Size>>;
+    using MakeLayoutA = asc::te::frame_layout_format<LayoutA, AscendC::Std::Int<C0_SIZE>>;
     using MakeLayoutScaleA = asc::te::frame_layout_format<asc::te::scalea_nd_layout_ptn, AscendC::Std::Int<kScaleC0>>;
-    using MakeLayoutB = asc::te::frame_layout_format<LayoutB, AscendC::Std::Int<kC0Size>>;
+    using MakeLayoutB = asc::te::frame_layout_format<LayoutB, AscendC::Std::Int<C0_SIZE>>;
     using MakeLayoutScaleB = AscendC::Std::conditional_t<
-        TransB, asc::te::frame_layout_format<asc::te::scaleb_dn_layout_ptn, AscendC::Std::Int<kScaleC0>>,
+        transB, asc::te::frame_layout_format<asc::te::scaleb_dn_layout_ptn, AscendC::Std::Int<kScaleC0>>,
         asc::te::frame_layout_format<asc::te::scaleb_nd_layout_ptn, AscendC::Std::Int<kScaleC0>>>;
     using MakeLayoutC = asc::te::frame_layout_format<LayoutC, AscendC::Std::Int<asc::te::c0_element<CType>>>;
-
-    // ---- Fragment MMAD types ----
-    using BlockMmadFragC = Blaze::Gemm::Block::QmmMxBlockMmadFragment<0, false, AType, LayoutA, BType, LayoutB, CType,
-                                                                      LayoutC, float, LayoutC>;
-    static constexpr bool weightNz = BlockMmadFragC::weightNz;
-    using FragL1Params = typename BlockMmadFragC::L1Params;
-    using FragBlockShape = typename BlockMmadFragC::BlockShape;
 
     // ---- FragmentTensor types ----
     using FragTensorA = Apace::Basic::FragmentTensor<DIMS_NUM, Apace::Basic::MAX_FRAGMENT_COUNT, MakeLayoutA, AType>;
@@ -163,18 +150,11 @@ public:
      * @brief 顶层参数结构
      */
     struct Params {
-        const QuantMatmulTilingData* mmTile{nullptr};
-        QBMMTiling qbmmParams;
         FragmentParams fragParams;
-
-        // GM pointers
-        GM_ADDR aGM{nullptr};
-        GM_ADDR aScaleGM{nullptr};
-        GM_ADDR bGM{nullptr};
-        GM_ADDR bScaleGM{nullptr};
-        GM_ADDR cGM{nullptr};
-        GM_ADDR biasGM{nullptr};
-        bool isBias{false};
+        BlockMmadParams mmadParams;
+        BlockSchedulerParams schParams;
+        FragL1Params l1Params;
+        QBMMTiling qbmmParams;
 
         // Win buffer base addresses (computed by communication layer)
         GM_ADDR winDataBase{nullptr};
@@ -207,7 +187,16 @@ public:
 private:
     __aicore__ inline void Init(const Params& params);
     __aicore__ inline void Process(const Params& params, const ProblemShape& problemShape, BlockScheduler& bs,
-                                   BlockMmadFragC& mmadFrag, Mc2Kernel::OpStateDump& opStateDump);
+                                   BlockMmadFrag& mmadFrag, Mc2Kernel::OpStateDump& opStateDump);
+
+    // 读端仅经 GetNextSlot 推进游标，data 槽回绕复用、scale 槽恒全量。
+    // 循环内：等待 tile 依赖的 round；reuse 按 0-based round（dependTileIdx-1），更新 slot 偏移。
+    __aicore__ inline void WaitDependTiles(int32_t dependTileIdx, int32_t commTurnI, int32_t& readyTileIdx,
+                                           uint64_t& dataSlotOffset, uint64_t& scaleSlotOffset,
+                                           Mc2Kernel::OpStateDump& opStateDump);
+    // 收尾兜底：排空剩余 round 的 flag；不写偏移、不推进 scale 游标。
+    __aicore__ inline void DrainWaitTiles(int32_t commTurnI, int32_t& readyTileIdx,
+                                          Mc2Kernel::OpStateDump& opStateDump);
 
     // ---- L2 cache optimization ----
     template <typename TensorB, typename TensorScaleB>
@@ -232,10 +221,18 @@ private:
         const FragTensorA* fragA;
         const FragScaleA* fragScaleA;
         const FragTensorC* fragC;
-        uint64_t rankCnt;
     };
     __aicore__ inline TileCtx ResolveTileCtx(int64_t mPos, int64_t headMainRows, int64_t mainRoundRows,
-                                             int64_t mainSectionRows, uint32_t rankSize, uint32_t commTurn) const;
+                                             int64_t mainSectionRows, uint32_t commTurn) const;
+
+    // ---- Per-tile 计算 ----
+    template <typename GmTensorA, typename GmTensorScaleA, typename GmTensorB, typename GmTensorScaleB,
+              typename GmTensorBias>
+    __aicore__ inline void ProcessOneBlock(BlockMmadFrag& mmadFrag, const GmTensorA& gmA,
+                                           const GmTensorScaleA& gmScaleA, const GmTensorB& gmB,
+                                           const GmTensorScaleB& gmScaleB, const GmTensorBias& gmBias,
+                                           const TileCtx& ctx, const BlockShape& singleShape, int64_t nPos,
+                                           int64_t baseM, int64_t baseN, int64_t K, int64_t scaleKLen);
 
     // ---- GM addresses ----
     __gm__ AType* aGmAddr_{nullptr};
@@ -246,31 +243,23 @@ private:
     __gm__ float* biasGmAddr_{nullptr};
 
     // ---- FragmentTensor state ----
-    FragTensorA headFragA_{};
-    FragScaleA headFragScaleA_{};
-    FragTensorC headFragC_{};
-    FragTensorA curMainA_{};
-    FragScaleA curMainScaleA_{};
-    FragTensorC curMainC_{};
-    FragTensorA tailFragA_{};
-    FragScaleA tailFragScaleA_{};
-    FragTensorC tailFragC_{};
+    static constexpr uint32_t MAX_FRAG = Apace::Basic::MAX_FRAGMENT_COUNT;
+    struct FragStreams {
+        FragTensorA a{};
+        FragScaleA scaleA{};
+        FragTensorC c{};
+        GM_ADDR addrListA[MAX_FRAG]{};
+        GM_ADDR addrListScaleA[MAX_FRAG]{};
+        GM_ADDR addrListC[MAX_FRAG]{};
+    };
+    FragStreams headFrag_{};
+    FragStreams curMainFrag_{};
+    FragStreams tailFrag_{};
 
     static constexpr uint32_t MAX_RANK_SIZE = 16U; // 与 tiling rank_size 上限一致
     GM_ADDR cFragAddrs_[MAX_RANK_SIZE]{};
     GM_ADDR winDataRankBase_[MAX_RANK_SIZE]{};
     GM_ADDR winScaleRankBase_[MAX_RANK_SIZE]{};
-
-    static constexpr uint32_t MAX_FRAG = Apace::Basic::MAX_FRAGMENT_COUNT;
-    GM_ADDR headAddrListA_[MAX_FRAG]{};
-    GM_ADDR headAddrListScale_[MAX_FRAG]{};
-    GM_ADDR headAddrListC_[MAX_FRAG]{};
-    GM_ADDR mainAddrListA_[MAX_FRAG]{};
-    GM_ADDR mainAddrListScale_[MAX_FRAG]{};
-    GM_ADDR mainAddrListC_[MAX_FRAG]{};
-    GM_ADDR tailAddrListA_[MAX_FRAG]{};
-    GM_ADDR tailAddrListScale_[MAX_FRAG]{};
-    GM_ADDR tailAddrListC_[MAX_FRAG]{};
 
     BufferSyncManager bufferSyncMgr_;
     Apace::Basic::BufferChannel* dataChannel_{nullptr};
@@ -288,28 +277,27 @@ private:
     uint64_t tileMCStride_{};
 };
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse, TransB>::Init(
-    const Params& params)
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::Init(const Params& params)
 {
     if ASCEND_IS_AIV {
         return;
     }
-    aGmAddr_ = reinterpret_cast<__gm__ AType*>(params.aGM);
-    bGmAddr_ = reinterpret_cast<__gm__ BType*>(params.bGM);
-    cGmAddr_ = reinterpret_cast<__gm__ CType*>(params.cGM);
-    scaleAGmAddr_ = reinterpret_cast<__gm__ ScaleType*>(params.aScaleGM);
-    scaleBGmAddr_ = reinterpret_cast<__gm__ ScaleType*>(params.bScaleGM);
-    biasGmAddr_ = reinterpret_cast<__gm__ float*>(params.biasGM);
+    aGmAddr_ = reinterpret_cast<__gm__ AType*>(params.mmadParams.aGmAddr);
+    bGmAddr_ = reinterpret_cast<__gm__ BType*>(params.mmadParams.bGmAddr);
+    cGmAddr_ = reinterpret_cast<__gm__ CType*>(params.mmadParams.cGmAddr);
+    scaleAGmAddr_ = reinterpret_cast<__gm__ ScaleType*>(params.mmadParams.scaleAGmAddr);
+    scaleBGmAddr_ = reinterpret_cast<__gm__ ScaleType*>(params.mmadParams.scaleBGmAddr);
+    biasGmAddr_ = reinterpret_cast<__gm__ float*>(params.mmadParams.biasGmAddr);
+    tileMDataStride_ = static_cast<uint64_t>(params.fragParams.tileM) * params.dataBytesPerMRow;
+    tileMScaleStride_ = static_cast<uint64_t>(params.fragParams.tileM) * params.scaleBytesPerMRow;
+    tileMCStride_ = static_cast<uint64_t>(params.fragParams.tileM) * params.cBytesPerM;
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
 template <typename TensorB, typename TensorScaleB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse,
-                                             TransB>::SetL2Cache(const ProblemShape& problemShape, int64_t baseM,
-                                                                 int64_t baseN, TensorB& gmB, TensorScaleB& gmScaleB)
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::SetL2Cache(
+    const ProblemShape& problemShape, int64_t baseM, int64_t baseN, TensorB& gmB, TensorScaleB& gmScaleB)
 {
     const bool fullMBlock = (baseM >= asc::te::get<Blaze::Gemm::MNK_M>(problemShape));
 
@@ -352,46 +340,51 @@ __aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncMana
     }
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse, TransB>::Run(
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+template <typename GmTensorA, typename GmTensorScaleA, typename GmTensorB, typename GmTensorScaleB,
+          typename GmTensorBias>
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::ProcessOneBlock(
+    BlockMmadFrag& mmadFrag, const GmTensorA& gmA, const GmTensorScaleA& gmScaleA, const GmTensorB& gmB,
+    const GmTensorScaleB& gmScaleB, const GmTensorBias& gmBias, const TileCtx& ctx, const BlockShape& singleShape,
+    int64_t nPos, int64_t baseM, int64_t baseN, int64_t K, int64_t scaleKLen)
+{
+    auto gmBlockB = gmB.slice(asc::te::make_coord(0L, nPos), asc::te::make_shape(K, baseN));
+    auto gmBlockScaleB = gmScaleB.slice(asc::te::make_coord(0L, nPos), asc::te::make_shape(scaleKLen, baseN));
+    auto gmBlockBias = gmBias.slice(asc::te::make_coord(0L, nPos), asc::te::make_shape(1L, baseN));
+    auto blockA = gmA.slice(asc::te::make_coord(ctx.regionMPos, 0L), asc::te::make_shape(baseM, K));
+    auto blockScaleA = gmScaleA.slice(asc::te::make_coord(ctx.regionMPos, 0L), asc::te::make_shape(baseM, scaleKLen));
+    auto blockC = ctx.fragC->slice(asc::te::make_coord(ctx.regionMPos, nPos), asc::te::make_shape(baseM, baseN));
+    mmadFrag(blockA, gmBlockB, blockScaleA, gmBlockScaleB, gmBlockBias, blockC, singleShape);
+}
+
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::Run(
     const Params& params, Mc2Kernel::OpStateDump& opStateDump)
 {
     Init(params);
 
-    const auto& mmT = *params.mmTile;
-    const auto& fp = params.fragParams;
-    const int64_t Ki = static_cast<int64_t>(fp.k);
-    const int64_t Ni = static_cast<int64_t>(fp.n);
-    const int64_t scaleKLen = static_cast<int64_t>(fp.scaleKLen);
+    const auto& fragParams = params.fragParams;
+    const auto& qbmmParams = params.qbmmParams;
+    const int64_t K = static_cast<int64_t>(fragParams.k);
+    const int64_t N = static_cast<int64_t>(fragParams.n);
 
     // 总 logical M = head + main 段 + tail。
-    bool hasTail = (fp.tailCnt > 0 && fp.tailM > 0);
-    const int64_t headMainRows = static_cast<int64_t>(fp.headRows);
-    const int64_t mainRoundRows = static_cast<int64_t>(fp.rankSize - 1) * static_cast<int64_t>(fp.tileM);
-    const int64_t mainSectionRows = static_cast<int64_t>(fp.tileCnt) * mainRoundRows;
-    const int64_t tailRows = hasTail ? static_cast<int64_t>(fp.rankSize) * static_cast<int64_t>(fp.paddedTailM) : 0;
+    bool hasTail = (fragParams.tailCnt > 0 && fragParams.tailM > 0);
+    const int64_t headMainRows = static_cast<int64_t>(fragParams.headRows);
+    const int64_t mainRoundRows =
+        static_cast<int64_t>(fragParams.rankSize - 1) * static_cast<int64_t>(fragParams.tileM);
+    const int64_t mainSectionRows = static_cast<int64_t>(fragParams.tileCnt) * mainRoundRows;
+    const int64_t tailRows =
+        hasTail ? static_cast<int64_t>(fragParams.rankSize) * static_cast<int64_t>(fragParams.paddedTailM) : 0;
     const int64_t totalLogicalM = headMainRows + mainSectionRows + tailRows;
 
-    // 调度器参数
-    BlockSchedulerParams schParams;
-    schParams.baseM = mmT.baseM;
-    schParams.baseN = mmT.baseN;
-    schParams.mTailTile = mmT.mTailTile;
-    schParams.nTailTile = mmT.nTailTile;
-    schParams.mBaseTailSplitCnt = mmT.mBaseTailSplitCnt;
-    schParams.nBaseTailSplitCnt = mmT.nBaseTailSplitCnt;
-    schParams.mTailMain = mmT.mTailMain;
-    schParams.nTailMain = mmT.nTailMain;
-
-    FragBlockShape l0TileShape{static_cast<int64_t>(mmT.baseM), static_cast<int64_t>(mmT.baseN),
-                               static_cast<int64_t>(mmT.baseK), 0L};
-    FragL1Params fragL1{static_cast<uint64_t>(mmT.stepK) * mmT.baseK, mmT.scaleKL1, mmT.nBufferNum};
-
-    ProblemShape problemShape{totalLogicalM, Ni, Ki, 1};
-    BlockScheduler sch(problemShape, schParams);
-    BlockMmadFragC mmadFrag;
-    mmadFrag.Init(problemShape, l0TileShape, fragL1, params.isBias, mmT.dbL0c > 1);
+    ProblemShape problemShape{totalLogicalM, N, K, 1};
+    BlockScheduler sch(problemShape, params.schParams);
+    const BlockShape l0TileShape{static_cast<int64_t>(qbmmParams.baseM), static_cast<int64_t>(qbmmParams.baseN),
+                                 static_cast<int64_t>(qbmmParams.baseK), 0L};
+    BlockMmadFrag mmadFrag;
+    bool isBias = biasGmAddr_ != nullptr;
+    mmadFrag.Init(problemShape, l0TileShape, params.l1Params, isBias, qbmmParams.dbL0C > 1);
 
     // 延迟构建 fragment tensor（head 先建，main/tail 在 Process 中按需建）
     BuildFragmentTensors(params);
@@ -399,45 +392,33 @@ __aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncMana
     Process(params, problemShape, sch, mmadFrag, opStateDump);
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse,
-                                             TransB>::Process(const Params& params, const ProblemShape& problemShape,
-                                                              BlockScheduler& sch, BlockMmadFragC& mmadFrag,
-                                                              Mc2Kernel::OpStateDump& opStateDump)
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::Process(
+    const Params& params, const ProblemShape& problemShape, BlockScheduler& sch, BlockMmadFrag& mmadFrag,
+    Mc2Kernel::OpStateDump& opStateDump)
 {
-    const auto& mmT = *params.mmTile;
-    const auto& fp = params.fragParams;
-    const int64_t Ki = static_cast<int64_t>(fp.k);
-    const int64_t Ni = static_cast<int64_t>(fp.n);
-    const int64_t scaleKLen = static_cast<int64_t>(fp.scaleKLen);
+    const auto& fragParams = params.fragParams;
+    const int64_t K = static_cast<int64_t>(fragParams.k);
+    const int64_t N = static_cast<int64_t>(fragParams.n);
+    const int64_t scaleKLen = static_cast<int64_t>(fragParams.scaleKLen);
 
-    const int64_t headMainRows = static_cast<int64_t>(fp.headRows);
-    const int64_t mainRoundRows = static_cast<int64_t>(fp.rankSize - 1) * static_cast<int64_t>(fp.tileM);
-    const int64_t mainSectionRows = static_cast<int64_t>(fp.tileCnt) * mainRoundRows;
+    const int64_t headMainRows = static_cast<int64_t>(fragParams.headRows);
+    const int64_t mainRoundRows =
+        static_cast<int64_t>(fragParams.rankSize - 1) * static_cast<int64_t>(fragParams.tileM);
+    const int64_t mainSectionRows = static_cast<int64_t>(fragParams.tileCnt) * mainRoundRows;
 
     // B / scaleB / bias 全局共享 tensor
-    auto gmB = asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::gm>(bGmAddr_), MakeLayoutB{}(Ki, Ni));
+    auto gmB = asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::gm>(bGmAddr_), MakeLayoutB{}(K, N));
     auto gmScaleB = asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::gm>(scaleBGmAddr_),
-                                         MakeLayoutScaleB{}(scaleKLen, Ni));
-    __gm__ float* biasNull = nullptr;
-    __gm__ float* biasPtr = params.isBias ? biasGmAddr_ : biasNull;
-    auto gmBias = asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::gm>(biasPtr),
-                                       asc::te::make_frame_layout<asc::te::nd_ext_layout_ptn>(1L, Ni));
+                                         MakeLayoutScaleB{}(scaleKLen, N));
+    auto gmBias = asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::gm>(biasGmAddr_),
+                                       asc::te::make_frame_layout<asc::te::nd_ext_layout_ptn>(1L, N));
 
-    const auto& mTailTile = mmT.mTailTile;
-    const auto& nTailTile = mmT.nTailTile;
+    const auto& mTailTile = params.schParams.mTailTile;
+    const auto& nTailTile = params.schParams.nTailTile;
     // 尾块拆分：需核数(尾块数×M拆分×N拆分)≤总核数才拆分；mTailTile=nTailTile=1时等价no-op。
     if ((sch.GetEndBlockIdx() + 1) * mTailTile * nTailTile <= AscendC::GetBlockNum()) {
         sch.UpdateTailTile(mTailTile, nTailTile);
-    }
-
-    // BufferChannel 由 fusions 层（写端 impl）构造并经 SetChannels 注入，读端仅推进游标；
-    //   AIC/AIV 游标各自独立推进。data 槽回绕复用（slotNum 已在写端归一化），scale 槽恒全量（slotNum=commTurn）。
-    //   每 slot 容纳一轮 (rankSize-1) 个 remote tile 段（跳过本卡，remoteIdx 紧凑排列）。
-    uint32_t dataSlotNum = fp.commTurn;
-    if constexpr (enableBufferReuse) {
-        dataSlotNum = dataChannel_->GetSlotNum();
     }
 
     // 预触发 HEAD（flagId=0）：HEAD 读本地 GM 不经通信；hcomm 策略下为 no-op。
@@ -445,63 +426,34 @@ __aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncMana
     // dependTileIdx=0 为本 rank 数据，无需等待通信。
     opStateDump.DoDump(DUMP_FIELD_WAIT);
 
-    const int32_t commTurnI = static_cast<int32_t>(fp.commTurn);
-    const int32_t dataSlotNumI = static_cast<int32_t>(dataSlotNum);
+    const int32_t commTurnI = static_cast<int32_t>(fragParams.commTurn);
     // 复用路径：0-based round 序号（初始 -1 表示尚未 Acquire 任何 round）；
     // 非复用路径：保持 1-based dependTileIdx 语义（与 hcomm 策略的 handle 等待兼容）。
     int32_t readyTileIdx = enableBufferReuse ? -1 : 0;
     uint64_t dataSlotOffset = 0;
     uint64_t scaleSlotOffset = 0;
 
-    asc::te::coord<int64_t, int64_t, int64_t, int64_t> blockIdx;
+    BlockCoord blockIdx;
     int64_t mPos = 0L, nPos = 0L;
 
     while (sch.GetTileIdx(blockIdx)) {
-        auto singleShape =
-            sch.template GetBlockShape<Blaze::Gemm::QuantMode::MX_PERGROUP_MODE,
-                                       Blaze::Gemm::QuantMode::MX_PERGROUP_MODE, BlockMmadFragC::weightNz>(blockIdx);
-        int64_t curMtile = asc::te::get<0>(singleShape);
-        int64_t curNtile = asc::te::get<1>(singleShape);
-        if (curMtile <= 0 || curNtile <= 0) {
+        auto singleShape = sch.template GetBlockShape<Blaze::Gemm::QuantMode::MX_PERGROUP_MODE,
+                                                      Blaze::Gemm::QuantMode::MX_PERGROUP_MODE, weightNz>(blockIdx);
+        int64_t baseM = asc::te::get<0>(singleShape);
+        int64_t baseN = asc::te::get<1>(singleShape);
+        if (baseM <= 0 || baseN <= 0) {
             break;
         }
         opStateDump.DoDump(DUMP_FIELD_TURN_INC);
         sch.GetTileCoord(blockIdx, mPos, nPos);
 
-        auto ctx = ResolveTileCtx(mPos, headMainRows, mainRoundRows, mainSectionRows, fp.rankSize, fp.commTurn);
+        auto ctx = ResolveTileCtx(mPos, headMainRows, mainRoundRows, mainSectionRows, fragParams.commTurn);
 
-        if constexpr (enableBufferReuse) {
-            // wait + release merged：release 已消费 round，写端 round>=dataSlotNum 覆盖同槽前等待该 flag；
-            // 最后 dataSlotNum 个 round 的槽位不会再被覆盖，无需 release。
-            int32_t dependRound = static_cast<int32_t>(ctx.dependTileIdx) - 1;
-            while (readyTileIdx < dependRound) {
-                if (readyTileIdx >= 0 && readyTileIdx < commTurnI - dataSlotNumI) {
-                    bufferSyncMgr_.Release(dataChannel_->GetRoundSlotIdx(static_cast<uint32_t>(readyTileIdx)) + 1);
-                }
-                readyTileIdx++;
-                auto dataSlot = dataChannel_->GetNextSlot();
-                bufferSyncMgr_.Acquire(dataSlot.slotIdx + 1); // +1 避开 HEAD 预触发的 flagId=0
-                dataSlotOffset = dataSlot.offset;
-                scaleSlotOffset = scaleChannel_->GetNextSlot().offset;
-                opStateDump.DoDump(DUMP_FIELD_WAIT);
-            }
-        } else {
-            while (readyTileIdx < static_cast<int32_t>(ctx.dependTileIdx)) {
-                readyTileIdx++;
-                bufferSyncMgr_.Acquire(static_cast<uint32_t>(readyTileIdx));
-                opStateDump.DoDump(DUMP_FIELD_WAIT);
-            }
-        }
+        WaitDependTiles(static_cast<int32_t>(ctx.dependTileIdx), commTurnI, readyTileIdx, dataSlotOffset,
+                        scaleSlotOffset, opStateDump);
 
         // Per-tile L2 cache hint
-        SetL2Cache(problemShape, curMtile, curNtile, gmB, gmScaleB);
-
-        auto gmBlockB = gmB.slice(asc::te::make_coord(0L, nPos), asc::te::make_shape(Ki, curNtile));
-        auto gmBlockScaleB = gmScaleB.slice(asc::te::make_coord(0L, nPos), asc::te::make_shape(scaleKLen, curNtile));
-        auto gmBlockBias = gmBias.slice(asc::te::make_coord(0L, nPos), asc::te::make_shape(1L, curNtile));
-
-        auto coordC = asc::te::make_coord(ctx.regionMPos, nPos);
-        auto shapeC = asc::te::make_shape(curMtile, curNtile);
+        SetL2Cache(problemShape, baseM, baseN, gmB, gmScaleB);
 
         // MAIN/TAIL 的 fragment tensor 延迟到首次命中时构建/更新地址。
         if (ctx.region == MAIN) {
@@ -522,44 +474,61 @@ __aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncMana
                 auto gmA =
                     asc::te::make_tensor(asc::te::make_mem_ptr<asc::te::location::gm>(reinterpret_cast<__gm__ AType*>(
                                              reinterpret_cast<__gm__ char*>(params.winDataBase) + dataSlotOffset)),
-                                         MakeLayoutA{}(mainRoundRows, Ki));
+                                         MakeLayoutA{}(mainRoundRows, K));
                 auto gmScaleA = asc::te::make_tensor(
                     asc::te::make_mem_ptr<asc::te::location::gm>(reinterpret_cast<__gm__ ScaleType*>(
                         reinterpret_cast<__gm__ char*>(params.winScaleBase) + scaleSlotOffset)),
                     MakeLayoutScaleA{}(mainRoundRows, scaleKLen));
-                auto blockA = gmA.slice(asc::te::make_coord(ctx.regionMPos, 0L), asc::te::make_shape(curMtile, Ki));
-                auto blockScaleA =
-                    gmScaleA.slice(asc::te::make_coord(ctx.regionMPos, 0L), asc::te::make_shape(curMtile, scaleKLen));
-                auto blockC = ctx.fragC->slice(coordC, shapeC);
-                mmadFrag(blockA, gmBlockB, blockScaleA, gmBlockScaleB, gmBlockBias, cFragAddrs_,
-                         static_cast<uint64_t>(fp.mPerRank), static_cast<uint64_t>(fp.tileM),
-                         static_cast<uint64_t>(fp.tileCnt), static_cast<uint64_t>(fp.tailM), ctx.rankCnt, Ni,
-                         singleShape, ctx.regionMPos, nPos, 0, blockC);
-            } else {
-                // HEAD/TAIL：frag 读（HEAD 本地单 fragment；TAIL 多 fragment 含本 rank + remote 紧凑段）
-                auto coordA = asc::te::make_coord(ctx.regionMPos, 0L);
-                auto blockA = ctx.fragA->slice(coordA, asc::te::make_shape(curMtile, Ki));
-                auto blockScaleA = ctx.fragScaleA->slice(coordA, asc::te::make_shape(curMtile, scaleKLen));
-                auto blockC = ctx.fragC->slice(coordC, shapeC);
-                mmadFrag(blockA, gmBlockB, blockScaleA, gmBlockScaleB, gmBlockBias, cFragAddrs_,
-                         static_cast<uint64_t>(fp.mPerRank), static_cast<uint64_t>(fp.tileM),
-                         static_cast<uint64_t>(fp.tileCnt), static_cast<uint64_t>(fp.tailM), ctx.rankCnt, Ni,
-                         singleShape, ctx.regionMPos, nPos, 0, blockC);
+                ProcessOneBlock(mmadFrag, gmA, gmScaleA, gmB, gmScaleB, gmBias, ctx, singleShape, nPos, baseM, baseN, K,
+                                scaleKLen);
+                continue;
             }
-        } else {
-            auto coordA = asc::te::make_coord(ctx.regionMPos, 0L);
-            auto blockA = ctx.fragA->slice(coordA, asc::te::make_shape(curMtile, Ki));
-            auto blockScaleA = ctx.fragScaleA->slice(coordA, asc::te::make_shape(curMtile, scaleKLen));
-            auto blockC = ctx.fragC->slice(coordC, shapeC);
-            mmadFrag(blockA, gmBlockB, blockScaleA, gmBlockScaleB, gmBlockBias, cFragAddrs_,
-                     static_cast<uint64_t>(fp.mPerRank), static_cast<uint64_t>(fp.tileM),
-                     static_cast<uint64_t>(fp.tileCnt), static_cast<uint64_t>(fp.tailM), ctx.rankCnt, Ni, singleShape,
-                     ctx.regionMPos, nPos, 0, blockC);
         }
+        ProcessOneBlock(mmadFrag, *ctx.fragA, *ctx.fragScaleA, gmB, gmScaleB, gmBias, ctx, singleShape, nPos, baseM,
+                        baseN, K, scaleKLen);
     }
 
     // 收尾兜底：确保所有 round 均已 Acquire；复用路径还需 Release（尾核不释放会导致写端覆盖前死等）。
+    DrainWaitTiles(commTurnI, readyTileIdx, opStateDump);
+}
+
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::WaitDependTiles(
+    int32_t dependTileIdx, int32_t commTurnI, int32_t& readyTileIdx, uint64_t& dataSlotOffset,
+    uint64_t& scaleSlotOffset, Mc2Kernel::OpStateDump& opStateDump)
+{
     if constexpr (enableBufferReuse) {
+        // wait + release merged：release 已消费 round，写端 round>=dataSlotNum 覆盖同槽前等待该 flag；
+        // 最后 dataSlotNum 个 round 的槽位不会再被覆盖，无需 release。
+        // reuse 内部按 0-based round 等待（dependTileIdx-1）；dataSlotNum 取自 dataChannel_（reuse 下必已注入）。
+        const int32_t dataSlotNumI = static_cast<int32_t>(dataChannel_->GetSlotNum());
+        while (readyTileIdx < dependTileIdx - 1) {
+            if (readyTileIdx >= 0 && readyTileIdx < commTurnI - dataSlotNumI) {
+                bufferSyncMgr_.Release(dataChannel_->GetRoundSlotIdx(static_cast<uint32_t>(readyTileIdx)) + 1);
+            }
+            readyTileIdx++;
+            auto dataSlot = dataChannel_->GetNextSlot();
+            bufferSyncMgr_.Acquire(dataSlot.slotIdx + 1); // +1 避开 HEAD 预触发的 flagId=0
+            dataSlotOffset = dataSlot.offset;
+            scaleSlotOffset = scaleChannel_->GetNextSlot().offset;
+            opStateDump.DoDump(DUMP_FIELD_WAIT);
+        }
+    } else {
+        // 非复用路径：保持 1-based dependTileIdx 语义（与 hcomm 策略的 handle 等待兼容）。
+        while (readyTileIdx < dependTileIdx) {
+            readyTileIdx++;
+            bufferSyncMgr_.Acquire(static_cast<uint32_t>(readyTileIdx));
+            opStateDump.DoDump(DUMP_FIELD_WAIT);
+        }
+    }
+}
+
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::DrainWaitTiles(
+    int32_t commTurnI, int32_t& readyTileIdx, Mc2Kernel::OpStateDump& opStateDump)
+{
+    if constexpr (enableBufferReuse) {
+        const int32_t dataSlotNumI = static_cast<int32_t>(dataChannel_->GetSlotNum());
         while (readyTileIdx < commTurnI - 1) {
             if (readyTileIdx >= 0 && readyTileIdx < commTurnI - dataSlotNumI) {
                 bufferSyncMgr_.Release(dataChannel_->GetRoundSlotIdx(static_cast<uint32_t>(readyTileIdx)) + 1);
@@ -578,12 +547,12 @@ __aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncMana
     }
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
 __aicore__ inline Apace::Basic::FragmentParam<
-    AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse, TransB>::DIMS_NUM>
-AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse, TransB>::MakeFragParam(
-    uint64_t fragSize, uint64_t realFragSize, uint32_t fragCnt, uint64_t shape1) const
+    AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::DIMS_NUM>
+AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::MakeFragParam(uint64_t fragSize,
+                                                                                uint64_t realFragSize, uint32_t fragCnt,
+                                                                                uint64_t shape1) const
 {
     Apace::Basic::FragmentParam<DIMS_NUM> param{};
     param.assembleAxis = 0;
@@ -595,59 +564,54 @@ AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse,
     return param;
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse,
-                                             TransB>::BuildFragmentTensors(const Params& params)
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::BuildFragmentTensors(
+    const Params& params)
 {
-    const auto& fp = params.fragParams;
+    const auto& fragParams = params.fragParams;
 
-    for (uint32_t r = 0; r < fp.rankSize; ++r) {
-        cFragAddrs_[r] = params.cGM + static_cast<uint64_t>(r) * fp.mPerRank * params.cBytesPerM;
+    for (uint32_t r = 0; r < fragParams.rankSize; ++r) {
+        cFragAddrs_[r] = params.mmadParams.cGmAddr + static_cast<uint64_t>(r) * fragParams.mPerRank * params.cBytesPerM;
     }
 
-    tileMDataStride_ = static_cast<uint64_t>(fp.tileM) * params.dataBytesPerMRow;
-    tileMScaleStride_ = static_cast<uint64_t>(fp.tileM) * params.scaleBytesPerMRow;
-    tileMCStride_ = static_cast<uint64_t>(fp.tileM) * params.cBytesPerM;
-
     // HEAD：自身数据，单 fragment tensor。
-    headAddrListA_[0] = params.aGM;
-    headAddrListScale_[0] = params.aScaleGM;
-    headAddrListC_[0] = cFragAddrs_[fp.rankId];
-    headFragA_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutA, AType>(
-        MakeFragParam(fp.headRows, fp.headRows, 1, fp.k), headAddrListA_);
-    headFragScaleA_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutScaleA, ScaleType>(
-        MakeFragParam(fp.headRows, fp.headRows, 1, fp.scaleKLen), headAddrListScale_);
-    headFragC_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutC, CType>(
-        MakeFragParam(fp.headRows, fp.headRows, 1, fp.n), headAddrListC_);
+    headFrag_.addrListA[0] = params.mmadParams.aGmAddr;
+    headFrag_.addrListScaleA[0] = params.mmadParams.scaleAGmAddr;
+    headFrag_.addrListC[0] = cFragAddrs_[fragParams.rankId];
+    headFrag_.a = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutA, AType>(
+        MakeFragParam(fragParams.headRows, fragParams.headRows, 1, fragParams.k), headFrag_.addrListA);
+    headFrag_.scaleA = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutScaleA, ScaleType>(
+        MakeFragParam(fragParams.headRows, fragParams.headRows, 1, fragParams.scaleKLen), headFrag_.addrListScaleA);
+    headFrag_.c = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutC, CType>(
+        MakeFragParam(fragParams.headRows, fragParams.headRows, 1, fragParams.n), headFrag_.addrListC);
     // main / tail 的 fragment tensor 延迟到首次使用时构建，构建开销被 comm wait 掩盖。
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse,
-                                             TransB>::EnsureWinRankBasesReady(const Params& params)
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::EnsureWinRankBasesReady(
+    const Params& params)
 {
     if (winBasesReady_) {
         return;
     }
-    const auto& fp = params.fragParams;
-    for (uint32_t r = 0; r < fp.rankSize; ++r) {
-        winDataRankBase_[r] = params.winDataBase + static_cast<uint64_t>(r) * fp.mPerRank * params.dataBytesPerMRow;
-        winScaleRankBase_[r] = params.winScaleBase + static_cast<uint64_t>(r) * fp.mPerRank * params.scaleBytesPerMRow;
+    const auto& fragParams = params.fragParams;
+    for (uint32_t r = 0; r < fragParams.rankSize; ++r) {
+        winDataRankBase_[r] =
+            params.winDataBase + static_cast<uint64_t>(r) * fragParams.mPerRank * params.dataBytesPerMRow;
+        winScaleRankBase_[r] =
+            params.winScaleBase + static_cast<uint64_t>(r) * fragParams.mPerRank * params.scaleBytesPerMRow;
     }
     winBasesReady_ = true;
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse,
-                                             TransB>::BuildMainFragment(const Params& params, uint32_t roundIdx)
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::BuildMainFragment(
+    const Params& params, uint32_t roundIdx)
 {
     if constexpr (!enableBufferReuse) {
         EnsureWinRankBasesReady(params);
     }
-    const auto& fp = params.fragParams;
+    const auto& fragParams = params.fragParams;
 
     if constexpr (!enableBufferReuse) {
         curRoundDataOff_ = static_cast<uint64_t>(roundIdx) * tileMDataStride_;
@@ -656,39 +620,41 @@ __aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncMana
     curRoundCOff_ = static_cast<uint64_t>(roundIdx) * tileMCStride_;
 
     uint32_t fragIdx = 0;
-    for (uint32_t r = 0; r < fp.rankSize; ++r) {
-        if (r == fp.rankId) {
+    for (uint32_t r = 0; r < fragParams.rankSize; ++r) {
+        if (r == fragParams.rankId) {
             continue;
         }
         if constexpr (!enableBufferReuse) {
-            mainAddrListA_[fragIdx] = winDataRankBase_[r] + curRoundDataOff_;
-            mainAddrListScale_[fragIdx] = winScaleRankBase_[r] + curRoundScaleOff_;
+            curMainFrag_.addrListA[fragIdx] = winDataRankBase_[r] + curRoundDataOff_;
+            curMainFrag_.addrListScaleA[fragIdx] = winScaleRankBase_[r] + curRoundScaleOff_;
         }
-        mainAddrListC_[fragIdx] = cFragAddrs_[r] + curRoundCOff_;
+        curMainFrag_.addrListC[fragIdx] = cFragAddrs_[r] + curRoundCOff_;
         fragIdx++;
     }
     if constexpr (!enableBufferReuse) {
-        curMainA_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutA, AType>(
-            MakeFragParam(fp.tileM, fp.tileM, fp.rankSize - 1, fp.k), mainAddrListA_);
-        curMainScaleA_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutScaleA, ScaleType>(
-            MakeFragParam(fp.tileM, fp.tileM, fp.rankSize - 1, fp.scaleKLen), mainAddrListScale_);
+        curMainFrag_.a = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutA, AType>(
+            MakeFragParam(fragParams.tileM, fragParams.tileM, fragParams.rankSize - 1, fragParams.k),
+            curMainFrag_.addrListA);
+        curMainFrag_.scaleA = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutScaleA, ScaleType>(
+            MakeFragParam(fragParams.tileM, fragParams.tileM, fragParams.rankSize - 1, fragParams.scaleKLen),
+            curMainFrag_.addrListScaleA);
     }
-    curMainC_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutC, CType>(
-        MakeFragParam(fp.tileM, fp.tileM, fp.rankSize - 1, fp.n), mainAddrListC_);
+    curMainFrag_.c = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutC, CType>(
+        MakeFragParam(fragParams.tileM, fragParams.tileM, fragParams.rankSize - 1, fragParams.n),
+        curMainFrag_.addrListC);
     curMainRoundIdx_ = roundIdx;
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse,
-                                             TransB>::BuildTailFragment(const Params& params)
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::BuildTailFragment(
+    const Params& params)
 {
     if constexpr (!enableBufferReuse) {
         EnsureWinRankBasesReady(params);
     }
-    const auto& fp = params.fragParams;
+    const auto& fragParams = params.fragParams;
 
-    uint64_t tailRowOff = fp.headRows;
+    uint64_t tailRowOff = fragParams.headRows;
     uint64_t tailDataOff = tailRowOff * params.dataBytesPerMRow;
     uint64_t tailScaleOff = tailRowOff * params.scaleBytesPerMRow;
     uint64_t tailCOff = tailRowOff * params.cBytesPerM;
@@ -698,41 +664,45 @@ __aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncMana
     uint64_t dataSlotOff = 0;
     uint64_t scaleSlotOff = 0;
     if constexpr (enableBufferReuse) {
-        dataSlotOff = (static_cast<uint64_t>(fp.tileCnt) % dataChannel_->GetSlotNum()) *
-                      (static_cast<uint64_t>(fp.rankSize - 1) * tileMDataStride_);
-        scaleSlotOff = static_cast<uint64_t>(fp.tileCnt) * (static_cast<uint64_t>(fp.rankSize - 1) * tileMScaleStride_);
+        dataSlotOff = (static_cast<uint64_t>(fragParams.tileCnt) % dataChannel_->GetSlotNum()) *
+                      (static_cast<uint64_t>(fragParams.rankSize - 1) * tileMDataStride_);
+        scaleSlotOff = static_cast<uint64_t>(fragParams.tileCnt) *
+                       (static_cast<uint64_t>(fragParams.rankSize - 1) * tileMScaleStride_);
     }
 
-    for (uint32_t r = 0; r < fp.rankSize; ++r) {
-        if (r == fp.rankId) {
-            tailAddrListA_[r] = params.aGM + tailDataOff;
-            tailAddrListScale_[r] = params.aScaleGM + tailScaleOff;
+    for (uint32_t r = 0; r < fragParams.rankSize; ++r) {
+        if (r == fragParams.rankId) {
+            tailFrag_.addrListA[r] = params.mmadParams.aGmAddr + tailDataOff;
+            tailFrag_.addrListScaleA[r] = params.mmadParams.scaleAGmAddr + tailScaleOff;
         } else if constexpr (enableBufferReuse) {
             // remote 紧凑：remoteIdx 为跳过本卡后的升序序号，与写端 PUT 的槽内布局一致
-            uint32_t remoteIdx = (r > fp.rankId) ? (r - 1) : r;
-            tailAddrListA_[r] = params.winDataBase + dataSlotOff + static_cast<uint64_t>(remoteIdx) * tileMDataStride_;
-            tailAddrListScale_[r] =
+            uint32_t remoteIdx = (r > fragParams.rankId) ? (r - 1) : r;
+            tailFrag_.addrListA[r] =
+                params.winDataBase + dataSlotOff + static_cast<uint64_t>(remoteIdx) * tileMDataStride_;
+            tailFrag_.addrListScaleA[r] =
                 params.winScaleBase + scaleSlotOff + static_cast<uint64_t>(remoteIdx) * tileMScaleStride_;
         } else {
-            tailAddrListA_[r] = winDataRankBase_[r] + tailDataOff;
-            tailAddrListScale_[r] = winScaleRankBase_[r] + tailScaleOff;
+            tailFrag_.addrListA[r] = winDataRankBase_[r] + tailDataOff;
+            tailFrag_.addrListScaleA[r] = winScaleRankBase_[r] + tailScaleOff;
         }
-        tailAddrListC_[r] = cFragAddrs_[r] + tailCOff;
+        tailFrag_.addrListC[r] = cFragAddrs_[r] + tailCOff;
     }
-    tailFragA_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutA, AType>(
-        MakeFragParam(fp.paddedTailM, fp.tailM, fp.rankSize, fp.k), tailAddrListA_);
-    tailFragScaleA_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutScaleA, ScaleType>(
-        MakeFragParam(fp.paddedTailM, fp.tailM, fp.rankSize, fp.scaleKLen), tailAddrListScale_);
-    tailFragC_ = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutC, CType>(
-        MakeFragParam(fp.paddedTailM, fp.tailM, fp.rankSize, fp.n), tailAddrListC_);
+    tailFrag_.a = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutA, AType>(
+        MakeFragParam(fragParams.paddedTailM, fragParams.tailM, fragParams.rankSize, fragParams.k),
+        tailFrag_.addrListA);
+    tailFrag_.scaleA = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutScaleA, ScaleType>(
+        MakeFragParam(fragParams.paddedTailM, fragParams.tailM, fragParams.rankSize, fragParams.scaleKLen),
+        tailFrag_.addrListScaleA);
+    tailFrag_.c = Apace::Basic::MakeFragmentTensor<DIMS_NUM, MAX_FRAG, MakeLayoutC, CType>(
+        MakeFragParam(fragParams.paddedTailM, fragParams.tailM, fragParams.rankSize, fragParams.n),
+        tailFrag_.addrListC);
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse,
-                                             TransB>::UpdateMainRoundAddrs(const Params& params, uint32_t roundIdx)
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline void AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::UpdateMainRoundAddrs(
+    const Params& params, uint32_t roundIdx)
 {
-    const auto& fp = params.fragParams;
+    const auto& fragParams = params.fragParams;
     uint32_t delta = roundIdx - curMainRoundIdx_;
     if constexpr (!enableBufferReuse) {
         curRoundDataOff_ += static_cast<uint64_t>(delta) * tileMDataStride_;
@@ -741,60 +711,56 @@ __aicore__ inline void AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncMana
     curRoundCOff_ += static_cast<uint64_t>(delta) * tileMCStride_;
 
     uint32_t fragIdx = 0;
-    for (uint32_t r = 0; r < fp.rankSize; ++r) {
-        if (r == fp.rankId) {
+    for (uint32_t r = 0; r < fragParams.rankSize; ++r) {
+        if (r == fragParams.rankId) {
             continue;
         }
         if constexpr (!enableBufferReuse) {
-            mainAddrListA_[fragIdx] = winDataRankBase_[r] + curRoundDataOff_;
-            mainAddrListScale_[fragIdx] = winScaleRankBase_[r] + curRoundScaleOff_;
+            curMainFrag_.addrListA[fragIdx] = winDataRankBase_[r] + curRoundDataOff_;
+            curMainFrag_.addrListScaleA[fragIdx] = winScaleRankBase_[r] + curRoundScaleOff_;
         }
-        mainAddrListC_[fragIdx] = cFragAddrs_[r] + curRoundCOff_;
+        curMainFrag_.addrListC[fragIdx] = cFragAddrs_[r] + curRoundCOff_;
         fragIdx++;
     }
     if constexpr (!enableBufferReuse) {
-        curMainA_.UpdateAddrList(mainAddrListA_);
-        curMainScaleA_.UpdateAddrList(mainAddrListScale_);
+        curMainFrag_.a.UpdateAddrList(curMainFrag_.addrListA);
+        curMainFrag_.scaleA.UpdateAddrList(curMainFrag_.addrListScaleA);
     }
-    curMainC_.UpdateAddrList(mainAddrListC_);
+    curMainFrag_.c.UpdateAddrList(curMainFrag_.addrListC);
     curMainRoundIdx_ = roundIdx;
 }
 
-template <typename AType, typename BType, typename CType, typename BufferSyncManager, bool enableBufferReuse,
-          bool TransB>
-__aicore__ inline
-    typename AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse, TransB>::TileCtx
-    AllGatherQbmmMxKernel<AType, BType, CType, BufferSyncManager, enableBufferReuse, TransB>::ResolveTileCtx(
-        int64_t mPos, int64_t headMainRows, int64_t mainRoundRows, int64_t mainSectionRows, uint32_t rankSize,
-        uint32_t commTurn) const
+ALL_GATHER_QBMM_MX_KERNEL_CLASS_TEM_PARAMS
+__aicore__ inline typename AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::TileCtx
+AllGatherQbmmMxKernel<ALL_GATHER_QBMM_MX_KERNEL_FUNC_TEM_PARAMS>::ResolveTileCtx(int64_t mPos, int64_t headMainRows,
+                                                                                 int64_t mainRoundRows,
+                                                                                 int64_t mainSectionRows,
+                                                                                 uint32_t commTurn) const
 {
     TileCtx ctx{};
     if (mPos < headMainRows) {
         ctx.dependTileIdx = 0;
         ctx.region = HEAD;
         ctx.regionMPos = mPos;
-        ctx.fragA = &headFragA_;
-        ctx.fragScaleA = &headFragScaleA_;
-        ctx.fragC = &headFragC_;
-        ctx.rankCnt = static_cast<uint64_t>(rankSize - 1);
+        ctx.fragA = &headFrag_.a;
+        ctx.fragScaleA = &headFrag_.scaleA;
+        ctx.fragC = &headFrag_.c;
     } else if (mPos < headMainRows + mainSectionRows) {
         int64_t relPos = mPos - headMainRows;
         ctx.roundIdx = static_cast<uint32_t>(relPos / mainRoundRows);
         ctx.dependTileIdx = ctx.roundIdx + 1;
         ctx.region = MAIN;
         ctx.regionMPos = relPos % mainRoundRows;
-        ctx.fragA = &curMainA_;
-        ctx.fragScaleA = &curMainScaleA_;
-        ctx.fragC = &curMainC_;
-        ctx.rankCnt = static_cast<uint64_t>(rankSize - 1);
+        ctx.fragA = &curMainFrag_.a;
+        ctx.fragScaleA = &curMainFrag_.scaleA;
+        ctx.fragC = &curMainFrag_.c;
     } else {
         ctx.dependTileIdx = commTurn;
         ctx.region = TAIL;
         ctx.regionMPos = mPos - headMainRows - mainSectionRows;
-        ctx.fragA = &tailFragA_;
-        ctx.fragScaleA = &tailFragScaleA_;
-        ctx.fragC = &tailFragC_;
-        ctx.rankCnt = static_cast<uint64_t>(rankSize);
+        ctx.fragA = &tailFrag_.a;
+        ctx.fragScaleA = &tailFrag_.scaleA;
+        ctx.fragC = &tailFrag_.c;
     }
     return ctx;
 }

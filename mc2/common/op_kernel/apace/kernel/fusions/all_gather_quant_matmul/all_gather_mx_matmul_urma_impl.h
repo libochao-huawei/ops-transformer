@@ -33,11 +33,6 @@ namespace Apace {
 using namespace AscendC;
 using namespace Apace::AivComm;
 
-using LayoutA = asc::te::nd_ext_layout_ptn;
-using LayoutB = asc::te::dn_ext_layout_ptn;
-using LayoutC = asc::te::nd_ext_layout_ptn;
-using ProblemShape = asc::te::shape<int64_t, int64_t, int64_t, int64_t>;
-
 struct UrmaBufferSync {
     __aicore__ inline void Acquire(uint32_t flagId)
     {
@@ -58,9 +53,31 @@ public:
                                 const AllGatherMxMatmulUrmaTilingData* tilingData);
     __aicore__ inline void Process();
 
-    using QuantMatmulKernelImpl = AllGatherQbmmMxKernel<AType, BType, CType, UrmaBufferSync, true, true>;
-    using KernelParams = typename QuantMatmulKernelImpl::Params;
-    using QBMMTiling = typename QuantMatmulKernelImpl::QBMMTiling;
+    // Layout 定义
+    using LayoutA = asc::te::nd_ext_layout_ptn;
+    // B 矩阵布局：urma 通路固定转置 (N, K)
+    using LayoutB = asc::te::dn_ext_layout_ptn;
+    using LayoutC = asc::te::nd_ext_layout_ptn;
+    using ProblemShape = asc::te::shape<int64_t, int64_t, int64_t, int64_t>;
+
+    // 组件定义
+    using BlockMmadFrag = Blaze::Gemm::Block::QmmMxBlockMmadFragment<0, false, AType, LayoutA, BType, LayoutB, CType,
+                                                                     LayoutC, float, LayoutC>;
+    // Reuse MXFP4's B4 scheduler geometry for HiFP4; MMAD keeps the real type.
+#if APACE_HIF4_TYPE_SUPPORTED
+    using SchedulerAType =
+        AscendC::Std::conditional_t<AscendC::IsSameType<AType, hifloat4x2_t>::value, fp4x2_e2m1_t, AType>;
+#else
+    using SchedulerAType = AType;
+#endif
+    using BlockScheduler =
+        Blaze::Gemm::Block::BlockSchedulerQuantBatchMatmulV3<ProblemShape, 0, LayoutA, LayoutB, SchedulerAType>;
+    using QuantMatmulKernelImpl = AllGatherQbmmMxKernel<BlockMmadFrag, BlockScheduler, UrmaBufferSync, true>;
+
+    // 参数类型
+    using Params = typename QuantMatmulKernelImpl::Params;
+    using BlockSchedulerParams = typename QuantMatmulKernelImpl::BlockSchedulerParams;
+    using FragL1Params = typename QuantMatmulKernelImpl::FragL1Params;
     using FragmentParams = typename QuantMatmulKernelImpl::FragmentParams;
 
     QuantMatmulKernelImpl quantMatmulKernelImpl_;
@@ -237,10 +254,13 @@ __aicore__ inline void AllGatherMxMatmulUrmaImpl<AType, BType, CType>::Process()
 template <typename AType, typename BType, typename CType>
 __aicore__ inline void AllGatherMxMatmulUrmaImpl<AType, BType, CType>::MatmulProcess()
 {
-    KernelParams params;
-    params.mmTile = &tilingData_->mmTile;
-    params.qbmmParams = {tilingData_->mmTile.baseM, tilingData_->mmTile.baseN, tilingData_->mmTile.baseK,
-                         tilingData_->mmTile.dbL0c};
+    Params params;
+    const auto& mmT = tilingData_->mmTile;
+    params.schParams = BlockSchedulerParams{
+        mmT.baseM,     mmT.baseN,    mmT.mTailTile, mmT.nTailTile, mmT.mBaseTailSplitCnt, mmT.nBaseTailSplitCnt,
+        mmT.mTailMain, mmT.nTailMain};
+    params.qbmmParams = {mmT.baseM, mmT.baseN, mmT.baseK, mmT.dbL0c};
+    params.l1Params = FragL1Params{static_cast<uint64_t>(mmT.stepK) * mmT.baseK, mmT.scaleKL1, mmT.nBufferNum};
     params.fragParams = {tileCnt_,
                          tileM_,
                          tailCnt_,
@@ -254,13 +274,7 @@ __aicore__ inline void AllGatherMxMatmulUrmaImpl<AType, BType, CType>::MatmulPro
                          static_cast<uint64_t>(k_),
                          static_cast<uint64_t>(n_),
                          scaleKLen_};
-    params.aGM = aGM_;
-    params.aScaleGM = aScaleGM_;
-    params.bGM = bGM_;
-    params.bScaleGM = bScaleGM_;
-    params.cGM = cGM_;
-    params.biasGM = biasGM_;
-    params.isBias = (tilingData_->isBias != 0);
+    params.mmadParams = {aGM_, bGM_, cGM_, biasGM_, aScaleGM_, bScaleGM_};
     params.winDataBase = GetWinDataRegionBase();
     params.winScaleBase = GetWinScaleRegionBase();
     params.dataBytesPerMRow = dataBytesPerMRow_;
