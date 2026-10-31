@@ -341,7 +341,7 @@ add_subdirectory(common)
 
 if (NOT BUILD_OPS_RTY_KERNEL)
     should_add_module("mc2" ADD_MC2)
-    if(ADD_MC2)
+    if(ADD_MC2 AND NOT (ASCEND_COMPUTE_UNIT STREQUAL "ascend5162a"))
         add_subdirectory(mc2)
     endif()
     should_add_module("posembedding" ADD_POSEMBEDDING)
