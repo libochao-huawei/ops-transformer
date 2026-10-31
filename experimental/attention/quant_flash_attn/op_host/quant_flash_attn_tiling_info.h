@@ -41,17 +41,17 @@ constexpr uint32_t METADATA_INDEX = 14;
 
 // Attributes Index
 constexpr uint32_t ATTR_QUANT_MODE_INDEX = 0;
-constexpr uint32_t ATTR_SOFTMAX_SCALE_INDEX = 1;  // scaleValue
-constexpr uint32_t ATTR_MASK_MODE_INDEX = 2;      // mask_mode
-constexpr uint32_t ATTR_WIN_LEFT_INDEX = 3;       // win_left (preToken)
-constexpr uint32_t ATTR_WIN_RIGHT_INDEX = 4;      // win_right (nextToken)
-constexpr uint32_t ATTR_MAX_SEQLEN_Q_INDEX = 5;   // max_seqlen_q
-constexpr uint32_t ATTR_MAX_SEQLEN_KV_INDEX = 6;  // max_seqlen_kv
-constexpr uint32_t ATTR_LAYOUT_Q_INDEX = 7;       // layout_q
+constexpr uint32_t ATTR_SOFTMAX_SCALE_INDEX = 1;    // scaleValue
+constexpr uint32_t ATTR_MASK_MODE_INDEX = 2;        // mask_mode
+constexpr uint32_t ATTR_WIN_LEFT_INDEX = 3;         // win_left (preToken)
+constexpr uint32_t ATTR_WIN_RIGHT_INDEX = 4;        // win_right (nextToken)
+constexpr uint32_t ATTR_MAX_SEQLEN_Q_INDEX = 5;     // max_seqlen_q
+constexpr uint32_t ATTR_MAX_SEQLEN_KV_INDEX = 6;    // max_seqlen_kv
+constexpr uint32_t ATTR_LAYOUT_Q_INDEX = 7;         // layout_q
 constexpr uint32_t ATTR_LAYOUT_Q_DESCALE_INDEX = 8; // layout_q_descale
-constexpr uint32_t ATTR_LAYOUT_KV_INDEX = 9;      // layout_kv
-constexpr uint32_t ATTR_LAYOUT_OUT_INDEX = 10;    // layout_out
-constexpr uint32_t ATTR_RETURN_LSE_INDEX = 11;    // return_softmax_lse
+constexpr uint32_t ATTR_LAYOUT_KV_INDEX = 9;        // layout_kv
+constexpr uint32_t ATTR_LAYOUT_OUT_INDEX = 10;      // layout_out
+constexpr uint32_t ATTR_RETURN_LSE_INDEX = 11;      // return_softmax_lse
 
 // Output Index
 constexpr uint32_t ATTN_OUT_INDEX = 0;
@@ -96,10 +96,11 @@ constexpr int64_t QUANT_MODE_A8C8_QKV_MXFP8_P_FP8_E4M3_PER_TENSOR_SOFTMAX_FP16 =
 constexpr int64_t QUANT_MODE_A8C8_QKV_MXFP8_P_MXFP8_SOFTMAX_FP16 = 4;
 constexpr int64_t QUANT_MODE_A4C4_QKV_MXFP4_P_MXFP4_SOFTMAX_FP16 = 5;
 constexpr int64_t QUANT_MODE_A8C8_QK_FP8_E4M3_PER_TOKEN_HEAD_V_FP8_E4M3_PER_HEAD_P_FP8_E4M3_PER_TENSOR_SOFTMAX_FP32 = 6;
-constexpr int64_t QUANT_MODE_A8C8_QKV_HIF8_PER_TENSOR_P_FP8_E4M3_PER_TENSOR_SOFTMAX_FP32 = 7;
-constexpr int64_t QUANT_MODE_A4C4_QKV_HIF4_P_HIF4_LEVEL1_SOFTMAX_FP16 = 8;
-constexpr int64_t QUANT_MODE_A4C4_QKV_HIF4_P_HIF4_LEVEL2_SOFTMAX_FP16 = 9;
-constexpr int64_t QUANT_MODE_A4C4_QKV_HIF4_P_HIF4_LEVEL3_SOFTMAX_FP16 = 10;
+constexpr int64_t QUANT_MODE_A8C8_QKV_HIF8_PER_TENSOR_P_FP8_E4M3_PER_TENSOR_SOFTMAX_FP32 = 0;
+constexpr int64_t QUANT_MODE_A4C4_QKV_HIF4_P_HIF4_LEVEL1_SOFTMAX_FP16 = 7;
+constexpr int64_t QUANT_MODE_A4C4_QKV_HIF4_P_HIF4_LEVEL2_SOFTMAX_FP16 = 8;
+constexpr int64_t QUANT_MODE_A4C4_QKV_HIF4_P_HIF4_LEVEL3_SOFTMAX_FP16 = 9;
+constexpr int64_t QUANT_MODE_A4C4_QKV_HIF4_P_FP8_E4M3_SOFTMAX_FP16 = 10;
 // 已实现 quant_mode 别名（语义化使用）
 constexpr int64_t QUANT_MODE_MXFP8 = QUANT_MODE_A8C8_QKV_MXFP8_P_FP8_E4M3_PER_TENSOR_SOFTMAX_FP32;
 constexpr int64_t QUANT_MODE_MXFP4 = QUANT_MODE_A4C4_QKV_MXFP4_P_MXFP4_SOFTMAX_FP16;
@@ -145,13 +146,13 @@ struct QfaPlatFormInfo {
 };
 
 struct FARequiredParaInfo {
-    const gert::CompileTimeTensorDesc *desc;
-    const gert::StorageShape *shape;
+    const gert::CompileTimeTensorDesc* desc;
+    const gert::StorageShape* shape;
 };
 
 struct FAOptionalParaInfo {
-    const gert::CompileTimeTensorDesc *desc;
-    const gert::Tensor *tensor;
+    const gert::CompileTimeTensorDesc* desc;
+    const gert::Tensor* tensor;
 };
 
 struct FAParaInfo {
@@ -172,18 +173,18 @@ struct FAParaInfo {
     FAOptionalParaInfo attnMask = {nullptr, nullptr};
     FAOptionalParaInfo metadata = {nullptr, nullptr};
 
-    const int64_t *quantMode = nullptr;
-    const float *softmaxScale = nullptr;
-    const int64_t *maskMode = nullptr;
-    const int64_t *winLeft = nullptr;
-    const int64_t *winRight = nullptr;
-    const int64_t *maxSeqlenQ = nullptr;
-    const int64_t *maxSeqlenKV = nullptr;
-    const char *layoutQ = nullptr;
-    const char *layoutQDescale = nullptr;
-    const char *layoutKV = nullptr;
-    const char *layoutOut = nullptr;
-    const bool *returnSoftMaxLse = nullptr;
+    const int64_t* quantMode = nullptr;
+    const float* softmaxScale = nullptr;
+    const int64_t* maskMode = nullptr;
+    const int64_t* winLeft = nullptr;
+    const int64_t* winRight = nullptr;
+    const int64_t* maxSeqlenQ = nullptr;
+    const int64_t* maxSeqlenKV = nullptr;
+    const char* layoutQ = nullptr;
+    const char* layoutQDescale = nullptr;
+    const char* layoutKV = nullptr;
+    const char* layoutOut = nullptr;
+    const bool* returnSoftMaxLse = nullptr;
 
     FARequiredParaInfo attnOut = {nullptr, nullptr};
     FARequiredParaInfo lseOut = {nullptr, nullptr};
@@ -191,8 +192,8 @@ struct FAParaInfo {
 
 class QuantFlashAttnTilingInfo : public TilingInfo {
 public:
-    const char *opName = nullptr;
-    fe::PlatFormInfos *platformInfo = nullptr;
+    const char* opName = nullptr;
+    fe::PlatFormInfos* platformInfo = nullptr;
     FAParaInfo opParamInfo;
 
     // BaseParams
