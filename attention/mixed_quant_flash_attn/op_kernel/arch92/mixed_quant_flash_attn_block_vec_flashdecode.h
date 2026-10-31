@@ -318,7 +318,7 @@ protected:
         LocalTensor<T> maxLseUb = fdLseUbBuf.ReinterpretCast<T>();
         FaVectorApi::ComputeScaleValue_VF_FD<T, T, SinkInjectStage::AT_FA_PROLOGUE>(
             lseMax, lseMax, lseSum, lseExp, maxLseUb, lseMaxUb, dealRowCount, actualCombineLoopSize,
-            constInfo.isSoftmaxLseEnable, false);
+            constInfo.isSoftmaxLseEnable, false, -FLT_MAX_NEW);
     }
 
     __aicore__ inline void Bmm2DataCopyOutTrans(LocalTensor<OUTPUT_T>& attenOutUb, uint32_t startRow,

@@ -40,8 +40,8 @@ _compare_mod = _load_impl("compare")
 # 三方比对专用容差（仅 --compare cross_check 时生效）。与 tolerance 分开声明，
 # 避免默认(stat_rel_err)模式下触发 TTK 的 golden Promote / 第三方抓取逻辑。
 CROSS_CHECK_TOLERANCE = {
-    "float16": {"standard": "cross_check"},
-    "bfloat16": {"standard": "cross_check"},
+    "float16": {"standard": "cross_check", "level": "L0"},
+    "bfloat16": {"standard": "cross_check", "level": "L0"},
 }
 
 
@@ -56,15 +56,20 @@ class MixedQuantFlashAttnSpec:
     def compare(*outputs, compare_context=None, **kwargs):
         compare_method = _compare_mod._get_compare_method()
         if compare_method == "cross_check":
-            # Rebuild 第三方(高精度 use_npu=True) benchmark 结果，保证 compare 进程里有 bench_outputs。
+            if not _compare_mod.is_cross_check_available():
+                raise RuntimeError("cross_check requires TTK CrossCheckComparison")
+            # Rebuild the selected third-party outputs; golden outputs are the FP64 CPU truth.
             _golden_mod.rebuild_golden_context_from_compare_context(compare_context)
             ctx = _golden_mod.get_golden_context()
             bench_outputs = ctx.get("bench_outputs")
             kwargs["data_type"] = ctx.get("data_type") or kwargs.get("data_type")
-            if bench_outputs is not None and _compare_mod.is_cross_check_available():
-                return _compare_mod._run_ttk_cross_check_e2e(
-                    outputs, kwargs, bench_outputs, CROSS_CHECK_TOLERANCE
+            if bench_outputs is None:
+                raise RuntimeError(
+                    "cross_check third-party golden outputs are unavailable"
                 )
+            return _compare_mod._run_ttk_cross_check_e2e(
+                outputs, kwargs, bench_outputs, CROSS_CHECK_TOLERANCE
+            )
         return _compare_mod.compare(*outputs)
 
 

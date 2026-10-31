@@ -26,12 +26,19 @@ import numpy as np
 
 try:
     from ttk.utilities.container_utils import get_global_storage
-except Exception:
-    get_global_storage = None
+except ImportError:
+    try:
+        from ttk.switches import get_global_storage
+    except ImportError:
+        get_global_storage = None
 
 try:
-    from ttk.core_modules.comparison.cross_check import CrossCheckComparison
-    from ttk.core_modules.comparison.resolve import resolve_tolerance
+    try:
+        from ttk.core_modules.comparison.cross_check import CrossCheckComparison
+        from ttk.core_modules.comparison.resolve import resolve_tolerance
+    except ImportError:
+        from ttk.core_modules.common.comparison.cross_check import CrossCheckComparison
+        from ttk.core_modules.common.comparison.resolve import resolve_tolerance
 
     _TTK_CROSS_CHECK_AVAILABLE = True
 except Exception:
@@ -354,14 +361,14 @@ def _ttk_cross_check_single(
     npu_out, golden_out, bench_out, idx, name, dtype_str, params
 ):
     c = CrossCheckComparison(
-        npu_out, bench_out, idx, dtype_str, params, third_party=golden_out
+        npu_out, golden_out, idx, dtype_str, params, third_party=bench_out
     )
     precision_str, log, is_pass, metrics = c.compare()
 
     # 打印三方比对报告（通过/失败都打，便于日志查看 mare/mere/rmse）。
     print(f"\n┌{_SEP2}┐", flush=True)
     print(
-        f"│  三方比对(CrossCheck): {name}  三方=use_npu(高精度)  third_party=golden",
+        f"│  三方比对(CrossCheck): {name}  真值=CPU FP64  third_party=XPU（见 golden.py 的 _run_third_party_golden）",
         flush=True,
     )
     print(f"├{_SEP2}┤", flush=True)

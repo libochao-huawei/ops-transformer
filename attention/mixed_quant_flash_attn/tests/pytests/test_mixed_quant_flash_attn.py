@@ -153,8 +153,7 @@ def _execute_step(case_name, params, case_dir, mode, dev_id, seed_val):
                 pytest.skip(f"Input file not found: {input_path}")
             print(f"  [cpu] Computing CPU golden for {case_name}")
             input_data = torch.load(input_path, map_location="cpu", weights_only=False)
-            input_data["use_npu"] = False
-            result = run_cpu_golden(input_data)
+            result = run_cpu_golden(input_data, mode="cpu")
             torch.save(result, cpu_path)
             print(f"  [cpu] Saved to {cpu_path}")
 
@@ -163,12 +162,9 @@ def _execute_step(case_name, params, case_dir, mode, dev_id, seed_val):
 
             if not os.path.exists(input_path):
                 pytest.skip(f"Input file not found: {input_path}")
-            print(
-                f"  [cpu_high] Computing CPU golden (aclnnBatchMatMul) for {case_name}"
-            )
+            print(f"  [cpu_high] Computing CPU golden (FP64) for {case_name}")
             input_data = torch.load(input_path, map_location="cpu", weights_only=False)
-            input_data["use_npu"] = True
-            result = run_cpu_golden(input_data)
+            result = run_cpu_golden(input_data, mode="cpu_high")
             torch.save(result, cpu_path)
             print(f"  [cpu_high] Saved to {cpu_path}")
 

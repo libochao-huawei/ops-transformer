@@ -17,6 +17,9 @@ TTK 传入的 tensor 可能是 numpy array，需转为 torch tensor 后传给 tf
 
 __golden__ = {"e2e": {"mqfa_ttk_ops.call_npu": "cpu_mixed_quant_flash_attn"}}
 
+import sys
+import traceback
+
 import numpy as np
 import torch
 
@@ -24,11 +27,21 @@ from core.cpu import run_cpu_golden
 
 try:
     from ttk.utilities.container_utils import get_global_storage
-except Exception:
-    get_global_storage = None
+except ImportError:
+    try:
+        from ttk.switches import get_global_storage
+    except ImportError:
+        get_global_storage = None
 
 
 _GOLDEN_CONTEXT = {}
+
+
+def _record_bench_error(exc):
+    """第三方 golden 失败时打印根因到 stderr，避免静默吞掉。"""
+    detail = f"{type(exc).__name__}: {exc}"
+    print(f"[golden] third-party golden failed: {detail}", file=sys.stderr, flush=True)
+    traceback.print_exc(file=sys.stderr)
 
 
 def _get_compare_method():
@@ -60,6 +73,12 @@ def _to_torch(val, dtype=None):
     if isinstance(val, (list, tuple)):
         return torch.tensor(val, dtype=dtype or torch.int32)
     return torch.tensor(val)
+
+
+def _run_third_party_golden(input_kwargs):
+    # 第三方切换：注释当前 return，取消另一行注释；同进程和独立进程重建共用此处。
+    return run_cpu_golden(input_kwargs, mode="npu")  # NPU 小算子
+    # return run_cpu_golden(input_kwargs, mode="cpu")  # CPU 低精
 
 
 def cpu_mixed_quant_flash_attn(
@@ -121,15 +140,17 @@ def cpu_mixed_quant_flash_attn(
         "souter": int(kwargs.get("souter", 32)),
     }
 
-    result = run_cpu_golden(dict(input_kwargs))
-    if _get_compare_method() == "cross_check":
-        # 第三方(高精度) golden：use_npu=True 走 aclnnBatchMatMul 的 fp32 路径。
+    cross_check = _get_compare_method() == "cross_check"
+    result = run_cpu_golden(input_kwargs, mode="cpu_high" if cross_check else "cpu")
+    if cross_check:
+        # FP64 CPU result is the truth; bench_outputs holds the third-party result.
         _GOLDEN_CONTEXT["data_type"] = str(getattr(q, "dtype", "bfloat16"))
         try:
-            bench = run_cpu_golden({**input_kwargs, "use_npu": True})
+            bench = _run_third_party_golden(input_kwargs)
             _GOLDEN_CONTEXT["bench_outputs"] = (bench["attn_out"], bench["softmax_lse"])
-        except Exception:
+        except Exception as exc:
             _GOLDEN_CONTEXT["bench_outputs"] = None
+            _record_bench_error(exc)
     return result["attn_out"], result["softmax_lse"]
 
 
@@ -138,7 +159,7 @@ def get_golden_context():
 
 
 def rebuild_golden_context_from_compare_context(compare_context):
-    """Re-run the high-precision benchmark (use_npu=True) from compare_context.
+    """Re-run the selected third-party golden from compare_context.
 
     TTK 可能在独立进程里跑 golden 与 compare，cross_check 需要在 compare 进程里
     重建 bench_outputs。仅计算第三方结果（golden 本体已由 TTK 传入）。
@@ -188,7 +209,9 @@ def rebuild_golden_context_from_compare_context(compare_context):
             "sinner": int(_attr("sinner", default=512)),
             "souter": int(_attr("souter", default=32)),
         }
-        bench = run_cpu_golden({**input_kwargs, "use_npu": True})
+        _GOLDEN_CONTEXT["data_type"] = str(input_kwargs["q"].dtype)
+        bench = _run_third_party_golden(input_kwargs)
         _GOLDEN_CONTEXT["bench_outputs"] = (bench["attn_out"], bench["softmax_lse"])
-    except Exception:
+    except Exception as exc:
         _GOLDEN_CONTEXT["bench_outputs"] = None
+        _record_bench_error(exc)

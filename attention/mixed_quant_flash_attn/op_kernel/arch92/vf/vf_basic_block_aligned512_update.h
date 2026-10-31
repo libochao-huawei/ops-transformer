@@ -137,43 +137,41 @@ __simd_vf__ void ProcessVec1UpdateAlignImpl512VF(
                 preg_compare1, (__ubuf__ uint32_t*&)maskUb1, nPadding);
             LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
                 preg_compare2, (__ubuf__ uint32_t*&)maskUb2, nPadding);
-            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
-                preg_compare3, (__ubuf__ uint32_t*&)maskUb3, nPadding);
-            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
-                preg_compare4, (__ubuf__ uint32_t*&)maskUb4, nPadding);
-            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
-                preg_compare1, (__ubuf__ uint32_t*&)maskUb5, nPadding);
-            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
-                preg_compare2, (__ubuf__ uint32_t*&)maskUb6, nPadding);
-            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
-                preg_compare3, (__ubuf__ uint32_t*&)maskUb7, nPadding);
-            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
-                preg_compare4, (__ubuf__ uint32_t*&)maskUb8, nPadding);
-
             Select(vreg_sel1, vreg_min, vreg_input_x1, preg_compare1);
             Select(vreg_sel2, vreg_min, vreg_input_x2, preg_compare2);
-
-            Select(vreg_sel3, vreg_min, vreg_input_x3, preg_compare3);
-            Select(vreg_sel4, vreg_min, vreg_input_x4, preg_compare4);
-
-            Select(vreg_sel5, vreg_min, vreg_input_x5, preg_compare1);
-            Select(vreg_sel6, vreg_min, vreg_input_x6, preg_compare2);
-
-            Select(vreg_sel7, vreg_min, vreg_input_x7, preg_compare3);
-            Select(vreg_sel8, vreg_min, vreg_input_x8, preg_compare4);
-
             StoreAlign<T, MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ T*&)srcUb + i * s2BaseSize, vreg_sel1,
                                                               preg_all);
             StoreAlign<T, MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ T*&)srcUb + floatRepSize + i * s2BaseSize,
                                                               vreg_sel2, preg_all);
+
+            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
+                preg_compare3, (__ubuf__ uint32_t*&)maskUb3, nPadding);
+            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
+                preg_compare4, (__ubuf__ uint32_t*&)maskUb4, nPadding);
+            Select(vreg_sel3, vreg_min, vreg_input_x3, preg_compare3);
+            Select(vreg_sel4, vreg_min, vreg_input_x4, preg_compare4);
             StoreAlign<T, MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ T*&)srcUb + floatRepSize * 2 + i * s2BaseSize,
                                                               vreg_sel3, preg_all);
             StoreAlign<T, MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ T*&)srcUb + floatRepSize * 3 + i * s2BaseSize,
                                                               vreg_sel4, preg_all);
+
+            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
+                preg_compare1, (__ubuf__ uint32_t*&)maskUb5, nPadding);
+            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
+                preg_compare2, (__ubuf__ uint32_t*&)maskUb6, nPadding);
+            Select(vreg_sel5, vreg_min, vreg_input_x5, preg_compare1);
+            Select(vreg_sel6, vreg_min, vreg_input_x6, preg_compare2);
             StoreAlign<T, MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ T*&)srcUb + floatRepSize * 4 + i * s2BaseSize,
                                                               vreg_sel5, preg_all);
             StoreAlign<T, MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ T*&)srcUb + floatRepSize * 5 + i * s2BaseSize,
                                                               vreg_sel6, preg_all);
+
+            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
+                preg_compare3, (__ubuf__ uint32_t*&)maskUb7, nPadding);
+            LoadAlign<uint32_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::MaskDist::DIST_DS>(
+                preg_compare4, (__ubuf__ uint32_t*&)maskUb8, nPadding);
+            Select(vreg_sel7, vreg_min, vreg_input_x7, preg_compare3);
+            Select(vreg_sel8, vreg_min, vreg_input_x8, preg_compare4);
             StoreAlign<T, MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ T*&)srcUb + floatRepSize * 6 + i * s2BaseSize,
                                                               vreg_sel7, preg_all);
             StoreAlign<T, MicroAPI::StoreDist::DIST_NORM_B32>((__ubuf__ T*&)srcUb + floatRepSize * 7 + i * s2BaseSize,

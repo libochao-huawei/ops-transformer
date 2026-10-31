@@ -458,7 +458,7 @@ def trans_pa_to_no_pa(
 
 
 def softmax_flash(x, block_sum, block_max, block_exp, is_first, sink=None):
-    x = x.to(torch.float32)
+    x = x.to(block_sum.dtype)
     x_max = x.max(axis=-1, keepdims=True).values
     if is_first and sink is not None:
         x_max = torch.maximum(x_max, sink)
@@ -648,6 +648,9 @@ def antiquant_data(
         raise NotImplementedError(
             f"unsupported quant_compute_mode: {quant_compute_mode}"
         )
+    if output_dtype == torch.float64:
+        out_antiquant_scale = out_antiquant_scale.to(torch.float64)
+        out_data = out_data.to(torch.float64)
     if quant_compute_mode == 3:
         return out_data * out_antiquant_scale
     elif quant_compute_mode in [1, 2]:
@@ -917,8 +920,15 @@ def fixpipe_softmax_scale(scale):
     return float((bits & np.uint32(0xFFFFE000)).view(np.float32))
 
 
-def tforward(sinner=-1, souter=-1, use_npu=False, **kwargs):
-    q = kwargs["q"]
+def tforward(sinner=-1, souter=-1, mode="cpu", **kwargs):
+    """mode: cpu (default), npu (small-op matmuls), cpu_high (CPU FP64)."""
+    if mode not in ("cpu", "npu", "cpu_high"):
+        raise ValueError(
+            f"unsupported golden mode: {mode!r}; expected cpu, npu or cpu_high"
+        )
+    high_precision = mode == "cpu_high"
+    compute_dtype = torch.float64 if high_precision else torch.float32
+    q = kwargs["q"].to(torch.float64) if high_precision else kwargs["q"]
     k = kwargs["k"]
     v = kwargs["v"]
     k_descale = kwargs["k_descale"]
@@ -930,7 +940,9 @@ def tforward(sinner=-1, souter=-1, use_npu=False, **kwargs):
     sinks = kwargs["sinks"]
     attn_mask = kwargs["attn_mask"]
     quant_compute_mode = kwargs.get("quant_mode", kwargs.get("quant_compute_mode", 1))
-    softmax_scale = fixpipe_softmax_scale(kwargs["softmax_scale"])
+    softmax_scale = kwargs["softmax_scale"]
+    if not high_precision:
+        softmax_scale = fixpipe_softmax_scale(softmax_scale)
     mask_mode = kwargs["mask_mode"]
     win_left = kwargs["win_left"]
     win_right = kwargs["win_right"]
@@ -970,7 +982,7 @@ def tforward(sinner=-1, souter=-1, use_npu=False, **kwargs):
     )
 
     if sinks is not None:
-        sinks = torch.as_tensor(sinks, dtype=torch.float32)
+        sinks = torch.as_tensor(sinks, dtype=compute_dtype)
         if sinks.dim() != 1:
             raise ValueError(f"sinks must be 1-D, but got shape {tuple(sinks.shape)}")
         if sinks.numel() == 0:
@@ -997,11 +1009,11 @@ def tforward(sinner=-1, souter=-1, use_npu=False, **kwargs):
     # the sink as the only softmax term.
     if n2 == 0 or has_empty_input:
         if layout_q in ("BNSD", "BSND"):
-            x_max = torch.zeros((batch, n1, s1), dtype=torch.float32)
-            x_sum = torch.zeros((batch, n1, s1), dtype=torch.float32)
+            x_max = torch.zeros((batch, n1, s1), dtype=compute_dtype)
+            x_sum = torch.zeros((batch, n1, s1), dtype=compute_dtype)
         elif layout_q == "TND":
-            x_max = torch.zeros((q.shape[0], n1), dtype=torch.float32)
-            x_sum = torch.zeros((q.shape[0], n1), dtype=torch.float32)
+            x_max = torch.zeros((q.shape[0], n1), dtype=compute_dtype)
+            x_sum = torch.zeros((q.shape[0], n1), dtype=compute_dtype)
         else:
             raise NotImplementedError(f"unsupported layout_q({layout_q})")
         return attn_out.reshape(attn_out_shape), x_max, x_sum
@@ -1020,11 +1032,11 @@ def tforward(sinner=-1, souter=-1, use_npu=False, **kwargs):
             attn_out = attn_out.reshape(-1, n2, g, d)
 
     if layout_q in ["BSND", "BNSD"]:
-        x_max = torch.zeros((batch, n1, s1))
-        x_sum = torch.zeros((batch, n1, s1))
+        x_max = torch.zeros((batch, n1, s1), dtype=compute_dtype)
+        x_sum = torch.zeros((batch, n1, s1), dtype=compute_dtype)
     elif layout_q == "TND":
-        x_max = torch.zeros((q.shape[0], n1))
-        x_sum = torch.zeros((q.shape[0], n1))
+        x_max = torch.zeros((q.shape[0], n1), dtype=compute_dtype)
+        x_sum = torch.zeros((q.shape[0], n1), dtype=compute_dtype)
     else:
         raise NotImplementedError(f"unsupported layout_q({layout_q})")
 
@@ -1104,11 +1116,11 @@ def tforward(sinner=-1, souter=-1, use_npu=False, **kwargs):
                     )
                 else:
                     souter_actual = souter
-                block_sum = torch.zeros((souter_actual, 1), dtype=torch.float32)
-                block_max = torch.ones((souter_actual, 1), dtype=torch.float32) * (
+                block_sum = torch.zeros((souter_actual, 1), dtype=compute_dtype)
+                block_max = torch.ones((souter_actual, 1), dtype=compute_dtype) * (
                     -float("inf")
                 )
-                block_exp = torch.ones((souter_actual, 1), dtype=torch.float32)
+                block_exp = torch.ones((souter_actual, 1), dtype=compute_dtype)
                 sink_values = get_sink_values_for_block(
                     sinks,
                     n2_idx,
@@ -1188,19 +1200,19 @@ def tforward(sinner=-1, souter=-1, use_npu=False, **kwargs):
                             raise NotImplementedError(
                                 f"unimplemented sparse_mode: {mask_mode}"
                             )
-                    if use_npu:
+                    if mode == "npu":
                         mm1 = npu_batch_matmul_fp32(
                             q_block, k_block.transpose(1, 0).contiguous()
                         )
                     else:
                         mm1 = torch.matmul(
-                            q_block.to(torch.float32),
-                            k_block.to(torch.float32).transpose(1, 0),
+                            q_block.to(compute_dtype),
+                            k_block.to(compute_dtype).transpose(1, 0),
                         )
                     if mask_block is not None:
                         mm1 = mm1 + torch.where(
                             mask_block.to(torch.bool), -torch.inf, 0.0
-                        ).to(torch.float32)
+                        ).to(compute_dtype)
                     p_block, block_sum, block_max, block_exp = softmax_flash(
                         mm1 * softmax_scale,
                         block_sum,
@@ -1209,16 +1221,15 @@ def tforward(sinner=-1, souter=-1, use_npu=False, **kwargs):
                         sinner_idx == 0,
                         sink_values if sinner_idx == 0 else None,
                     )
-                    if use_npu:
+                    if mode == "npu":
                         mm2 = npu_batch_matmul_fp32(
                             p_block.to(q.dtype), v_block.contiguous()
                         )
                     else:
-                        # Cube PV operands use Q precision; max/sum and the
-                        # matmul accumulator remain FP32 (flash_mla reference).
+                        # Preserve default FP32 accumulation; use FP64 in high-precision mode.
                         mm2 = torch.matmul(
-                            p_block.to(torch.float32),
-                            v_block.to(torch.float32),
+                            p_block.to(compute_dtype),
+                            v_block.to(compute_dtype),
                         )
                     if sinner_idx == 0:
                         out_block = mm2
@@ -1336,14 +1347,12 @@ def finalize_softmax_lse(lse, input_data):
     return lse
 
 
-def run_cpu_golden(input_data):
+def run_cpu_golden(input_data, mode="cpu"):
+    """Run golden in cpu (default), npu or cpu_high mode."""
     sinner = input_data.get("sinner", 512)
     souter = input_data.get("souter", 32)
-    use_npu = input_data.get("use_npu", False)
-    input_data = {
-        k: v for k, v in input_data.items() if k not in ("sinner", "souter", "use_npu")
-    }
-    out_cpu, x_max, x_sum = tforward(sinner, souter, use_npu=use_npu, **input_data)
+    input_data = {k: v for k, v in input_data.items() if k not in ("sinner", "souter")}
+    out_cpu, x_max, x_sum = tforward(sinner, souter, mode=mode, **input_data)
     lse = torch.log(x_sum) + x_max
     # No softmax term exists for an empty/invalid row. FIA exposes that state as +inf.
     lse = torch.where(x_sum == 0, torch.full_like(lse, float("inf")), lse)
