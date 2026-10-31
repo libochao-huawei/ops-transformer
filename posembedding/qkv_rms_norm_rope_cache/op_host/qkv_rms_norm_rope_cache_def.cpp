@@ -255,8 +255,8 @@ public:
         this->AICore().AddConfig("ascend910b");
         this->AICore().AddConfig("ascend910_93");
 
-        // Ascend950(DAV_3510 / arch35):原型与 A2 完全一致,不重定义 Input()/Output(),
-        // 只追加 config 并指定 arch35 内核入口。
+        // Ascend950(DAV_3510 / arch35)与 Ascend350:原型与 A2 完全一致,
+        // 不重定义 Input()/Output(),只追加 config 并指定 arch35 内核入口(350 复用同一套 regbase 内核)。
         OpAICoreConfig regbaseConfig;
         regbaseConfig
             .DynamicCompileStaticFlag(true)
@@ -264,6 +264,7 @@ public:
             .DynamicRankSupportFlag(true)
             .ExtendCfgInfo("opFile.value", "qkv_rms_norm_rope_cache_apt");
         this->AICore().AddConfig("ascend950", regbaseConfig);
+        this->AICore().AddConfig("ascend350", regbaseConfig);
     }
 };
 
