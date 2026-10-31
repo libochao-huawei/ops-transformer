@@ -206,6 +206,11 @@ static inline ge::graphStatus Init(const gert::TilingContext* context, const int
         const int64_t* rangeList = reinterpret_cast<const int64_t*>(rangePtr->GetData());
         param.input.start = rangeList[0];
         param.input.end = rangeList[1];
+        if (!isUnpermute && param.input.start > param.input.end) {
+            OP_LOGW(context->GetNodeName(),
+                    "rangeOptional start [%ld] must not exceed end [%ld]; no indices match the range.",
+                    param.input.start, param.input.end);
+        }
     } else {
         param.input.start = 0;
         param.input.end = 0;
