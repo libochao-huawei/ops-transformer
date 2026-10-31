@@ -418,7 +418,12 @@ def generate_qfa_mxfp8_inputs(
     # 主体段(每batch前align_down(kvLen,64)行)才参与V的量化, 尾段置零不进cache
     # (真值只在v_tail, 模拟写入路径的cache尾块剥离); 尾长=kv%64。
     # v_tail PA专属(checker 契约); PA_NZ 要求 D%16==0 (bf16 32B分形内径16)
-    enable_v_tail = bool(kwargs.get("enable_v_tail", False))
+    # v_tail 是否生效以 CSV 里 v_tail slot 是否非空为准（Excel 列直接透传，不再有
+    # enable_v_tail 属性）；兼容旧 CSV 仍带 enable_v_tail 的情形。
+    _vt_shape = tuple(getattr(v_tail, "shape", ()) or ())
+    enable_v_tail = bool(kwargs.get("enable_v_tail", False)) or (
+        len(_vt_shape) > 0 and 0 not in _vt_shape
+    )
     if enable_v_tail:
         if not enable_pa:
             raise ValueError(
