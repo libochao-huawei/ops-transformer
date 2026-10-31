@@ -25,7 +25,7 @@ constexpr uint32_t ATTR_LAYOUT_K_INDEX = 3;
 constexpr uint32_t ATTR_MASK_MODE_INDEX = 4;
 constexpr uint32_t ATTR_QUANT_MODE_INDEX = 5;
 constexpr uint32_t ATTR_RETURN_VALUE_INDEX = 6;
-// sparse_indices_mode(索引输出布局模式, Version(2) 属性, 仅 aclnnPoolKeyIndexerV2 暴露)
+// sparse_indices_mode(索引输出布局模式, 仅 aclnnPoolKeyIndexerV2 暴露)
 constexpr uint32_t ATTR_SPARSE_INDICES_MODE_INDEX = 9;
 
 // topk / poolSize constraints (ref aclnn doc)
@@ -115,8 +115,8 @@ static ge::graphStatus InferShapePoolKeyIndexer(gert::InferShapeContext* context
                                                       "topk must be divisible by pool_size"),
                 return ge::GRAPH_FAILED);
 
-    // sparse_indices_mode(索引输出布局模式, Version(2) 属性): 仅支持 0(legacy) / 1(compact)。
-    // V1 接口运行时属性容器可能不含该项(Version(2) 标记), 守护式读取, 缺省合法。
+    // sparse_indices_mode(索引输出布局模式): 仅支持 0(legacy) / 1(compact)。
+    // 旧 GE 图的运行时属性容器可能不含该项, 守护式读取, 缺省合法。
     if (attrs->GetAttrNum() > ATTR_SPARSE_INDICES_MODE_INDEX) {
         const int64_t* modePtr = attrs->GetInt(ATTR_SPARSE_INDICES_MODE_INDEX);
         OP_CHECK_IF(modePtr != nullptr && *modePtr != 0 && *modePtr != 1,

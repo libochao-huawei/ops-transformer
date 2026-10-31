@@ -95,14 +95,16 @@ public:
         // eager/aclnn 路径 GetDynamicInputStride 返回 nullptr, 属性是唯一来源;
         // -1 表示未指定(连续输入), tiling 回退到 shape 推导。
         this->Attr("k_descale_stride0").AttrType(OPTIONAL).Int(-1);
-        // 索引输出布局模式(尾块追加模式, 参考 kv_rms_norm_rope_cache 的 Version 机制):
+        // 索引输出布局模式(尾块追加模式):
         //   0 = legacy(默认): tail 固定偏移 topk, 短序列 [expandTotal, topk) 为 -1 缝隙,
-        //       与历史版本输出逐比特一致(V1 接口 aclnnPoolKeyIndexer 不暴露本属性,
+        //       与历史版本输出逐比特一致(V1 兼容签名 aclnnPoolKeyIndexer 不暴露本属性,
         //       恒以默认值运行, 模型侧存量调用零感知)
         //   1 = compact    : tail 紧跟有效展开 token, -1 全部位于行尾(消除中间空洞)
-        // Version(2) 使该属性仅出现在 aclnnPoolKeyIndexerV2 接口签名中(V1 ABI 不变);
+        // def 声明全量原型, opbuild 生成单一 inner 接口 aclnnInnerPoolKeyIndexer;
+        // 外层 aclnnPoolKeyIndexer(V1 兼容签名, 冻结 legacy)/aclnnPoolKeyIndexerV2
+        // (全量原型)由 op_api 手写提供(参考 lightning_indexer_v2 手写 aclnn 结构);
         // GE 图模式经 op_graph proto 声明可直接设置。两种模式有效 token 集合一致。
-        this->Attr("sparse_indices_mode").AttrType(OPTIONAL).Int(0).Version(2);
+        this->Attr("sparse_indices_mode").AttrType(OPTIONAL).Int(0);
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)

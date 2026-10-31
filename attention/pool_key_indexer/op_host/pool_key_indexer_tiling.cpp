@@ -162,9 +162,9 @@ ge::graphStatus PoolKeyIndexerTiling::ParseAndCheckParams(PoolKeyIndexerTilingIn
     OP_CHECK_NULL_WITH_CONTEXT(context_, returnValuePtr);
     info.returnValue = *returnValuePtr;
 
-    // sparse_indices_mode(索引输出布局模式, Version(2) 属性): 0=legacy / 1=compact。
-    // 仅 V2 接口(aclnnPoolKeyIndexerV2)/图模式会设置; V1 接口的运行时属性容器
-    // 可能不含该项(Version(2) 标记), 读取以 GetAttrNum + 判空双重守护, 缺省 legacy。
+    // sparse_indices_mode(索引输出布局模式): 0=legacy / 1=compact。
+    // aclnn 路径经 inner 全量原型恒写入(手写 V1 兼容签名固定传 0); 旧 GE 图的
+    // 运行时属性容器可能不含该项, 读取以 GetAttrNum + 判空双重守护, 缺省 legacy。
     info.sparseIndicesMode = PKI_SPARSE_INDICES_MODE_LEGACY;
     if (attrs->GetAttrNum() > PKI_ATTR_SPARSE_INDICES_MODE) {
         const int64_t* modePtr = attrs->GetAttrPointer<int64_t>(PKI_ATTR_SPARSE_INDICES_MODE);

@@ -52,8 +52,8 @@ constexpr uint32_t PKI_ATTR_QUANT_MODE = 5;
 constexpr uint32_t PKI_ATTR_RETURN_VALUE = 6;
 constexpr uint32_t PKI_ATTR_KEY_STRIDE0 = 7;
 constexpr uint32_t PKI_ATTR_K_DESCALE_STRIDE0 = 8;
-// sparse_indices_mode(索引输出布局模式, Version(2) 标记: 仅 aclnnPoolKeyIndexerV2 暴露;
-// V1 接口运行时属性容器可能不含该项, 读取须以 GetAttrNum/判空守护)
+// sparse_indices_mode(索引输出布局模式: 仅 aclnnPoolKeyIndexerV2 暴露, V1 兼容签名不含;
+// 旧 GE 图的运行时属性容器可能不含该项, 读取须以 GetAttrNum/判空守护)
 constexpr uint32_t PKI_ATTR_SPARSE_INDICES_MODE = 9;
 
 // ------------------ Limits ------------------
