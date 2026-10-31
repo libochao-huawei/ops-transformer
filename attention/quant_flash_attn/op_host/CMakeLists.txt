@@ -25,6 +25,13 @@ if("${CONDITION_UNIT}" STREQUAL "ascend950")
         COMPUTE_UNIT Ascend950PR_9599
         OPTIONS -DENABLE_CV_COMM_VIA_SSBUF=true
     )
+elseif("${CONDITION_UNIT}" STREQUAL "ascend350")
+    set(quant_flash_attn_depends attention/common CACHE INTERNAL "Dependencies for quant_flash_attn")
+    add_ops_compile_options(
+        OP_NAME QuantFlashAttn
+        COMPUTE_UNIT Ascend350_355e
+        OPTIONS -DENABLE_CV_COMM_VIA_SSBUF=true
+    )
 elseif("${CONDITION_UNIT}" STREQUAL "ascend960dt")
     set(quant_flash_attn_depends attention/common CACHE INTERNAL "Dependencies for quant_flash_attn")
 endif()

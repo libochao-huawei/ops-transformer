@@ -2586,6 +2586,7 @@ public:
             .ExtendCfgInfo("opFile.value", "fused_infer_attention_score_apt")
             .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
         this->AICore().AddConfig("ascend950", aicore_config_95);
+        this->AICore().AddConfig("ascend350", aicore_config_95);
         this->AICore().AddConfig("ascend960dt", aicore_config_95);
 
         OpAICoreConfig aicore_config_kirin;

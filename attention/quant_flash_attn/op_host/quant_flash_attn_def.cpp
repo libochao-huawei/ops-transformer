@@ -178,6 +178,7 @@ public:
             .ExtendCfgInfo("opFile.value", "quant_flash_attn");
 
         this->AICore().AddConfig("ascend950", aicore_config_95);
+        this->AICore().AddConfig("ascend350", aicore_config_95);
 
         OpAICoreConfig aicore_config_96;
         aicore_config_96.Input("q")

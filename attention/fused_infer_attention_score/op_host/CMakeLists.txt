@@ -35,6 +35,17 @@ if("${CONDITION_UNIT}" STREQUAL "ascend950")
                 -mllvm -cce-vf-remove-membar=false
                 -mllvm -cce-aicore-hoist-movemask=false
     )
+elseif("${CONDITION_UNIT}" STREQUAL "ascend350")
+    add_ops_compile_options(
+        OP_NAME FusedInferAttentionScore
+        COMPUTE_UNIT Ascend350_355e
+        OPTIONS -DENABLE_CV_COMM_VIA_SSBUF=true
+                --cce-auto-sync=off
+                -Wno-deprecated-declarations
+                -Werror
+                -mllvm -cce-vf-remove-membar=false
+                -mllvm -cce-aicore-hoist-movemask=false
+    )
 else()
     add_ops_compile_options(
         OP_NAME FusedInferAttentionScore
