@@ -909,7 +909,7 @@ def batch_level():
 @pytest.mark.parametrize("page", [64, 128])
 def test_batch_consistency(page, batch_level):
     torch_npu.npu.set_deterministic_level(3)
-    import ops.quant_sparse_lightning_indexer_dsl as impl
+    import ops.quant_sparse_lightning_indexer as impl
 
     case = generate_qsli_test_data(
         dict(

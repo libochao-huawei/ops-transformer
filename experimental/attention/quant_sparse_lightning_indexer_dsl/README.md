@@ -177,6 +177,6 @@ indices, values = quant_sparse_lightning_indexer(
 
 ## 编译与验证
 
-Torch 接口分别调用 `ops.quant_lightning_indexer_dsl` / `ops.quant_sparse_lightning_indexer_dsl` 及对应 metadata 模块。使用 native 包时须保持源码、Torch 接口和导出产物版本一致。静态配置变化是否命中取决于包内导出的组合与缓存，不能仅凭第二次调用耗时推断；metadata 调用与 DSL 计算 kernel 编译是不同环节。
+Torch 接口分别调用 `ops.quant_lightning_indexer` / `ops.quant_sparse_lightning_indexer` 及对应 metadata 模块。使用 native 包时须保持源码、Torch 接口和导出产物版本一致。静态配置变化是否命中取决于包内导出的组合与缓存，不能仅凭第二次调用耗时推断；metadata 调用与 DSL 计算 kernel 编译是不同环节。
 
 pytest 公共调用会通过真实 Torch 接口先生成 metadata，再传给计算接口。回归时记录实际加载的实现及其校验值。批跑用例由调用者提供，算子目录不附带用例表。

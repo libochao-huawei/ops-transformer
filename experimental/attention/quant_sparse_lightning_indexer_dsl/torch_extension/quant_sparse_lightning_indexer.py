@@ -154,7 +154,7 @@ def quant_sparse_lightning_indexer(
     return_value=False,
 ):
     """Run the CANNBotDSL QSLI kernel through the Torch NPU dispatcher."""
-    from ops.quant_sparse_lightning_indexer_dsl import (
+    from ops.quant_sparse_lightning_indexer import (
         quant_sparse_lightning_indexer as dsl_quant_sparse_lightning_indexer,
     )
 
@@ -209,7 +209,7 @@ def _quant_sparse_lightning_indexer_metadata_impl(
     layout_q="TND",
     layout_k="TND",
 ):
-    from ops.quant_sparse_lightning_indexer_metadata_dsl import (
+    from ops.quant_sparse_lightning_indexer_metadata import (
         quant_sparse_lightning_indexer_metadata as dsl_metadata,
     )
 

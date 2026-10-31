@@ -189,7 +189,7 @@ def quant_lightning_indexer(
     candidate_block_size=-1,
 ):
     """Run the CANNBotDSL QLI kernel through the Torch NPU dispatcher."""
-    from ops.quant_lightning_indexer_dsl import (
+    from ops.quant_lightning_indexer import (
         quant_lightning_indexer as dsl_quant_lightning_indexer,
     )
 
@@ -242,7 +242,7 @@ def _quant_lightning_indexer_metadata_impl(
     candidate_topk_blocks=-1,
     candidate_block_size=-1,
 ):
-    from ops.quant_lightning_indexer_metadata_dsl import (
+    from ops.quant_lightning_indexer_metadata import (
         quant_lightning_indexer_metadata as dsl_metadata,
     )
 

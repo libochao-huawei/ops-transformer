@@ -71,10 +71,10 @@ def test_qsli_torch_extension_metadata(layout, return_value, monkeypatch):
     import torch_npu
     import cann_ops_transformer.ops.attention.quant_sparse_lightning_indexer_dsl
     from qsli_test_utils import _to_npu_tensors
-    from ops.quant_sparse_lightning_indexer_dsl import (
+    from ops.quant_sparse_lightning_indexer import (
         quant_sparse_lightning_indexer as direct,
     )
-    from ops.quant_sparse_lightning_indexer_metadata_dsl import (
+    from ops.quant_sparse_lightning_indexer_metadata import (
         quant_sparse_lightning_indexer_metadata as direct_metadata,
     )
 

@@ -52,8 +52,8 @@ def test_offset_comparison_uses_local_reference_scores():
 def test_qli_rejects_generalized_head_shape():
     import pytest
     import torch
-    from ops.quant_lightning_indexer_dsl import quant_lightning_indexer
-    from ops.quant_lightning_indexer_metadata_dsl import (
+    from ops.quant_lightning_indexer import quant_lightning_indexer
+    from ops.quant_lightning_indexer_metadata import (
         quant_lightning_indexer_metadata,
     )
 
@@ -80,7 +80,7 @@ def test_tnd_pa_metadata_offsets_and_tail_storage():
     import torch
     import torch_npu
     import cann_ops_transformer.ops.attention.quant_lightning_indexer_dsl
-    from ops.quant_lightning_indexer_metadata_dsl import build_metadata, choose_splits
+    from ops.quant_lightning_indexer_metadata import build_metadata, choose_splits
 
     quant_lightning_indexer = (
         torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer
@@ -209,8 +209,8 @@ def test_qli_torch_extension_outputs(layout, return_value, candidate, monkeypatc
     import torch
     import torch_npu
     import cann_ops_transformer.ops.attention.quant_lightning_indexer_dsl
-    from ops.quant_lightning_indexer_dsl import quant_lightning_indexer as direct
-    from ops.quant_lightning_indexer_metadata_dsl import (
+    from ops.quant_lightning_indexer import quant_lightning_indexer as direct
+    from ops.quant_lightning_indexer_metadata import (
         quant_lightning_indexer_metadata as direct_metadata,
     )
 
@@ -293,7 +293,7 @@ def test_qli_metadata_without_tensor(layout):
     import torch
     import torch_npu
     import cann_ops_transformer.ops.attention.quant_lightning_indexer_dsl
-    from ops.quant_lightning_indexer_metadata_dsl import (
+    from ops.quant_lightning_indexer_metadata import (
         quant_lightning_indexer_metadata,
     )
 
@@ -331,7 +331,7 @@ def test_torch_extension_meta_and_fake(monkeypatch):
 
     for name in names:
         for suffix in ("", "_metadata"):
-            module = importlib.import_module("ops." + name + suffix + "_dsl")
+            module = importlib.import_module("ops." + name + suffix)
             monkeypatch.setattr(module, name + suffix, forbidden)
             assert torch._C._dispatch_has_kernel_for_dispatch_key(
                 "cann_ops_transformer::ds41." + name + suffix, "PrivateUse1"
