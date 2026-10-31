@@ -562,6 +562,12 @@ ge::graphStatus MoeTokenPermuteWithEpTilingBase::GetShapeAttrsInfo()
         return ge::GRAPH_FAILED;
     }
 
+    if (start > end) {
+        OP_LOGW(context_->GetNodeName(),
+                "rangeOptional start [%ld] is greater than end [%ld]; some output entries may remain unwritten.", start,
+                end);
+    }
+
     numOutTokens = end - start;
     numOutTokens = (numOutTokens <= 0) ? numOutTokens + totalLength : numOutTokens;
     numOutTokens = std::min(numOutTokens, totalLength);
