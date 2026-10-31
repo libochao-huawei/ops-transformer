@@ -83,6 +83,27 @@ def has_cpu_output(case_name, cache_dir=None):
     return os.path.exists(_path(case_name, "cpu_output", cache_dir))
 
 
+def save_bench_output(case_name, bench_out, bench_lse, cache_dir=None):
+    path = _path(case_name, "bench_output", cache_dir)
+    torch.save({"bench_out": bench_out, "bench_lse": bench_lse}, path)
+    logger.info("[CACHE] save bench output → %s", path)
+
+
+def load_bench_output(case_name, cache_dir=None):
+    path = _path(case_name, "bench_output", cache_dir)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No cached bench output: {path} (rerun with --golden-mode=gen,cpu)"
+        )
+    data = torch.load(path, weights_only=False)
+    logger.info("[CACHE] load bench output ← %s", path)
+    return data["bench_out"], data["bench_lse"]
+
+
+def has_bench_output(case_name, cache_dir=None):
+    return os.path.exists(_path(case_name, "bench_output", cache_dir))
+
+
 def save_npu_output(case_name, atten_out, lse_out, cache_dir=None):
     path = _path(case_name, "npu_output", cache_dir)
     torch.save({"atten_out": atten_out, "lse_out": lse_out}, path)

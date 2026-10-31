@@ -48,6 +48,15 @@ def pytest_addoption(parser):
         help="golden 缓存目录路径（默认 common/golden_cache/）",
     )
     parser.addoption(
+        "--compare-method",
+        default="two_way",
+        choices=["two_way", "cross_check"],
+        help=(
+            "精度对比方式: two_way=CPU golden 两方对比（默认），"
+            "cross_check=以 fp64 bench 为基准的三方对比"
+        ),
+    )
+    parser.addoption(
         "--parse-prof",
         default=None,
         metavar="PROF_DIR",
@@ -178,3 +187,8 @@ def golden_mode(request):
 @pytest.fixture(scope="session")
 def cache_dir(request):
     return request.config.getoption("--cache-dir")
+
+
+@pytest.fixture(scope="session")
+def compare_method(request):
+    return request.config.getoption("--compare-method")

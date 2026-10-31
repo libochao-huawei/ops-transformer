@@ -60,3 +60,4 @@ TEST_PARAMS = {
 }
 
 CASES = expand_paramset_to_cases(TEST_PARAMS)
+FAIL_CASES = []

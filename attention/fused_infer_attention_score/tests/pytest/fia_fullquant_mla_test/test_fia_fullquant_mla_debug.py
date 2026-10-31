@@ -32,10 +32,10 @@ for _case, _cid in zip(CASES, CASE_IDS):
 
 @pytest.mark.debug
 @pytest.mark.parametrize("params", _param_list)
-def test_fia_fullquant_mla(params, golden_mode, cache_dir):
+def test_fia_fullquant_mla(params, golden_mode, cache_dir, compare_method):
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
-            test_runner.execute_test, params, golden_mode, cache_dir
+            test_runner.execute_test, params, golden_mode, cache_dir, compare_method
         )
         atten_result, lse_result = future.result()
     test_runner.check_results(atten_result, lse_result)

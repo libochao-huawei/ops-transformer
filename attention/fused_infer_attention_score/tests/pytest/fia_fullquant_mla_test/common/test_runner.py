@@ -59,11 +59,12 @@ def apply_params(params):
             setattr(golden, golden_attr, params[param_key])
 
 
-def execute_test(params, mode, cdir=None):
+def execute_test(params, mode, cdir=None, compare_method="two_way"):
     """执行单个 case 的全流程
 
     mode: {"gen","cpu","npu","compare"} 的子集
     cdir: golden 缓存目录
+    compare_method: "two_way"(默认, CPU golden 两方对比) / "cross_check"(以 fp64 bench 为基准的三方对比)
     返回 (atten_result, lse_result)；当 mode 只含 gen/cpu/npu 之一时返回 (None, None)
     """
     apply_params(params)
@@ -114,11 +115,13 @@ def execute_test(params, mode, cdir=None):
     if "gen" in mode and not (mode & {"cpu", "npu", "compare"}):
         return None, None
 
-    # ---- Step 2: CPU Golden ----
+    # ---- Step 2: CPU Golden + fp64 bench ----
+    use_bench = compare_method == "cross_check"
     if "cpu" in mode:
         if golden.NUM_BLOCKS != 0:
-            # NUM_BLOCKS 非 0 时 CPU golden 需要从 cache 还原，留到 npu 阶段拿到 cache 后处理
+            # NUM_BLOCKS 非 0 时 CPU golden/bench 需要从 cache 还原，留到 npu 阶段拿到 cache 后处理
             cpu_out, cpu_lse = None, None
+            bench_out, bench_lse = None, None
         else:
             cpu_out, cpu_lse = golden.cpu_fp8_fullquant_mla_golden(
                 q_fp8,
@@ -134,8 +137,31 @@ def execute_test(params, mode, cdir=None):
                 kr_bf16,
             )
             golden_cache.save_cpu_output(case_name, cpu_out, cpu_lse, cache_dir=cdir)
+            if use_bench:
+                bench_out, bench_lse = golden.cpu_fp8_fullquant_mla_bench(
+                    q_fp8,
+                    k_fp8,
+                    v_fp8,
+                    deq_q,
+                    deq_k,
+                    deq_v,
+                    golden.ACTUAL_SEQ_Q,
+                    golden.ACTUAL_SEQ_KV,
+                    qr_bf16,
+                    kr_bf16,
+                )
+                golden_cache.save_bench_output(
+                    case_name, bench_out, bench_lse, cache_dir=cdir
+                )
+            else:
+                bench_out, bench_lse = None, None
     else:
         cpu_out, cpu_lse = golden_cache.load_cpu_output(case_name, cache_dir=cdir)
+        bench_out, bench_lse = (
+            golden_cache.load_bench_output(case_name, cache_dir=cdir)
+            if use_bench
+            else (None, None)
+        )
 
     if "cpu" in mode and not (mode & {"npu", "compare"}):
         return None, None
@@ -195,22 +221,55 @@ def execute_test(params, mode, cdir=None):
             qr_bf16,
             kr_bf16_recon,
         )
+        if use_bench:
+            bench_out, bench_lse = golden.cpu_fp8_fullquant_mla_bench(
+                q_fp8,
+                k_bnsd_recon,
+                v_bnsd_recon,
+                deq_q,
+                deq_k,
+                deq_v,
+                golden.ACTUAL_SEQ_Q,
+                golden.ACTUAL_SEQ_KV,
+                qr_bf16,
+                kr_bf16_recon,
+            )
         if "cpu" in mode:
             golden_cache.save_cpu_output(case_name, cpu_out, cpu_lse, cache_dir=cdir)
+            if use_bench:
+                golden_cache.save_bench_output(
+                    case_name, bench_out, bench_lse, cache_dir=cdir
+                )
 
     # ---- Step 4/5: 精度对比 ----
     compare_layout = "TND" if golden.ENABLE_PA else golden.INPUT_LAYOUT
     cpu_cmp = golden.convert_q_bnsd_to_layout(
         cpu_out, golden.ACTUAL_SEQ_Q, compare_layout
     )
-    atten_result = result_compare_method.check_result(cpu_cmp, npu_out)
+    if use_bench:
+        bench_cmp = golden.convert_q_bnsd_to_layout(
+            bench_out, golden.ACTUAL_SEQ_Q, compare_layout
+        )
+        atten_result = result_compare_method.cross_check_result(
+            bench_cmp, npu_out, cpu_cmp, "atten"
+        )
+    else:
+        atten_result = result_compare_method.check_result(cpu_cmp, npu_out)
 
     lse_result = None
     if golden.ENABLE_LSE:
         lse_cmp = golden.convert_q_bnsd_to_layout(
             cpu_lse, golden.ACTUAL_SEQ_Q, compare_layout
         )
-        lse_result = result_compare_method.check_result(lse_cmp, lse_out)
+        if use_bench:
+            bench_lse_cmp = golden.convert_q_bnsd_to_layout(
+                bench_lse, golden.ACTUAL_SEQ_Q, compare_layout
+            )
+            lse_result = result_compare_method.cross_check_result(
+                bench_lse_cmp, lse_out, lse_cmp, "lse"
+            )
+        else:
+            lse_result = result_compare_method.check_result(lse_cmp, lse_out)
 
     return atten_result, lse_result
 
@@ -219,23 +278,33 @@ def check_results(atten_result, lse_result):
     if atten_result is None:
         return
 
-    atten_status = atten_result[0] if isinstance(atten_result, tuple) else atten_result
-    if atten_status != "Pass":
-        pct = (
-            atten_result[1]
-            if isinstance(atten_result, tuple) and len(atten_result) > 1
-            else "N/A"
+    if isinstance(atten_result, dict):
+        if atten_result["result"] != "Pass":
+            pytest.fail(f"Attention cross_check failed: {atten_result['detail']}")
+    else:
+        atten_status = (
+            atten_result[0] if isinstance(atten_result, tuple) else atten_result
         )
-        pytest.fail(
-            f"Attention output compare failed: result={atten_status}, PctRlt={pct}"
-        )
-
-    if lse_result is not None:
-        lse_status = lse_result[0] if isinstance(lse_result, tuple) else lse_result
-        if lse_status != "Pass":
+        if atten_status != "Pass":
             pct = (
-                lse_result[1]
-                if isinstance(lse_result, tuple) and len(lse_result) > 1
+                atten_result[1]
+                if isinstance(atten_result, tuple) and len(atten_result) > 1
                 else "N/A"
             )
-            pytest.fail(f"LSE compare failed: result={lse_status}, PctRlt={pct}")
+            pytest.fail(
+                f"Attention output compare failed: result={atten_status}, PctRlt={pct}"
+            )
+
+    if lse_result is not None:
+        if isinstance(lse_result, dict):
+            if lse_result["result"] != "Pass":
+                pytest.fail(f"LSE cross_check failed: {lse_result['detail']}")
+        else:
+            lse_status = lse_result[0] if isinstance(lse_result, tuple) else lse_result
+            if lse_status != "Pass":
+                pct = (
+                    lse_result[1]
+                    if isinstance(lse_result, tuple) and len(lse_result) > 1
+                    else "N/A"
+                )
+                pytest.fail(f"LSE compare failed: result={lse_status}, PctRlt={pct}")

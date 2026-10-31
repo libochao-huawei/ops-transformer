@@ -50,7 +50,7 @@ GRAPH_PATH = 0
 DEVICE_ID = 0
 
 B = 1
-N_q = 10
+N_q = 8
 N_kv = 1
 
 # MLA dims: D_nope + D_rope = qkHeadDim
@@ -642,8 +642,8 @@ def cpu_fp8_fullquant_mla_golden(
                     qri.to(torch.float32), krj_T.to(torch.float32)
                 )
                 sij = sij + rope_score
-            deq_qi_scaled = deq_qi * softmax_scale
-            sij = sij * deq_qi_scaled * deq_k_scalar
+            # descale 乘法顺序需与 NPU 保持一致, 否则 fp32 末位差异会翻转 P 的 fp8 量化取整
+            sij = sij * deq_qi * softmax_scale * deq_k_scalar
 
             causal_mask = mask_blocks[i][j].contiguous()
             sij = sij.masked_fill(causal_mask, float("-inf"))
@@ -690,6 +690,124 @@ def cpu_fp8_fullquant_mla_golden(
     ).contiguous()
     result = torch.where(all_masked, torch.zeros_like(result), result)
     return result, lse
+
+
+def cpu_fp8_fullquant_mla_bench(
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    deq_q,
+    deq_k,
+    deq_v,
+    actual_seq_q,
+    actual_seq_kv,
+    qr_bf16=None,
+    kr_bf16=None,
+):
+    """三方比对 bench: 以 fp64 升精度的 MLA 参考实现
+
+    作为 "cpu/bench" 与 "npu/bench" 的共同高精度基准:
+      - 反量化、bmm、online softmax 全部用 float64 累加, 排除 fp32 归约噪声
+      - running max 取整个 KV 一次(全局), 不复现 kernel 的 KV 分块语义
+      - 保留算子语义: P 的 fp8 cast (行 max 归一化到 448) 与 448 反缩放
+    返回 float32 的 (result, lse), 布局与 golden 一致 (BNSD)
+    """
+    softmax_scale = get_softmax_scale(SCALE_VALUE, D)
+    fp8_e4m3_max = 448.0
+
+    q_t = q_fp8.cpu().to(torch.float64).contiguous()
+    k_t = k_fp8.cpu().to(torch.float64).contiguous()
+    v_t = v_fp8.cpu().to(torch.float64).contiguous()
+    deq_q = deq_q.cpu().double().contiguous()
+    deq_k = deq_k.cpu().double().contiguous()
+    deq_v = deq_v.cpu().double().contiguous()
+    deq_k_scalar = deq_k.reshape(-1)[0] if deq_k.numel() == 1 else deq_k
+    deq_v_scalar = deq_v.reshape(-1)[0] if deq_v.numel() == 1 else deq_v
+    if qr_bf16 is not None:
+        qr_bf16 = qr_bf16.cpu().double().contiguous()
+    if kr_bf16 is not None:
+        kr_bf16 = kr_bf16.cpu().double().contiguous()
+
+    batch, heads, q_seq, _ = q_t.shape
+    v_dim = v_t.shape[-1]
+
+    # 空 KV 场景
+    if k_t.shape[2] == 0:
+        result = torch.zeros(
+            (batch, heads, q_seq, v_dim), dtype=torch.float32
+        ).contiguous()
+        lse = torch.full(
+            (batch, heads, q_seq, 1), float("inf"), dtype=torch.float32
+        ).contiguous()
+        return result, lse
+
+    n_kv = max(int(N_kv), 1)
+    group = max(heads // n_kv, 1)
+
+    # Q 反量化(per-token-head) + softmax_scale 预乘
+    q64 = q_t * deq_q * softmax_scale
+
+    q_lens = torch.tensor(actual_seq_q, dtype=torch.int64).view(-1, 1, 1, 1)
+    k_lens = torch.tensor(actual_seq_kv, dtype=torch.int64).view(-1, 1, 1, 1)
+    Sq, Skv = q_seq, k_t.shape[2]
+    q_range = torch.arange(Sq).view(1, 1, -1, 1)
+    k_range = torch.arange(Skv).view(1, 1, 1, -1)
+    mask = (q_range >= q_lens) | (k_range >= k_lens)
+    if SPARSE_MODE == 3:
+        mask = mask | (k_range > (q_range + (k_lens - q_lens)))
+
+    minValue = -3.402823466e38
+    out = torch.zeros((batch, heads, Sq, v_dim), dtype=torch.float64)
+    o_sum = torch.zeros((batch, heads, Sq, 1), dtype=torch.float64)
+    o_max = torch.full((batch, heads, Sq, 1), minValue, dtype=torch.float64)
+
+    mask = mask.contiguous()
+
+    for kv in range(n_kv):
+        h0 = kv * group
+        h1 = min((kv + 1) * group, heads)
+        if h0 >= h1:
+            continue
+        kj_all = k_t[:, kv : kv + 1] * deq_k_scalar
+        vj_all = v_t[:, kv : kv + 1]
+        sij = torch.matmul(q64[:, h0:h1], kj_all.transpose(-1, -2))
+        if qr_bf16 is not None and kr_bf16 is not None:
+            rope_score = torch.matmul(
+                qr_bf16[:, h0:h1], kr_bf16[:, kv : kv + 1].transpose(-1, -2)
+            )
+            sij = sij + rope_score * deq_q[:, h0:h1] * softmax_scale * deq_k_scalar
+        sij = sij.masked_fill(mask, float("-inf"))
+
+        m_old = o_max[:, h0:h1]
+        m_block = torch.amax(sij, dim=-1, keepdim=True)
+        m_new = torch.maximum(m_old, m_block)
+        upd = torch.exp(m_old - m_new)
+        upd = torch.where(torch.isnan(upd), torch.zeros_like(upd), upd)
+
+        pij = torch.exp(sij - m_new)
+        pij = torch.where(torch.isneginf(sij), torch.zeros_like(pij), pij)
+        s_blk = pij.sum(dim=-1, keepdim=True)
+
+        # P 量化是算子语义(行 max 归一化到 448), 其余算术保持 float64
+        row_max_a = torch.exp(m_block - m_new) + EPSILON
+        p_cast = (pij * (fp8_e4m3_max / row_max_a)).float().to(FP8_DTYPE).double()
+        bmm2 = torch.matmul(p_cast, vj_all) * row_max_a
+
+        out[:, h0:h1] = out[:, h0:h1] * upd + bmm2
+        o_sum[:, h0:h1] = o_sum[:, h0:h1] * upd + s_blk
+        o_max[:, h0:h1] = m_new
+
+    # 最终输出: O = O_flash / rowSum / 448 * deq_v
+    result = out / (o_sum + EPSILON) / fp8_e4m3_max * deq_v_scalar
+
+    all_masked = o_max <= minValue
+    lse = torch.where(
+        all_masked,
+        torch.full_like(o_max, float("inf")),
+        o_max + torch.log(o_sum + EPSILON),
+    )
+    result = torch.where(all_masked, torch.zeros_like(result), result)
+    return result.float().contiguous(), lse.float().contiguous()
 
 
 # ==============================================================================
