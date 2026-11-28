@@ -44,6 +44,7 @@ public:
             .ExtendCfgInfo("opFile.value", "inplace_partial_rotary_mul_grad_apt");
         this->AICore().AddConfig("ascend950", config950);
         opbase::ArchConfigHelper::AddConfigByArch(this->AICore(), Ops::Base::DAV_9201, config950);
+        opbase::ArchConfigHelper::AddConfigByArch(this->AICore(), Ops::Base::DAV_9202, config950);
     }
 };
 

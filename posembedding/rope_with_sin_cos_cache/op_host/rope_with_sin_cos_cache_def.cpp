@@ -74,6 +74,7 @@ public:
             .ExtendCfgInfo("opFile.value", "rope_with_sin_cos_cache_apt");
         this->AICore().AddConfig("ascend950", regbaseCfg);
         this->AICore().AddConfig("ascend960dt", regbaseCfg);
+        this->AICore().AddConfig("ascend960pr", regbaseCfg);
 
         OpAICoreConfig config_kirin = GetKirinCoreConfig();
         this->AICore().AddConfig("kirinx90", config_kirin);

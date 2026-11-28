@@ -72,7 +72,7 @@ __aicore__ inline void HalfGradAlignVF(const LocalTensor<T>& sinTensor, const Lo
                     ops::LoadTwoTensorForDtypeT<T>(currCosUb, currCosUb, vregCos, vregHalfCos, preg, preg, offset,
                                                    halfOffset);
 
-#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201)
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202)
                     Mul(vregOut, vregCos, vregIn, preg);
                     MulAddDst(vregOut, vregHalfSin, vregHalfIn, preg);
                     Mul(vregHalfOut, vregSin, vregIn, preg);
@@ -152,7 +152,7 @@ __aicore__ inline void HalfGradCosSinPartialVF(const LocalTensor<T>& sinTensor, 
                                                    halfOffset);
                     ops::LoadTwoTensorForDtypeT<T>(currXUb, currXUb, vregX1, vregX2, preg, preg, offset, halfOffset);
 
-#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201)
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202)
                     Mul(vregTmp1, vregCos1, vregGrad1, preg);
                     MulAddDst(vregTmp1, vregSin2, vregGrad2, preg);
                     Mul(vregTmp3, vregSin1, vregGrad1, preg);
@@ -310,7 +310,7 @@ __aicore__ inline void BatchHalfGradContiguousVF(__ubuf__ T* in, __ubuf__ T* cos
                         ops::LoadOneTensorForDtypeT<T>(currSinUb, sinPart1Reg, pregLoop, i * VL_FLOAT32_SIZE);
                         ops::LoadOneTensorForDtypeT<T>(currSinUb, sinPart2Reg, pregLoop,
                                                        i * VL_FLOAT32_SIZE + dHalfOffset);
-#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201)
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202)
                         Mul(cosPart1Reg, inPart1Reg, cosPart1Reg, pregLoop);
                         MulAddDst(cosPart1Reg, sinPart2Reg, inPart2Reg, pregLoop);
                         Mul(cosPart2Reg, inPart2Reg, cosPart2Reg, pregLoop);

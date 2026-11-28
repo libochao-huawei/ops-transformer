@@ -30,6 +30,12 @@ if (BUILD_OPEN_PROJECT)
         COMPUTE_UNIT Ascend960DT_968B7
         OPTIONS -mllvm -cce-aicore-dcci-before-kernel-end=false
         )
+    elseif ("${ASCEND_COMPUTE_UNIT}" STREQUAL "ascend960pr")
+        add_ops_compile_options(
+        OP_NAME RopeWithSinCosCache
+        COMPUTE_UNIT Ascend960PR_969A1
+        OPTIONS -mllvm -cce-aicore-dcci-before-kernel-end=false
+        )
     endif()
 endif()
 
