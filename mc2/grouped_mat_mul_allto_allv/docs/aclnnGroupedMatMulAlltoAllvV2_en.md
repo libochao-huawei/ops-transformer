@@ -399,6 +399,7 @@ aclnnStatus aclnnGroupedMatMulAlltoAllvV2(
 - <term>Atlas A2 products</term>:
   - Both A and BSK must be in the range [1, 5000000]; N1 must not exceed 32768.
   - `sendCounts` and `recvCounts` are both INT64 direct count arrays, flattened in the order of `[rank][localExpert]`. The length of each must be equal to e * epWorldSize. Elements are non-negative, do not exceed A and BSK respectively, and their sums equal A and BSK respectively.
+  - For each source rank `s`, destination rank `d`, and expert index `i`, `sendCounts[d * e + i]` on the source rank must equal `recvCounts[s * e + i]` on the destination rank. The two arrays on the same rank can differ. The caller must ensure the counts match entry by entry across ranks. The AIV receive path skips a segment if the counts for that segment do not match.
   - `HCCL_BUFFSIZE` on each device in the communicator must be set based on the maximum send volume, satisfying `HCCL_BUFFSIZE >= max(200, ceil(A * N1 * 2 / 1048576) + 21)`, in MiB. Each FLOAT16 and BFLOAT16 element occupies 2 bytes, and 21 MiB is reserved for the control region.
 
 <!-- end id13 -->
