@@ -104,7 +104,7 @@ English | [简体中文](./README.md)
         expandedXOut[gatherRowIdx[i]]=quantResult[i // K]
         $$
 
-  6. The number of valid elements availableIdxNum of expandedRowIdxOut is calculated as the number of elements in expertIdx within the activeExpertRangeOptional range. -1 is also out of this range, indicating an invalid expert that does not participate in routing calculation:
+  6. The number of valid elements availableIdxNum of expandedRowIdxOut is calculated as the number of elements in expertIdx within the activeExpertRangeOptional range. -1 is also out of this range, indicating an invalid expert that does not participate in routing calculation. Support for -1 varies by product. For details, see the support description in "Constraints":
     $$
     availableIdxNum = |\{x\in expertIdx| expert\_start \le x<expert\_end \ \}|
     $$
@@ -143,7 +143,7 @@ English | [简体中文](./README.md)
       <tr>
         <td>expertIdx</td>
         <td>Input</td>
-        <td>K experts that process the tokens in each row. The expert IDs of elements cannot exceed the number of experts, and -1 indicates an invalid expert (this position does not participate in routing and is filtered out). Corresponds to expertIdx in the formula.</td>
+        <td>K experts that process the tokens in each row. The expert IDs of elements cannot exceed the number of experts, and -1 indicates an invalid expert (this position does not participate in routing and is filtered out). Corresponds to expertIdx in the formula. Support for -1 varies by product. For details, see "Constraints".</td>
         <td>INT32</td>
         <td>ND</td>
       </tr>
@@ -272,6 +272,9 @@ English | [简体中文](./README.md)
         - H is an even number, used to pack every two INT4 values along the H dimension into 1 byte.
         - scaleOptional is not input, or the input shape is (1, H) with the FLOAT32 data type, indicating the smooth scale broadcast along the H dimension for experts within the activeExpertRangeOptional range; offsetOptional is not input.
         - When expertTokensNumType is 0 or 1, the shape of expertTokensCountOrCumsumOut is [expertEnd-expertStart]; when expertTokensNumType is 2, the shape of expertTokensCountOrCumsumOut is [expertNum, 2].
+  - Support for -1 (invalid expert) in expertIdx:
+    - <term>Atlas A2 products</term>, <term>Atlas A3 products</term>: Inputting -1 in expertIdx is not supported. The value range of expertIdx is [0, expertNum-1].
+    - <term>Ascend 950PR&950DT products</term>: Support inputting -1 in expertIdx. -1 is filtered out and does not participate in routing calculation.
 
 - Special constraints of <term>Ascend 950PR&950DT products</term> in DropPad mode (when dropPadMode=1):
   - rowIdxType supports only the value 0 (gather index).

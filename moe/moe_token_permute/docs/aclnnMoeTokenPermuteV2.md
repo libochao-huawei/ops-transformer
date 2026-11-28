@@ -195,44 +195,54 @@ int CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& 
 }
 
 int main() {
+    // 示例用途：演示通过两段式接口aclnnMoeTokenPermuteV2GetWorkspaceSize与aclnnMoeTokenPermuteV2
+    // 完成MoE的token permute计算。输入tokens（3行token，每行4个元素）与indices（每个token
+    // 对应2个专家索引，即topK=2）；quantMode=-1为非量化场景，输出permuteTokensOut（shape为
+    // [6, 4]）与sortedIndicesOut（shape为[6]），expandedScaleOut传shape为[0]的空Tensor。
     int32_t deviceId = 0;
     aclrtStream stream;
     auto ret = Init(deviceId, &stream);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
 
-    std::vector<int64_t> xShape = {3, 4};
+    // 构造输入与输出的shape，需与接口参数定义保持一致
+    std::vector<int64_t> tokensShape = {3, 4};
     std::vector<int64_t> indicesShape = {3, 2};
-    std::vector<int64_t> expandedXOutShape = {6, 4};
+    std::vector<int64_t> permuteTokensOutShape = {6, 4};
     std::vector<int64_t> sortedIndicesOutShape = {6};
     std::vector<int64_t> expandedScaleOutShape = {0};
 
-    void* xDeviceAddr = nullptr;
+    void* tokensDeviceAddr = nullptr;
     void* indicesDeviceAddr = nullptr;
-    void* expandedXOutDeviceAddr = nullptr;
+    void* permuteTokensOutDeviceAddr = nullptr;
     void* sortedIndicesOutDeviceAddr = nullptr;
     void* expandedScaleOutDeviceAddr = nullptr;
-    aclTensor* x = nullptr;
+    aclTensor* tokens = nullptr;
     aclTensor* indices = nullptr;
-    aclTensor* expandedXOut = nullptr;
+    aclTensor* permuteTokensOut = nullptr;
     aclTensor* sortedIndicesOut = nullptr;
     aclTensor* expandedScaleOut = nullptr;
 
-    std::vector<float> xHostData = {
+    // 构造输入tokens与indices的数据
+    std::vector<float> tokensHostData = {
         0.1, 0.1, 0.1, 0.1,
         0.2, 0.2, 0.2, 0.2,
         0.3, 0.3, 0.3, 0.3
     };
     std::vector<int32_t> indicesHostData = {1, 2, 0, 1, 0, 2};
-    std::vector<float> expandedXOutHostData(24, 0);
-    std::vector<int32_t> sortedIndicesOutHostData(6, 0);
+    // 输出Tensor的数据缓冲区，长度由输出shape计算得到
+    std::vector<float> permuteTokensOutHostData(GetShapeSize(permuteTokensOutShape), 0);
+    std::vector<int32_t> sortedIndicesOutHostData(GetShapeSize(sortedIndicesOutShape), 0);
     std::vector<float> expandedScaleOutHostData;
 
-    ret = CreateAclTensor(xHostData, xShape, &xDeviceAddr, ACL_FLOAT, &x);
+    // 创建输入tokens与indices对应的aclTensor
+    ret = CreateAclTensor(tokensHostData, tokensShape, &tokensDeviceAddr, ACL_FLOAT, &tokens);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
     ret = CreateAclTensor(indicesHostData, indicesShape, &indicesDeviceAddr, ACL_INT32, &indices);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
-    ret = CreateAclTensor(expandedXOutHostData, expandedXOutShape, &expandedXOutDeviceAddr,
-                          ACL_FLOAT, &expandedXOut);
+    // 创建输出permuteTokensOut与sortedIndicesOut对应的aclTensor；
+    // 非量化场景下expandedScaleOut传shape为[0]的空Tensor
+    ret = CreateAclTensor(permuteTokensOutHostData, permuteTokensOutShape, &permuteTokensOutDeviceAddr,
+                          ACL_FLOAT, &permuteTokensOut);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
     ret = CreateAclTensor(sortedIndicesOutHostData, sortedIndicesOutShape, &sortedIndicesOutDeviceAddr,
                           ACL_INT32, &sortedIndicesOut);
@@ -241,17 +251,20 @@ int main() {
                           ACL_FLOAT, &expandedScaleOut);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
 
+    // numOutTokens=0表示不删除token；paddedMode当前不支持true，固定为false；quantMode=-1为非量化
     int64_t numOutTokens = 0;
     bool paddedMode = false;
     int64_t quantMode = -1;
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
+    // 调用第一段接口获取workspace大小与执行器
     ret = aclnnMoeTokenPermuteV2GetWorkspaceSize(
-        x, indices, numOutTokens, paddedMode, quantMode, expandedXOut, sortedIndicesOut, expandedScaleOut,
+        tokens, indices, numOutTokens, paddedMode, quantMode, permuteTokensOut, sortedIndicesOut, expandedScaleOut,
         &workspaceSize, &executor);
     CHECK_RET(ret == ACL_SUCCESS,
               LOG_PRINT("aclnnMoeTokenPermuteV2GetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
 
+    // 根据第一段接口计算出的workspaceSize申请device内存
     void* workspaceAddr = nullptr;
     if (workspaceSize > 0) {
         ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
@@ -263,24 +276,26 @@ int main() {
     ret = aclrtSynchronizeStream(stream);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
 
-    std::vector<float> expandedXData(24, 0);
-    ret = aclrtMemcpy(expandedXData.data(), expandedXData.size() * sizeof(float), expandedXOutDeviceAddr,
-                      expandedXData.size() * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST);
-    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy expandedXOut failed. ERROR: %d\n", ret); return ret);
-    std::vector<int32_t> sortedIndicesData(6, 0);
+    // 将device侧的计算结果拷贝至host侧用于验证，permuteTokensOut的shape为[6, 4]，sortedIndicesOut的shape为[6]
+    std::vector<float> permuteTokensData(GetShapeSize(permuteTokensOutShape), 0);
+    ret = aclrtMemcpy(permuteTokensData.data(), permuteTokensData.size() * sizeof(float), permuteTokensOutDeviceAddr,
+                      permuteTokensData.size() * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST);
+    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy permuteTokensOut failed. ERROR: %d\n", ret); return ret);
+    std::vector<int32_t> sortedIndicesData(GetShapeSize(sortedIndicesOutShape), 0);
     ret = aclrtMemcpy(sortedIndicesData.data(), sortedIndicesData.size() * sizeof(int32_t),
                       sortedIndicesOutDeviceAddr, sortedIndicesData.size() * sizeof(int32_t),
                       ACL_MEMCPY_DEVICE_TO_HOST);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy sortedIndicesOut failed. ERROR: %d\n", ret); return ret);
 
-    aclDestroyTensor(x);
+    // 释放资源
+    aclDestroyTensor(tokens);
     aclDestroyTensor(indices);
-    aclDestroyTensor(expandedXOut);
+    aclDestroyTensor(permuteTokensOut);
     aclDestroyTensor(sortedIndicesOut);
     aclDestroyTensor(expandedScaleOut);
-    aclrtFree(xDeviceAddr);
+    aclrtFree(tokensDeviceAddr);
     aclrtFree(indicesDeviceAddr);
-    aclrtFree(expandedXOutDeviceAddr);
+    aclrtFree(permuteTokensOutDeviceAddr);
     aclrtFree(sortedIndicesOutDeviceAddr);
     if (expandedScaleOutDeviceAddr != nullptr) {
         aclrtFree(expandedScaleOutDeviceAddr);

@@ -75,9 +75,9 @@ permuted_tokens, sorted_indices, expanded_scale
 F = indices.numel()
 H = tokens.shape[1]
 
-num_out_tokens is None或num_out_tokens == 0:M = F
-num_out_tokens > 0:                              M = min(num_out_tokens, F)
-num_out_tokens < 0:                              M = max(F + num_out_tokens, 0)
+num_out_tokens is None 或 num_out_tokens == 0:  M = F
+num_out_tokens > 0:                             M = min(num_out_tokens, F)
+num_out_tokens < 0:                             M = max(F + num_out_tokens, 0)
 ```
 
 各量化模式的输出如下：
@@ -97,7 +97,7 @@ AlignUp(a, b)  = CeilDiv(a, b) * b
 ```
 
 - `permuted_tokens`：根据`indices`扩展并按专家索引排序后的token；仅该输出和`expanded_scale`的第一维受`num_out_tokens`影响。
-- `sorted_indices`：`permuted_tokens`与原始`tokens`的行映射关系，长度始终为`indices.numel()`。
+- `sorted_indices`：`permuted_tokens`与原始`tokens`的行映射关系，长度始终为`indices.numel()`；当`num_out_tokens`截断`permuted_tokens`（M小于F）时，仅前M项对应返回的`permuted_tokens`的行，其余项对应的行被截断丢弃。
 - `expanded_scale`：量化输出对应的per-token分块scale；非量化模式返回空Tensor。
 
 > [!NOTE]
@@ -145,6 +145,9 @@ print(expanded_scale.shape)   # torch.Size([0])
 ### Ascend 950 MXFP8调用
 
 ```python
+# 复用上例创建的tokens（shape为[4, 128]，float16）与indices（shape为[4, 2]，int32），
+# 独立运行该代码块时需先按上例完成import并构造这两个输入
+# quant_mode=2表示MXFP8 E5M2量化，expanded_scale返回per-token分块scale
 permuted_tokens, sorted_indices, expanded_scale = moe_token_permute(
     tokens,
     indices,

@@ -144,7 +144,7 @@ aclnnStatus aclnnMoeTokenPermute(
       <td>permuteTokensOut</td>
       <td>输出</td>
       <td>根据indices进行扩展并排序过的tokens。</td>
-      <td><ul><li>支持空Tensor。</li><li>要求是一个维度大于等于2的Tensor，第一维的大小为min(num_tokens * topK, numOutTokens)。</li><li>除第一维外其余维度大小乘积与tokens除第一维外其余维度大小乘积相同。</li><li>数据类型同tokens。</li></ul></td>
+      <td><ul><li>支持空Tensor。</li><li>要求是一个维度大于等于2的Tensor，第一维的大小根据numOutTokens确定：numOutTokens为0时为num_tokens * topK；numOutTokens大于0时为min(num_tokens * topK, numOutTokens)；numOutTokens小于0时为max(num_tokens * topK + numOutTokens, 0)。</li><li>除第一维外其余维度大小乘积与tokens除第一维外其余维度大小乘积相同。</li><li>数据类型同tokens。</li></ul></td>
       <td>FLOAT16、BFLOAT16、FLOAT32、INT8</td>
       <td>ND</td>
       <td>≥2</td>
@@ -340,6 +340,11 @@ int CreateAclTensor(const std::vector<T>& hostData, const std::vector<int64_t>& 
     return 0;
 }
 int main() {
+    // 示例用途：演示通过两段式接口aclnnMoeTokenPermuteGetWorkspaceSize与aclnnMoeTokenPermute完成MoE的
+    // token permute计算：根据indices将tokens广播并按专家索引排序。输入tokens（3行token，每行4个元素）与
+    // indices（每个token对应2个专家索引，即topK=2），numOutTokens=0表示不删除token，paddedMode固定为
+    // false；输出permuteTokensOut（shape为[6, 4]）与sortedIndicesOut（shape为[6]），运行后将打印
+    // 两个输出的全部元素。
     // 1. 固定写法，device/stream初始化，参考acl对外接口列表
     // 根据自己的实际device填写deviceId
     int32_t deviceId = 0;
@@ -348,40 +353,42 @@ int main() {
     // check根据自己的需要处理
     CHECK_RET(ret == 0, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
     // 2. 构造输入与输出，需要根据API的接口定义构造
-    std::vector<int64_t> xShape = {3, 4};
-    std::vector<int64_t> idxShape = {3, 2};
-    std::vector<int64_t> expandedXOutShape = {6, 4};
-    std::vector<int64_t> idxOutShape = {6};
-    void* xDeviceAddr = nullptr;
+    std::vector<int64_t> tokensShape = {3, 4};
+    std::vector<int64_t> indicesShape = {3, 2};
+    std::vector<int64_t> permuteTokensOutShape = {6, 4};
+    std::vector<int64_t> sortedIndicesOutShape = {6};
+    void* tokensDeviceAddr = nullptr;
     void* indicesDeviceAddr = nullptr;
-    void* expandedXOutDeviceAddr = nullptr;
+    void* permuteTokensOutDeviceAddr = nullptr;
     void* sortedIndicesOutDeviceAddr = nullptr;
-    aclTensor* x = nullptr;
+    aclTensor* tokens = nullptr;
     aclTensor* indices = nullptr;
-    int64_t numTokenOut = 0;
-    bool padMode = false;
+    // numOutTokens=0表示不删除token；paddedMode当前不支持true，固定为false
+    int64_t numOutTokens = 0;
+    bool paddedMode = false;
 
-    aclTensor* expandedXOut = nullptr;
+    aclTensor* permuteTokensOut = nullptr;
     aclTensor* sortedIndicesOut = nullptr;
-    std::vector<float> xHostData = {0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.2, 0.3, 0.3, 0.3, 0.3};
+    std::vector<float> tokensHostData = {0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.2, 0.3, 0.3, 0.3, 0.3};
     std::vector<int> indicesHostData = {1, 2, 0, 1, 0, 2};
-    std::vector<float> expandedXOutHostData = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    std::vector<int> sortedIndicesOutHostData = {0, 0, 0, 0, 0, 0};
-    // 创建self aclTensor
-    ret = CreateAclTensor(xHostData, xShape, &xDeviceAddr, aclDataType::ACL_FLOAT, &x);
+    // 输出Tensor的数据缓冲区，长度由输出shape计算得到
+    std::vector<float> permuteTokensOutHostData(GetShapeSize(permuteTokensOutShape), 0);
+    std::vector<int> sortedIndicesOutHostData(GetShapeSize(sortedIndicesOutShape), 0);
+    // 创建输入tokens对应的aclTensor
+    ret = CreateAclTensor(tokensHostData, tokensShape, &tokensDeviceAddr, aclDataType::ACL_FLOAT, &tokens);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
-    ret = CreateAclTensor(indicesHostData, idxShape, &indicesDeviceAddr, aclDataType::ACL_INT32, &indices);
+    ret = CreateAclTensor(indicesHostData, indicesShape, &indicesDeviceAddr, aclDataType::ACL_INT32, &indices);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
-    // 创建out aclTensor
-    ret = CreateAclTensor(expandedXOutHostData, expandedXOutShape, &expandedXOutDeviceAddr, aclDataType::ACL_FLOAT, &expandedXOut);
+    // 创建输出permuteTokensOut与sortedIndicesOut对应的aclTensor
+    ret = CreateAclTensor(permuteTokensOutHostData, permuteTokensOutShape, &permuteTokensOutDeviceAddr, aclDataType::ACL_FLOAT, &permuteTokensOut);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
-    ret = CreateAclTensor(sortedIndicesOutHostData, idxOutShape, &sortedIndicesOutDeviceAddr, aclDataType::ACL_INT32, &sortedIndicesOut);
+    ret = CreateAclTensor(sortedIndicesOutHostData, sortedIndicesOutShape, &sortedIndicesOutDeviceAddr, aclDataType::ACL_INT32, &sortedIndicesOut);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
     // 3. 调用CANN算子库API，需要修改为具体的API
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor;
     // 调用aclnnMoeTokenPermute第一段接口
-    ret = aclnnMoeTokenPermuteGetWorkspaceSize(x, indices, numTokenOut, padMode, expandedXOut,
+    ret = aclnnMoeTokenPermuteGetWorkspaceSize(tokens, indices, numOutTokens, paddedMode, permuteTokensOut,
                                                sortedIndicesOut, &workspaceSize, &executor);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnMoeTokenPermuteGetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
     // 根据第一段接口计算出的workspaceSize申请device内存
@@ -397,15 +404,15 @@ int main() {
     ret = aclrtSynchronizeStream(stream);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
     // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
-    auto expandedXSize = GetShapeSize(expandedXOutShape);
-    std::vector<float> expandedXData(expandedXSize, 0);
-    ret = aclrtMemcpy(expandedXData.data(), expandedXData.size() * sizeof(expandedXData[0]), expandedXOutDeviceAddr, expandedXSize * sizeof(float),
+    auto permuteTokensSize = GetShapeSize(permuteTokensOutShape);
+    std::vector<float> permuteTokensData(permuteTokensSize, 0);
+    ret = aclrtMemcpy(permuteTokensData.data(), permuteTokensData.size() * sizeof(permuteTokensData[0]), permuteTokensOutDeviceAddr, permuteTokensSize * sizeof(float),
                       ACL_MEMCPY_DEVICE_TO_HOST);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return ret);
-    for (int64_t i = 0; i < expandedXSize; i++) {
-        LOG_PRINT("expandedXData[%ld] is: %f\n", i, expandedXData[i]);
+    for (int64_t i = 0; i < permuteTokensSize; i++) {
+        LOG_PRINT("permuteTokensData[%ld] is: %f\n", i, permuteTokensData[i]);
     }
-    auto sortedIndicesSize = GetShapeSize(idxOutShape);
+    auto sortedIndicesSize = GetShapeSize(sortedIndicesOutShape);
     std::vector<int> sortedIndicesData(sortedIndicesSize, 0);
     ret = aclrtMemcpy(sortedIndicesData.data(), sortedIndicesData.size() * sizeof(sortedIndicesData[0]), sortedIndicesOutDeviceAddr, sortedIndicesSize * sizeof(int32_t),
                       ACL_MEMCPY_DEVICE_TO_HOST);
@@ -414,15 +421,15 @@ int main() {
         LOG_PRINT("sortedIndicesData[%ld] is: %d\n", i, sortedIndicesData[i]);
     }
     // 6. 释放aclTensor和aclScalar，需要根据具体API的接口定义修改
-    aclDestroyTensor(x);
+    aclDestroyTensor(tokens);
     aclDestroyTensor(indices);
-    aclDestroyTensor(expandedXOut);
+    aclDestroyTensor(permuteTokensOut);
     aclDestroyTensor(sortedIndicesOut);
 
     // 7. 释放device资源，需要根据具体API的接口定义修改
-    aclrtFree(xDeviceAddr);
+    aclrtFree(tokensDeviceAddr);
     aclrtFree(indicesDeviceAddr);
-    aclrtFree(expandedXOutDeviceAddr);
+    aclrtFree(permuteTokensOutDeviceAddr);
     aclrtFree(sortedIndicesOutDeviceAddr);
     if (workspaceSize > 0) {
       aclrtFree(workspaceAddr);

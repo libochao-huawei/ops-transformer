@@ -148,7 +148,7 @@
       expandedXOut[gatherRowIdx[i]]=quantResult[i // K]
       $$
 
-  6.expandedRowIdxOut的有效元素数量availableIdxNum，计算方式为expertIdx中activeExpertRangeOptional范围内的元素的个数，-1也不在该范围内，表示无效专家，不参与路由计算：
+  6.expandedRowIdxOut的有效元素数量availableIdxNum，计算方式为expertIdx中activeExpertRangeOptional范围内的元素的个数，-1也不在该范围内，表示无效专家，不参与路由计算。-1的支持情况在不同产品上存在差异，详见"不同产品支持情况差异"章节：
 
     $$
     availableIdxNum = |\{x\in expertIdx| expert\_start \le x<expert\_end \ \}|
@@ -237,7 +237,7 @@ aclnnStatus aclnnMoeInitRoutingV3(
     <tr>
       <td>expertIdx（aclTensor）</td>
       <td>输入</td>
-      <td>每一行特征对应的K个处理专家，里面元素专家id不能超过专家数，-1表示无效专家（该位置不参与路由，会被过滤）</td>
+      <td>每一行特征对应的K个处理专家，里面元素专家id不能超过专家数，-1表示无效专家（该位置不参与路由，会被过滤；-1的支持情况存在产品差异，见"不同产品支持情况差异"）</td>
       <td>shape为(NUM_ROWS, K)</td>
       <td>INT32</td>
       <td>ND</td>
@@ -535,6 +535,15 @@ aclnnStatus aclnnMoeInitRoutingV3(
     - <term>Ascend 950PR&950DT系列产品</term>：支持-1、0、1、2、3、4、5、6、7、8、9、11、12、13、14、15、16、17。
     <!-- end id8 -->
 
+  - expertIdx中-1（无效专家）的支持情况差异：
+
+    <!-- npu="A3,910b" id13 -->
+    - <term>Atlas A2系列产品</term>、<term>Atlas A3系列产品</term>：不支持在expertIdx中输入-1，expertIdx的取值范围为[0, expertNum-1]。
+    <!-- end id13 -->
+    <!-- npu="950" id14 -->
+    - <term>Ascend 950PR&950DT系列产品</term>：支持在expertIdx中输入-1，-1会被过滤、不参与路由计算。
+    <!-- end id14 -->
+
   <!-- npu="950" id9 -->
   - <term>Ascend 950PR&950DT系列产品</term>仅支持如下参数的值：
     - activeNum参数不使用，支持取值为-1、0或NUM_ROWS*K。
@@ -636,6 +645,8 @@ aclnnStatus aclnnMoeInitRoutingV3(
   - <term>Ascend 950PR&950DT系列产品</term>：NUM_ROWS*K&gt;0且H=0时仍走正常路由流程，生成expandedRowIdxOut和expertTokensCountOrCumsumOut。
 
 - 不支持输入为inf/-inf/nan。
+
+- expertIdx中-1（无效专家）的支持情况存在产品差异：仅<term>Ascend 950PR&950DT系列产品</term>支持在expertIdx中输入-1；<term>Atlas A2系列产品</term>、<term>Atlas A3系列产品</term>不支持，expertIdx的取值范围为[0, expertNum-1]。详见"不同产品支持情况差异"章节。
 
 ## 调用示例
 

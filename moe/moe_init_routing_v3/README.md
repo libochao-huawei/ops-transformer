@@ -102,7 +102,7 @@
         expandedXOut[gatherRowIdx[i]]=quantResult[i // K]
         $$
 
-  6.expandedRowIdxOut的有效元素数量availableIdxNum计算方式为，expertIdx中activeExpertRangeOptional范围内的元素的个数，-1也不在该范围内，表示无效专家，不参与路由计算：
+  6.expandedRowIdxOut的有效元素数量availableIdxNum计算方式为，expertIdx中activeExpertRangeOptional范围内的元素的个数，-1也不在该范围内，表示无效专家，不参与路由计算。-1的支持情况在不同产品上存在差异，具体见"约束说明"中的支持情况说明：
     $$
     availableIdxNum = |\{x\in expertIdx| expert\_start \le x<expert\_end \ \}|
     $$
@@ -141,7 +141,7 @@
       <tr>
         <td>expertIdx</td>
         <td>输入</td>
-        <td>每一行特征对应的K个处理专家，里面元素专家id不能超过专家数，-1表示无效专家（该位置不参与路由，会被过滤）。对应公式中expertIdx。</td>
+        <td>每一行特征对应的K个处理专家，里面元素专家id不能超过专家数，-1表示无效专家（该位置不参与路由，会被过滤）。对应公式中expertIdx。-1的支持情况存在产品差异，详见"约束说明"。</td>
         <td>INT32</td>
         <td>ND</td>
       </tr>
@@ -270,6 +270,9 @@
         - H为偶数，用于沿H维每两个INT4值打包为1个字节。
         - scaleOptional不输入，或输入shape为(1, H)、数据类型为FLOAT32，表示对activeExpertRangeOptional范围内的expert按H维广播smooth scale；offsetOptional不输入。
         - expertTokensNumType为0或1时，expertTokensCountOrCumsumOut的shape为[expertEnd-expertStart]；expertTokensNumType为2时，expertTokensCountOrCumsumOut的shape为[expertNum, 2]。
+  - expertIdx中-1（无效专家）的支持情况：
+    - <term>Atlas A2系列产品</term>、<term>Atlas A3系列产品</term>：不支持在expertIdx中输入-1，expertIdx的取值范围为[0, expertNum-1]。
+    - <term>Ascend 950PR&950DT系列产品</term>：支持在expertIdx中输入-1，-1会被过滤、不参与路由计算。
 
 - <term>Ascend 950PR&950DT系列产品</term> DropPad模式特殊约束（dropPadMode=1时）：
   - rowIdxType仅支持取值为0（gather索引）。
