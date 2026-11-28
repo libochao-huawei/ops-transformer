@@ -57,6 +57,15 @@ def _is_dsl_candidate_device(device):
     return "Ascend950" in name
 
 
+def _check_required_compute_tensors(weights, query_dequant_scale, key_dequant_scale):
+    if weights is None:
+        raise TypeError("weights must be a Tensor, got None")
+    if query_dequant_scale is None:
+        raise TypeError("query_dequant_scale must be a Tensor, got None")
+    if key_dequant_scale is None:
+        raise TypeError("key_dequant_scale must be a Tensor, got None")
+
+
 def _check_tensor_devices(device, **tensors):
     for name, tensor in tensors.items():
         if tensor is not None and tensor.device != device:
@@ -221,6 +230,15 @@ class QuantLightningIndexerOpBuilder(OpBuilder):
             cmp_ratio=1,
             return_value=0,
         ):
+            if query is None:
+                raise TypeError("query must be a Tensor, got None")
+            if key is None:
+                raise TypeError("key must be a Tensor, got None")
+            _check_required_compute_tensors(
+                weights, query_dequant_scale, key_dequant_scale
+            )
+            if topk <= 0:
+                raise ValueError(f"topk must be greater than 0, got {topk}")
             key_head_num = (
                 key.shape[KEY_HEAD_DIM_TND]
                 if layout_k == "TND"
@@ -323,6 +341,12 @@ def quant_lightning_indexer_dcp_meta(
     cp_kv_cache_interleave_size: Optional[int] = None,
 ):
     # DCP 仅支持 TND + PA_BBND，score 输出 BF16（与 arch35 对齐）
+    if query is None:
+        raise TypeError("query must be a Tensor, got None")
+    if key is None:
+        raise TypeError("key must be a Tensor, got None")
+    if topk <= 0:
+        raise ValueError(f"topk must be greater than 0, got {topk}")
     key_head_num = (
         key.shape[KEY_HEAD_DIM_TND]
         if layout_k == "TND"
@@ -467,6 +491,11 @@ def _quant_lightning_indexer_npu(
     dispatcher implementation for NPU.zhe
     'PrivateUse1' is the combine key for custom NPU backends.
     """
+    if query is None:
+        raise TypeError("query must be a Tensor, got None")
+    if key is None:
+        raise TypeError("key must be a Tensor, got None")
+    _check_required_compute_tensors(weights, query_dequant_scale, key_dequant_scale)
     op_module = quant_lightning_indexer_op_builder.load()
     return op_module.quant_lightning_indexer(
         query,
@@ -520,6 +549,13 @@ def _quant_lightning_indexer_candidate_meta(
     candidate_topk_blocks,
     candidate_block_size,
 ):
+    if query is None:
+        raise TypeError("query must be a Tensor, got None")
+    if key is None:
+        raise TypeError("key must be a Tensor, got None")
+    _check_required_compute_tensors(weights, query_dequant_scale, key_dequant_scale)
+    if topk <= 0:
+        raise ValueError(f"topk must be greater than 0, got {topk}")
     enabled = _validate_candidate_parameters(
         candidate_topk_blocks, candidate_block_size
     )
@@ -573,6 +609,11 @@ def _quant_lightning_indexer_candidate_npu(
     candidate_topk_blocks,
     candidate_block_size,
 ):
+    if query is None:
+        raise TypeError("query must be a Tensor, got None")
+    if key is None:
+        raise TypeError("key must be a Tensor, got None")
+    _check_required_compute_tensors(weights, query_dequant_scale, key_dequant_scale)
     enabled = _validate_candidate_parameters(
         candidate_topk_blocks, candidate_block_size
     )
@@ -984,6 +1025,10 @@ def _quant_lightning_indexer_dcp_npu(
     cp_rank: Optional[int] = None,
     cp_kv_cache_interleave_size: Optional[int] = None,
 ):
+    if query is None:
+        raise TypeError("query must be a Tensor, got None")
+    if key is None:
+        raise TypeError("key must be a Tensor, got None")
     if causal_seqlens_kv_global is None:
         raise ValueError("DCP requires causal_seqlens_kv_global")
     if cp_world is None or cp_world <= 1:

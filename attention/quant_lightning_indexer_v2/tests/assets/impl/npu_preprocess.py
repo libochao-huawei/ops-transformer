@@ -215,7 +215,9 @@ def build_metadata_arguments(
             get_attribute(
                 kwargs,
                 "metadata_max_seqlen_q",
-                max_sequence(cu_q_values, seq_q_values, q_fallback),
+                q_fallback
+                if layout_q == "BSND"
+                else max_sequence(cu_q_values, seq_q_values, q_fallback),
             )
         ),
         "max_seqlen_k": int(
@@ -301,6 +303,24 @@ def run(
     **kwargs,
 ):
     """Generate metadata dynamically, or fill an existing static placeholder."""
+    required = (query, key, weights, query_dequant_scale, key_dequant_scale)
+    if _metadata_target is None and any(tensor is None for tensor in required):
+        # Let the Torch operator reject the missing tensor before any metadata lookup.
+        dtypes = kwargs.get("tensor_dtypes") or ()
+        if (
+            metadata is None
+            and len(dtypes) > METADATA_INDEX
+            and dtypes[METADATA_INDEX] is not None
+        ):
+            # TTK requires a tensor for the declared dynamic metadata slot.
+            device = next(
+                (tensor.device for tensor in required if torch.is_tensor(tensor)),
+                None,
+            )
+            return {
+                "metadata": torch.empty(0, dtype=torch.int32, device=device or "npu")
+            }
+        return None
     testcase_name = kwargs.get("testcase_name")
     is_error_case = expect_error(kwargs)
     del weights

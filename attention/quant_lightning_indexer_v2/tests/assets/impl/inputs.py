@@ -1032,7 +1032,8 @@ def generate_qli_v2_inputs(
     **kwargs,
 ):
     """Populate pytest-derived inputs; metadata is filled by npu_preprocess."""
-    if expect_error(kwargs):
+    required = (query, key, weights, query_dequant_scale, key_dequant_scale)
+    if any(tensor is None for tensor in required) or expect_error(kwargs):
         return None
 
     params = dict(kwargs)

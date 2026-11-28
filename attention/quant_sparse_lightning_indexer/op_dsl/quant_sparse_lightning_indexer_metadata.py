@@ -537,8 +537,12 @@ def metadata_geometry(
         raise ValueError(
             "MX4 metadata requires Nq=32/64, Nk=1 and logical head_dim=128"
         )
-    if mask_mode not in (0, 3) or not 1 <= cmp_ratio <= 128 or not 1 <= topk <= 8192:
-        raise ValueError("Invalid mask_mode, cmp_ratio or topk")
+    if mask_mode not in (0, 3):
+        raise ValueError(f"mask_mode must be 0 or 3, got {mask_mode}")
+    if not 1 <= cmp_ratio <= 128:
+        raise ValueError(f"cmp_ratio must be in [1, 128], got {cmp_ratio}")
+    if not 1 <= topk <= 8192:
+        raise ValueError(f"topk must be in [1, 8192], got {topk}")
     tensors = [
         x for x in (cu_seqlens_q, seqused_q, seqused_k, cmp_residual_k) if x is not None
     ]
@@ -768,12 +772,12 @@ def _tnd_geometry(
     for name, tensor in (("seqused_q", used_q), ("seqused_k", used_k)):
         if tensor is not None:
             _sequence(tensor, name, device, batch)
-    if (
-        not 1 <= int(topk) <= 8192
-        or int(mask_mode) not in (0, 3)
-        or not 1 <= int(cmp_ratio) <= 128
-    ):
-        raise ValueError("Invalid topk, mask_mode or cmp_ratio")
+    if int(mask_mode) not in (0, 3):
+        raise ValueError(f"mask_mode must be 0 or 3, got {mask_mode}")
+    if not 1 <= int(cmp_ratio) <= 128:
+        raise ValueError(f"cmp_ratio must be in [1, 128], got {cmp_ratio}")
+    if not 1 <= int(topk) <= 8192:
+        raise ValueError(f"topk must be in [1, 8192], got {topk}")
     if int(mask_mode) == 3 and int(cmp_ratio) != 1:
         _sequence(residual, "cmp_residual_k", device, batch)
     elif residual is not None:

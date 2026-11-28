@@ -557,7 +557,7 @@ def generate_li_v2_inputs(
     **kwargs,
 ):
     """Populate pytest-derived inputs; metadata is filled by npu_preprocess."""
-    if expect_error(kwargs):
+    if q is None or k is None or w is None or expect_error(kwargs):
         return None
 
     params = dict(kwargs)

@@ -27,6 +27,19 @@ def _is_ascend_950(device):
     )
 
 
+def _check_required_compute_tensors(
+    weights, query_dequant_scale, key_dequant_scale, candidate_block_indices
+):
+    if weights is None:
+        raise TypeError("weights must be a Tensor, got None")
+    if query_dequant_scale is None:
+        raise TypeError("query_dequant_scale must be a Tensor, got None")
+    if key_dequant_scale is None:
+        raise TypeError("key_dequant_scale must be a Tensor, got None")
+    if candidate_block_indices is None:
+        raise TypeError("candidate_block_indices must be a Tensor, got None")
+
+
 def _check_tensor_devices(device, **tensors):
     for name, tensor in tensors.items():
         if tensor is not None and tensor.device != device:
@@ -108,9 +121,9 @@ def _quant_sparse_lightning_indexer_950(
     return_value=0,
 ):
     """Run QSLI with the public candidate and quantization contract."""
-    if candidate_block_indices is None or candidate_block_length is None:
-        raise ValueError(
-            "Ascend 950 requires candidate_block_indices and candidate_block_length"
+    if candidate_block_length is None:
+        raise TypeError(
+            "candidate_block_length must be a Tensor on Ascend 950, got None"
         )
     _validate_950_layout(layout_q, layout_k, return_value)
     _validate_950_mode(quant_mode)
@@ -141,7 +154,9 @@ def _quant_sparse_lightning_indexer_950(
             or descale_k.dtype != torch.uint8
             or descale_k.numel() != 0
         ):
-            raise ValueError("PA_BBND descale_k must be an empty uint8 tensor")
+            raise ValueError(
+                "key_dequant_scale must be an empty uint8 tensor for PA_BBND"
+            )
         key_scale = None
     else:
         key_scale = _as_e8m0_storage(descale_k, allow_bytes=True)
@@ -354,6 +369,19 @@ class QuantSparseLightningIndexerOpBuilder(OpBuilder):
             candidate_block_size=8,
             return_value=0,
         ):
+            if query is None:
+                raise TypeError("query must be a Tensor, got None")
+            if key is None:
+                raise TypeError("key must be a Tensor, got None")
+            _check_required_compute_tensors(
+                weights, query_dequant_scale, key_dequant_scale, candidate_block_indices
+            )
+            if candidate_block_length is None and _is_ascend_950(query.device):
+                raise TypeError(
+                    "candidate_block_length must be a Tensor on Ascend 950, got None"
+                )
+            if topk <= 0:
+                raise ValueError(f"topk must be greater than 0, got {topk}")
             key_head_num = (
                 1
                 if layout_k == "PA_BBND" and key.dim() == 3
@@ -427,6 +455,13 @@ def _quant_sparse_lightning_indexer_npu(
 ):
     """consumer 专属入口: candidate_block_indices 必传, 在候选块内选 topk
     (候选块个数由 candidate_block_indices 末维决定, 不再是入参)"""
+    if query is None:
+        raise TypeError("query must be a Tensor, got None")
+    if key is None:
+        raise TypeError("key must be a Tensor, got None")
+    _check_required_compute_tensors(
+        weights, query_dequant_scale, key_dequant_scale, candidate_block_indices
+    )
     if query.device.type == "cpu":
         raise ValueError("Query must be an NPU tensor")
     if _is_ascend_950(query.device):

@@ -120,6 +120,14 @@ class LightningIndexerOpBuilder(OpBuilder):
             cmp_ratio=1,
             return_value=0,
         ):
+            if q is None:
+                raise TypeError("q must be a Tensor, got None")
+            if k is None:
+                raise TypeError("k must be a Tensor, got None")
+            if w is None:
+                raise TypeError("w must be a Tensor, got None")
+            if topk <= 0:
+                raise ValueError(f"topk must be greater than 0, got {topk}")
             key_head_num = k.shape[1] if layout_k == "TND" else k.shape[2]
 
             if layout_q == "BSND":
@@ -173,6 +181,14 @@ class LightningIndexerOpBuilder(OpBuilder):
             candidate_topk_blocks=-1,
             candidate_block_size=8,
         ):
+            if q is None:
+                raise TypeError("q must be a Tensor, got None")
+            if k is None:
+                raise TypeError("k must be a Tensor, got None")
+            if w is None:
+                raise TypeError("w must be a Tensor, got None")
+            if topk <= 0:
+                raise ValueError(f"topk must be greater than 0, got {topk}")
             key_head_num = k.shape[1] if layout_k == "TND" else k.shape[2]
 
             if layout_q == "BSND":
@@ -360,6 +376,12 @@ def _lightning_indexer_npu(
     dispatcher implementation for NPU.zhe
     'PrivateUse1' is the combine key for custom NPU backends.
     """
+    if q is None:
+        raise TypeError("q must be a Tensor, got None")
+    if k is None:
+        raise TypeError("k must be a Tensor, got None")
+    if w is None:
+        raise TypeError("w must be a Tensor, got None")
     op_module = lightning_indexer_op_builder.load()
     return op_module.lightning_indexer(
         q,
@@ -410,6 +432,12 @@ def _lightning_indexer_candidate_npu(
     """
     lightning_indexer.candidate overload 的 NPU 实现（4 输出）。
     """
+    if q is None:
+        raise TypeError("q must be a Tensor, got None")
+    if k is None:
+        raise TypeError("k must be a Tensor, got None")
+    if w is None:
+        raise TypeError("w must be a Tensor, got None")
     op_module = lightning_indexer_op_builder.load()
     return op_module.lightning_indexer_candidate_mode(
         q,

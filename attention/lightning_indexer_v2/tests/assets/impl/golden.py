@@ -130,6 +130,8 @@ def cpu_lightning_indexer_v2(
     **kwargs,
 ):
     """Materialize Golden from the exact pytest data produced by input."""
+    if q is None or k is None or w is None:
+        return None
     del q, k, w, topk, kwargs
     data = activate_case_data(testcase_name)
     if int(return_value):

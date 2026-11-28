@@ -211,7 +211,7 @@ aclnnStatus aclnnLightningIndexerV2(
     <td><ul><li>Empty tensors are not supported.</li></ul></td>
     <td>INT32</td>
     <td>ND</td>
-    <td>The shape is fixed to [1024].</td>
+    <td>The shape is [length], where length is 8 * (aic_num + aiv_num) rounded up to a multiple of 1024. aic_num and aiv_num are the current device's AIC and AIV core counts.</td>
     <td>x</td>
     </tr>
     <tr>
@@ -549,7 +549,19 @@ int InitializeTensors(TensorResources &resources)
     std::vector<int64_t> keyShape = {B, S2Compressed, N2, D};
     std::vector<int64_t> weightsShape = {B, S1, N1};
     std::vector<int64_t> cmpResidualKShape = {B};
-    std::vector<int64_t> metadataShape = {2048};
+    uint32_t aicCoreNum = 0;
+    uint32_t aivCoreNum = 0;
+    if (aclrtGetResInCurrentThread(ACL_RT_DEV_RES_CUBE_CORE, &aicCoreNum) != ACL_SUCCESS) {
+        LOG_PRINT("Failed to query AIC count\n");
+        return ACL_ERROR_INVALID_PARAM;
+    }
+    if (aclrtGetResInCurrentThread(ACL_RT_DEV_RES_VECTOR_CORE, &aivCoreNum) != ACL_SUCCESS) {
+        LOG_PRINT("Failed to query AIV count\n");
+        return ACL_ERROR_INVALID_PARAM;
+    }
+    constexpr uint32_t alignment = 1024U;
+    const int64_t usedSize = 8 * (static_cast<int64_t>(aicCoreNum) + aivCoreNum);
+    std::vector<int64_t> metadataShape = {(usedSize + alignment - 1) / alignment * alignment};
     std::vector<int64_t> sparseIndicesShape = {B, S1, N2, topk};
     std::vector<int64_t> sparseValuesShape = {B, S1, N2, topk};
 

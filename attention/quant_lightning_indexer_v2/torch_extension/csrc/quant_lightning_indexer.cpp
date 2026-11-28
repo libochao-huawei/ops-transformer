@@ -214,7 +214,7 @@ std::tuple<at::Tensor, at::Tensor> ConstructQuantLightningIndexerOutputTensor(
                     "than 0, but shape[",
                     i, "] is ", key.size(i));
     }
-    TORCH_CHECK(sparseCount > 0, "sparse count should be greater than 0, but now is ", sparseCount);
+    TORCH_CHECK(sparseCount > 0, "topk must be greater than 0, got ", sparseCount);
     int64_t keyHeadNum = (keyLayoutStr == "TND") ? key.size(DIM_1) : key.size(DIM_2);
     if (queryLayoutStr == "BSND") {
         outputSize = {query.size(DIM_0), query.size(DIM_1), keyHeadNum, sparseCount};
@@ -364,6 +364,7 @@ std::tuple<at::Tensor, at::Tensor> ConstructDcpOutputTensor(const at::Tensor& qu
                                                             int64_t sparseCount, std::string queryLayoutStr,
                                                             std::string keyLayoutStr, int64_t returnValue)
 {
+    TORCH_CHECK(sparseCount > 0, "topk must be greater than 0, got ", sparseCount);
     int64_t keyHeadNum = (keyLayoutStr == "TND") ? key.size(DIM_1) : key.size(DIM_2);
     at::SmallVector<int64_t, SIZE> outputSize;
     if (queryLayoutStr == "BSND") {

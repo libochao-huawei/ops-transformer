@@ -208,7 +208,7 @@ aclnnStatus aclnnLightningIndexerV2(
     <tr>
     <td>metadataOptional（aclTensor*）</td>
     <td>输入</td>
-    <td>LightningIndexerV2Metadata算子传入的分核信息，包含使用核数、分块大小以及每个核处理数据的起始点等内容。shape固定为[2048]。</td>
+    <td>LightningIndexerV2Metadata算子传入的分核信息，包含使用核数、分块大小以及每个核处理数据的起始点等内容。shape为一维，长度为将8 * (aic_num + aiv_num)向上对齐至1024的整数倍所得的元素数。aic_num和aiv_num为当前设备的AIC和AIV核数。</td>
     <td><ul><li>不支持空tensor。</li></ul></td>
     <td>INT32</td>
     <td>ND</td>
@@ -558,7 +558,19 @@ int InitializeTensors(TensorResources& resources)
     std::vector<int64_t> keyShape = {B, S2Compressed, N2, D};
     std::vector<int64_t> weightsShape = {B, S1, N1};
     std::vector<int64_t> cmpResidualKShape = {B};
-    std::vector<int64_t> metadataShape = {2048};
+    uint32_t aicCoreNum = 0;
+    uint32_t aivCoreNum = 0;
+    if (aclrtGetResInCurrentThread(ACL_RT_DEV_RES_CUBE_CORE, &aicCoreNum) != ACL_SUCCESS) {
+        LOG_PRINT("Failed to query AIC count\n");
+        return ACL_ERROR_INVALID_PARAM;
+    }
+    if (aclrtGetResInCurrentThread(ACL_RT_DEV_RES_VECTOR_CORE, &aivCoreNum) != ACL_SUCCESS) {
+        LOG_PRINT("Failed to query AIV count\n");
+        return ACL_ERROR_INVALID_PARAM;
+    }
+    constexpr uint32_t alignment = 1024U;
+    const int64_t usedSize = 8 * (static_cast<int64_t>(aicCoreNum) + aivCoreNum);
+    std::vector<int64_t> metadataShape = {(usedSize + alignment - 1) / alignment * alignment};
     std::vector<int64_t> sparseIndicesShape = {B, S1, N2, topk};
     std::vector<int64_t> sparseValuesShape = {B, S1, N2, topk};
 

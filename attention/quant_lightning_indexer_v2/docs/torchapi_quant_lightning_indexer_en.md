@@ -31,9 +31,9 @@
 
   The `quant_lightning_indexer` API obtains the top-k positions corresponding to each token through a series of operations. The main computation procedure is as follows:
 
-  1. Multiply the input parameter `q` ($Q_{index}^{Quant}\in\R^{g\times d}$) of a token by the given context `k` ($K_{index}^{Quant}\in\R^{S_{k}\times d}$) to obtain the relevance.
-  2. The relevance results are multiplied by the dequantization scales `q_descale` ($Scale_Q$) and `k_descale` ($Scale_K^T$) corresponding to `q` and `k`. After the invalid negative relevance signals are filtered out through the activation function $ReLU$, the relevance score vector between the current token and all preceding tokens is obtained.
-  3. After being multiplied by the weight coefficient `w` ($W$), the top $Top-k$ index values are selected along the g dimension to obtain the output $sparseIndices$, and the corresponding $sparseValues$ are output as the input to Attention.
+  1. Multiply the input parameter `query` ($Q_{index}^{Quant}\in\R^{g\times d}$) of a token by the given context `key` ($K_{index}^{Quant}\in\R^{S_{k}\times d}$) to obtain the relevance.
+  2. The relevance results are multiplied by the dequantization scales `query_dequant_scale` ($Scale_Q$) and `key_dequant_scale` ($Scale_K^T$) corresponding to `query` and `key`. After the invalid negative relevance signals are filtered out through the activation function $ReLU$, the relevance score vector between the current token and all preceding tokens is obtained.
+  3. After being multiplied by the weight coefficient `weights` ($W$), the top $Top-k$ index values are selected along the g dimension to obtain the output `sparse_indices`, and the corresponding `sparse_values` are output as the input to Attention.
 
   DCP (Decode Context Parallel) is enabled when `cp_world > 1` and is exposed through the `.dcp` overloads.
   `causal_seqlens_kv_global` (INT32, shape `(B,)`) is required. Only TND/PA_BBND and `mask_mode=3` are supported,
@@ -80,11 +80,11 @@ cann_ops_transformer.quant_lightning_indexer_metadata(
 
 ```python
 cann_ops_transformer.quant_lightning_indexer(
-  q,
-  k,
-  w,
-  q_descale,
-  k_descale,
+  query,
+  key,
+  weights,
+  query_dequant_scale,
+  key_dequant_scale,
   topk,
   quant_mode,
   *,
@@ -125,13 +125,21 @@ cann_ops_transformer.quant_lightning_indexer(
 - Only `(-1, -1)` and `(2048, 8)` are accepted; other combinations raise an error. When candidate is enabled,
   `g = N1/N2` may be 64 or 32 (64 is required when disabled); `layout_q` supports BSND/TND (TND requires
   `cu_seqlens_q`); candidate outputs are not offset by `output_idx_offset`.
-- candidate is supported only on Ascend910B/910_93; enabling it on Ascend950/960 raises an error.
+
+### Candidate mode (Ascend 950PR and 950DT)
+
+Pass `candidate_topk_blocks=2048` and `candidate_block_size=8` to both Python functions to enable
+two-level TopK candidate selection. This mode requires `quant_mode=5`, supports 1 to 32 query heads
+and `topk` in [1, 8192], and returns metadata of shape `(1024,)`.
+`quant_lightning_indexer` returns four tensors. The last two are `candidate_block_indices` and
+`candidate_block_length`, the number of valid candidate blocks per row. Unused candidate indices are
+filled with `-1`. When both candidate parameters are omitted, it returns two tensors.
 
 ## Parameters
 
 >**NOTE:**
 >
-> The meanings of the dimensions of parameters q, k, w, q_descale, and k_descale: b (batch size) denotes the batch size of input samples, q_s denotes the sequence length of input samples for q, k_s denotes the sequence length of input samples for k, q_n denotes the number of heads for q, k_n denotes the number of heads for k, d (head dim) denotes the dimension of the attention head, q_t denotes the cumulative sum of the sequence lengths of input samples for q, k_t denotes the cumulative sum of the sequence lengths of input samples for k, block_num denotes the total number of blocks in the PageAttention use case, block_size denotes the number of tokens in each block in the PageAttention use case, and g denotes the group size of GQA (g = q_n / k_n). The value of d in parameter q is equal to that in parameter k, and d currently only supports 128.
+> The meanings of the dimensions of parameters query, key, weights, query_dequant_scale, and key_dequant_scale: b (batch size) denotes the batch size of input samples, q_s denotes the sequence length of input samples for q, k_s denotes the sequence length of input samples for k, q_n denotes the number of heads for q, k_n denotes the number of heads for k, d (head dim) denotes the dimension of the attention head, q_t denotes the cumulative sum of the sequence lengths of input samples for q, k_t denotes the cumulative sum of the sequence lengths of input samples for k, block_num denotes the total number of blocks in the PageAttention use case, block_size denotes the number of tokens in each block in the PageAttention use case, and g denotes the group size of GQA (g = q_n / k_n). The value of d in query is equal to that in key, and d currently only supports 128.
 
 ### quant_lightning_indexer_metadata
 
@@ -163,11 +171,11 @@ cann_ops_transformer.quant_lightning_indexer(
 
 | Name | Type | Required/Optional | Description | Data Type | Dimension (Shape) |
 |--------|----------|-----------|------|----------|-------------|
-| q | Tensor | Required | Quantized input $Q_{index}^{Quant}$ in the formula. Empty tensor not supported. Data format: ND. | int8, float8_e4m3fn, HIfloat8, float4_e2m1 | shape is (b,q_s,q_n,d) when layout_q is BSND; shape is (q_t,q_n,d) when layout_q is TND |
-| k | Tensor | Required | Quantized input $K_{index}^{Quant}$ in the formula. Empty tensor not supported. Data format: ND. Only dimension 0 can be non-contiguous in PA_BBND use cases. In PA_BBND use cases, block_size must be a multiple of 16, with a maximum of 1024. | int8, float8_e4m3fn, HIfloat8, float4_e2m1 | shape is (b,k_s,k_n,d) when layout_k is BSND; shape is (k_t,k_n,d) when layout_k is TND; shape is (block_num,block_size,k_n,d) when layout_k is PA_BBND |
-| w | Tensor | Required | Weight coefficient $W$ in the formula. Empty tensor not supported. Data format: ND. | float16, float32 | shape is (b,q_s,q_n) when layout_q is BSND; shape is (q_t,q_n) when layout_q is TND |
-| q_descale | Tensor | Required | $Scale_Q$ in the formula, which is the dequantization scale of Index q. Empty tensor not supported. Data format: ND. | float16, float32, float8_e8m0 | When quant_mode is 3/5, shape is (b,q_s,q_n,d/64,2) when layout_q is BSND, and shape is (q_t,q_n,d/64,2) when layout_q is TND; when quant_mode is 4, shape must be (1,); in other use cases, the shape is the same as that of w |
-| k_descale | Tensor | Required | $Scale_K$ in the formula, which is the dequantization scale of Index k. Empty tensor not supported. Data format: ND. Only dimension 0 can be non-contiguous in PA_BBND use cases. | float16, float32, float8_e8m0 | When quant_mode is 3/5, shape is (block_num,block_size,k_n,d/64,2) when layout_k is PA_BBND, shape is (b,k_s,k_n,d/64,2) when layout_k is BSND, and shape is (k_t,k_n,d/64,2) when layout_k is TND; when quant_mode is 4, shape must be (1,); in other use cases, the shapes are (block_num,block_size,k_n), (b,k_s,k_n), or (k_t,k_n) respectively |
+| query | Tensor | Required | Quantized input $Q_{index}^{Quant}$ in the formula. Empty tensor not supported. Data format: ND. | int8, float8_e4m3fn, HIfloat8, float4_e2m1 | shape is (b,q_s,q_n,d) when layout_q is BSND; shape is (q_t,q_n,d) when layout_q is TND |
+| key | Tensor | Required | Quantized input $K_{index}^{Quant}$ in the formula. Empty tensor not supported. Data format: ND. Only dimension 0 can be non-contiguous in PA_BBND use cases. In PA_BBND use cases, block_size must be a multiple of 16, with a maximum of 1024. | int8, float8_e4m3fn, HIfloat8, float4_e2m1 | shape is (b,k_s,k_n,d) when layout_k is BSND; shape is (k_t,k_n,d) when layout_k is TND; shape is (block_num,block_size,k_n,d) when layout_k is PA_BBND |
+| weights | Tensor | Required | Weight coefficient $W$ in the formula. Empty tensor not supported. Data format: ND. | float16, float32 | shape is (b,q_s,q_n) when layout_q is BSND; shape is (q_t,q_n) when layout_q is TND |
+| query_dequant_scale | Tensor | Required | $Scale_Q$ in the formula, which is the dequantization scale of Index q. Empty tensor not supported. Data format: ND. | float16, float32, float8_e8m0 | When quant_mode is 3/5, shape is (b,q_s,q_n,d/64,2) when layout_q is BSND, and shape is (q_t,q_n,d/64,2) when layout_q is TND; when quant_mode is 4, shape must be (1,); in other use cases, the shape is the same as that of weights |
+| key_dequant_scale | Tensor | Required | $Scale_K$ in the formula, which is the dequantization scale of Index k. Empty tensor not supported. Data format: ND. Only dimension 0 can be non-contiguous in PA_BBND use cases. | float16, float32, float8_e8m0 | When quant_mode is 3/5, shape is (block_num,block_size,k_n,d/64,2) when layout_k is PA_BBND, shape is (b,k_s,k_n,d/64,2) when layout_k is BSND, and shape is (k_t,k_n,d/64,2) when layout_k is TND; when quant_mode is 4, shape must be (1,); in other use cases, the shapes are (block_num,block_size,k_n), (b,k_s,k_n), or (k_t,k_n) respectively |
 | topk | int | Required | Number of k token indices to retain in the topK phase. Currently supports [1, 8192]. | int64 | - |
 | quant_mode | int | Required | Quantization mode. Currently supports 1/2/3/4/5. 1 indicates qk: fp8(e4m3fn) per-token-head, scale: fp32; 2 indicates qk: int8 per-token-head, scale: fp16, w: fp16; 3 indicates qk: mxfp8(e4m3fn), scale: fp8(e8m0); 4 indicates qk: hifloat8 per-tensor, scale: fp32; 5 indicates qk: mxfp4(e2m1), scale: fp8(e8m0). | int64 | - |
 | cu_seqlens_q | Tensor | Optional | Cumulative sum of the number of valid q tokens in the current and preceding batches. The value of each element must be greater than or equal to that of the preceding element. Must be passed only when layout_q is TND. The first value is fixed to 0. Data format: ND. | int32 | (b+1,) |
@@ -183,7 +191,7 @@ cann_ops_transformer.quant_lightning_indexer(
 | layout_k | str | Optional | Data layout format of input k. Supports BSND, TND, and PA_BBND. Default value is BSND. | string | - |
 | mask_mode | int | Optional | Mask mode. 0 indicates the defaultMask mode, and 3 indicates the rightDownCausal mode. Default value is 0. | int64 | - |
 | cmp_ratio | int | Optional | Used for sparse computation, indicating the compression ratio of k. Default value is 1, indicating no compression. | int64 | - |
-| return_value | int | Optional | Whether to return the sparseValues corresponding to sparseIndices. 0 indicates not returning, and 1 indicates returning. Default value is 0. | int64 | - |
+| return_value | int | Optional | Whether to return the `sparse_values` corresponding to `sparse_indices`. 0 indicates not returning, and 1 indicates returning. Default value is 0. | int64 | - |
 | causal_seqlens_kv_global | Tensor | Optional | Global exclusive causal upper bound C for each request in DCP (Decode Context Parallel). Required when cp_world > 1; must be None for non-DCP. Data format: ND. | int32 | (b,) |
 | cp_world | int | Optional | CP group size for DCP. Values greater than 1 enable DCP. The default value is None (non-DCP). | int64 | - |
 | cp_rank | int | Optional | Current DCP rank. Must satisfy 0 \<= cp_rank \< cp_world. Must be explicitly provided when cp_world > 1; it cannot be None. | int64 | - |
@@ -215,21 +223,21 @@ cann_ops_transformer.quant_lightning_indexer(
 - cmp_residual_k must satisfy 0 <= cmp_residual_k\[i\] < cmp_ratio.
 - For details about the mask mode indicated by mask_mode, see [sparse_mode Parameter Description](../../../docs/en/context/sparse_mode_introduction.md).
 - pa_kv_cache supports non-contiguity on axis 0; pa_block_size supports values in [16, 1024] and must be a multiple of 16.
-- The data types of parameters q and k must be the same.
+- The data types of query and key must be the same.
 - Sorting NaN values in the TopK sorting process of this API is undefined behavior.
 - When layout_q is BSND, passing cu_seqlens_q is not supported; when layout_k is BSND or PA_BBND, passing cu_seqlens_k is not supported.
 - When cmp_ratio > 1 and mask_mode = 3, cmp_residual_k must be passed; in other cases, do not pass it.
 - Invalid parts of sparse_indices are filled with -1; invalid parts of sparse_values are filled with -inf.
 <!-- npu="A3,910b" id7 -->
-- x1 is INT8, x2 is INT8, x1Scale is FLOAT32, and x2Scale is FLOAT32.
+- <term>Atlas A3 products</term> and <term>Atlas A2 products</term>:
   - The value range of topk currently only supports [1, 2048].
   - When layout_k is TND, passing seqused_k is not supported.
   - output_idx_offset is not supported.
   - num_heads_q supports 64, 32, and 24: when num_heads_q is 24/32, layout_q must be TND, layout_k must be TND or PA_BBND, mask_mode must be 3, cmp_ratio must be 1, and return_value must be 0; otherwise the API reports an error.
   - Only quant_mode = 2 is supported.
-  - q and k only support int8; float8_e4m3fn, HIfloat8, and float4_e2m1 are not supported.
-  - q_descale and k_descale support float16; float32 and float8_e8m0 are not supported.
-  - w supports float16; float32 is not supported.
+  - query and key only support int8; float8_e4m3fn, HIfloat8, and float4_e2m1 are not supported.
+  - query_dequant_scale and key_dequant_scale support float16; float32 and float8_e8m0 are not supported.
+  - weights supports float16; float32 is not supported.
   - layout_k supports PA_BBND and TND: when num_heads_q is 64, only PA_BBND is supported, and seqused_k must be passed; when num_heads_q is 24/32, PA_BBND (seqused_k must be passed) or TND (cu_seqlens_k must be passed, and seqused_k is not supported) is supported.
   - cmp_ratio only supports powers of 2: 1/2/4/8/16/32/64/128; only 1 is supported when num_heads_q is 24/32.
   - The return_value function is not supported; passing this parameter is not recommended.
@@ -240,19 +248,19 @@ cann_ops_transformer.quant_lightning_indexer(
   - topk currently only supports a value range of [1, 8192].
   - num_heads_q = 1~64, q_n = 1~64 are supported.
   - cmp_ratio supports [1, 128].
-  - When output_idx_offset is passed, index offsets greater than or equal to 0 are supported. In addition, the following constraint must be satisfied: after the passed index offset is added, the resulting sparseIndice value must not exceed the maximum value of INT32.
+  - When output_idx_offset is passed, index offsets greater than or equal to 0 are supported. In addition, the following constraint must be satisfied: after the passed index offset is added, the resulting value in sparse_indices must not exceed the maximum value of INT32.
   - When layout_q is TND, cu_seqlens_q must be passed. If seqused_q is also passed, ensure that the q length of each batch passed by seqused_q does not exceed the q sequence length of each batch calculated based on cu_seqlens_q. When the q sequence length seqlen1 of a batch passed by seqused_q is less than the q length seqlen2 calculated based on cu_seqlens_q, TND Padding is enabled, and the sparse_indices and sparse_values of the q output in the batch for the part corresponding to the difference between seqlen2 and seqlen1 are all set to invalid values. In some long-sequence use cases, if the invalid data to be padded is too large, the aicore execution may time out due to hardware limitations. The amount of data to be padded can be calculated as (seqlen2 - seqlen1) * topk. It is recommended to control this data amount within 400 million.
   - The parameter metadata must be passed. When two-level TopK candidate selection is disabled, its shape is (8 * (1 + aic_num + aiv_num) + 256,), where the core counts are obtained from the current device; when enabled, its shape is (1024,).
-  - For q and k, float8_e4m3fn is supported when quant_mode is 1/3, HIfloat8 is supported when quant_mode is 4, float4_e2m1 is supported when quant_mode is 5, and int8 is supported when quant_mode is 2.
-  - For q_descale and k_descale, float8_e8m0 is supported when quant_mode is 3/5, float32 is supported when quant_mode is 1/4, and float16 is supported when quant_mode is 2.
-  - For w, float16 is supported when quant_mode is 2, and float32 is supported when quant_mode is 1/3/4/5.
+  - For query and key, float8_e4m3fn is supported when quant_mode is 1/3, HIfloat8 is supported when quant_mode is 4, float4_e2m1 is supported when quant_mode is 5, and int8 is supported when quant_mode is 2.
+  - For query_dequant_scale and key_dequant_scale, float8_e8m0 is supported when quant_mode is 3/5, float32 is supported when quant_mode is 1/4, and float16 is supported when quant_mode is 2.
+  - For weights, float16 is supported when quant_mode is 2, and float32 is supported when quant_mode is 1/3/4/5.
 <!-- end id5 -->
 
 ### Feature Parameter Group
 
 |      Feature Parameter Group      |      Parameter Field Name      |
 | :-------------------: | :-------------------: |
-|      Common parameter group      | q, k, w, q_descale, k_descale, metadata, output_idx_offset, topk, quant_mode, layout_q, layout_k, sparse_indices, sparse_values |
+|      Common parameter group      | query, key, weights, query_dequant_scale, key_dequant_scale, metadata, output_idx_offset, topk, quant_mode, layout_q, layout_k, sparse_indices, sparse_values |
 |      Mask parameter group      | mask_mode |
 |   SeqLens parameter group   | cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q |
 |   Sparse compression parameter group    | cmp_ratio, cmp_residual_k |
@@ -267,7 +275,7 @@ cann_ops_transformer.quant_lightning_indexer(
     - An empty tensor refers to a required input or output with a shape size of 0, that is, any axis is 0.
     - All use cases that trigger an empty tensor are intercepted and an error is reported.
 
-- Validation of q, k, sparse_indices, and sparse_values
+- Validation of query, key, sparse_indices, and sparse_values
 
 <table style="undefined;table-layout: fixed; width:1625px"><colgroup>
 <col style="width: 147px">
@@ -287,7 +295,7 @@ cann_ops_transformer.quant_lightning_indexer(
 </thead>
 <tbody>
     <tr>
-        <td>q</td>
+        <td>query</td>
         <td>            <ul>
                 <li>tensor_type supports INT8, FLOAT8_e4m3fn, HIFLOAT8, and FLOAT4_e2m1fn</li>
                 <li>BSND -> (b, q_s, q_n, d)</li>
@@ -297,7 +305,7 @@ cann_ops_transformer.quant_lightning_indexer(
         <td rowspan="4">            Must exist.
         </td>
         <td rowspan="4">            <ul>
-                <li>q and k must have the same data type</li>
+                <li>query and key must have the same data type</li>
                 <li>For layout validation rules, see the layout matching relationship table</li>
             </ul>
         </td>
@@ -315,7 +323,7 @@ cann_ops_transformer.quant_lightning_indexer(
         </td>
     </tr>
     <tr>
-        <td>k</td>
+        <td>key</td>
         <td rowspan="1">            <ul>
                 <li>tensor_type supports INT8, FLOAT8_e4m3fn, HIFLOAT8, and FLOAT4_e2m1fn</li>
                 <li>BSND -> (b, k_s, k_n, d)</li>
@@ -338,8 +346,8 @@ cann_ops_transformer.quant_lightning_indexer(
         <td>sparse_values</td>
         <td rowspan="1">            <ul>
                 <li>tensor_type supports BFLOAT16</li>
-                <li>If layout_q is BSND, the shape of sparse_indices is (b, q_s, k_n, topk)</li>
-                <li>If layout_q is TND, the shape of sparse_indices is (q_t, k_n, topk)</li>
+                <li>If layout_q is BSND, the shape of sparse_values is (b, q_s, k_n, topk)</li>
+                <li>If layout_q is TND, the shape of sparse_values is (q_t, k_n, topk)</li>
             </ul>
         </td>
     </tr>
@@ -589,7 +597,7 @@ Deterministic computation is supported by default.
 
   B = 2
   S1 = 64
-  N1 = 64
+  N1 = 32
   N2 = 1
   D = 128
   blockNum = 128
@@ -597,13 +605,14 @@ Deterministic computation is supported by default.
   topk = 32
 
   # Construct the inputs.
-  query = torch.randn(B, S1, N1, D).to(torch.float8_e4m3fn).npu()
-  key = torch.randn(blockNum, blockSize, N2, D).to(torch.float8_e4m3fn).npu()
-  weights = torch.randn(B, S1, N1).npu()
-  query_dequant_scale = torch.randn(B, S1, N1).npu()
-  key_dequant_scale = torch.randn(blockNum, blockSize, N2).npu()
+  query = torch.randint(0, 256, (B * S1, N1, D // 2), dtype=torch.uint8).npu()
+  key = torch.randint(0, 256, (blockNum, blockSize, N2, D // 2), dtype=torch.uint8).npu()
+  weights = torch.randn(B * S1, N1).npu()
+  query_dequant_scale = torch.full((B * S1, N1, 2, 2), 127, dtype=torch.uint8).view(torch.float8_e8m0fnu).npu()
+  key_dequant_scale = torch.full((blockNum, blockSize, N2, 2, 2), 127, dtype=torch.uint8).view(torch.float8_e8m0fnu).npu()
   block_table = torch.arange(blockNum, dtype=torch.int32).expand(B, -1).npu()
   seqused_k = torch.full((B,), blockNum * blockSize, dtype=torch.int32).npu()
+  cu_seqlens_q = torch.arange(0, (B + 1) * S1, S1, dtype=torch.int32).npu()
 
   # Generate metadata.
   metadata = quant_lightning_indexer_metadata(
@@ -611,34 +620,42 @@ Deterministic computation is supported by default.
       num_heads_k=N2,
       head_dim=D,
       topk=topk,
-      quant_mode=1,
+      quant_mode=5,
+      cu_seqlens_q=cu_seqlens_q,
       seqused_k=seqused_k,
       batch_size=B,
       max_seqlen_q=S1,
       max_seqlen_k=blockNum * blockSize,
-      layout_q="BSND",
-      layout_k="PA_BBND",
-      mask_mode=0,
-      cmp_ratio=1
-  )
-
-  # Execute quant_lightning_indexer.
-  sparse_indices, sparse_values = quant_lightning_indexer(
-      query, key, weights, query_dequant_scale, key_dequant_scale,
-      topk=topk,
-      quant_mode=1,
-      block_table=block_table,
-      metadata=metadata,
-      seqused_k=seqused_k,
-      max_seqlen_q=-1,
-      layout_q="BSND",
+      layout_q="TND",
       layout_k="PA_BBND",
       mask_mode=0,
       cmp_ratio=1,
-      return_value=1
+      candidate_topk_blocks=2048,
+      candidate_block_size=8
+  )
+
+  # Run quant_lightning_indexer.
+  sparse_indices, sparse_values, candidate_block_indices, candidate_block_length = quant_lightning_indexer(
+      query, key, weights, query_dequant_scale, key_dequant_scale,
+      topk=topk,
+      quant_mode=5,
+      block_table=block_table,
+      metadata=metadata,
+      cu_seqlens_q=cu_seqlens_q,
+      seqused_k=seqused_k,
+      max_seqlen_q=-1,
+      layout_q="TND",
+      layout_k="PA_BBND",
+      mask_mode=0,
+      cmp_ratio=1,
+      return_value=1,
+      candidate_topk_blocks=2048,
+      candidate_block_size=8
   )
   print(f"sparse_indices shape: {sparse_indices.shape}")
   print(f"sparse_values shape: {sparse_values.shape}")
+  print(f"candidate_block_indices shape: {candidate_block_indices.shape}")
+  print(f"candidate_block_length shape: {candidate_block_length.shape}")
   ```
 
 - aclgraph graph mode call:
@@ -652,48 +669,58 @@ Deterministic computation is supported by default.
   B = 2
   S1 = 64
   S2 = 128
-  N1 = 64
+  N1 = 32
   N2 = 1
   D = 128
   topk = 32
 
-  query = torch.randn(B, S1, N1, D).to(torch.float8_e4m3fn).npu()
-  key = torch.randn(B, S2, N2, D).to(torch.float8_e4m3fn).npu()
-  weights = torch.randn(B, S1, N1).npu()
-  query_dequant_scale = torch.randn(B, S1, N1).npu()
-  key_dequant_scale = torch.randn(B, S2, N2).npu()
+  query = torch.randint(0, 256, (B * S1, N1, D // 2), dtype=torch.uint8).npu()
+  key = torch.randint(0, 256, (B * S2, N2, D // 2), dtype=torch.uint8).npu()
+  weights = torch.randn(B * S1, N1).npu()
+  query_dequant_scale = torch.full((B * S1, N1, 2, 2), 127, dtype=torch.uint8).view(torch.float8_e8m0fnu).npu()
+  key_dequant_scale = torch.full((B * S2, N2, 2, 2), 127, dtype=torch.uint8).view(torch.float8_e8m0fnu).npu()
+  cu_seqlens_q = torch.arange(0, (B + 1) * S1, S1, dtype=torch.int32).npu()
+  cu_seqlens_k = torch.arange(0, (B + 1) * S2, S2, dtype=torch.int32).npu()
 
   class QuantLightningIndexerNetwork(torch.nn.Module):
       def __init__(self):
           super(QuantLightningIndexerNetwork, self).__init__()
 
-      def forward(self, query, key, weights, query_dequant_scale, key_dequant_scale):
+      def forward(self, query, key, weights, query_dequant_scale, key_dequant_scale, cu_seqlens_q, cu_seqlens_k):
           metadata = torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(
               num_heads_q=N1,
               num_heads_k=N2,
               head_dim=D,
               topk=topk,
-              quant_mode=1,
-              batch_size=B,
+              quant_mode=5,
+              cu_seqlens_q=cu_seqlens_q,
+              cu_seqlens_k=cu_seqlens_k,
+              batch_size=None,
               max_seqlen_q=S1,
               max_seqlen_k=S2,
-              layout_q="BSND",
-              layout_k="BSND",
+              layout_q="TND",
+              layout_k="TND",
               mask_mode=0,
-              cmp_ratio=1
+              cmp_ratio=1,
+              candidate_topk_blocks=2048,
+              candidate_block_size=8
           )
 
           return torch.ops.cann_ops_transformer.quant_lightning_indexer(
               query, key, weights, query_dequant_scale, key_dequant_scale,
               topk=topk,
-              quant_mode=1,
+              quant_mode=5,
+              cu_seqlens_q=cu_seqlens_q,
+              cu_seqlens_k=cu_seqlens_k,
               metadata=metadata,
               max_seqlen_q=-1,
-              layout_q="BSND",
-              layout_k="BSND",
+              layout_q="TND",
+              layout_k="TND",
               mask_mode=0,
               cmp_ratio=1,
-              return_value=1
+              return_value=1,
+              candidate_topk_blocks=2048,
+              candidate_block_size=8
           )
 
   from torchair.configs.compiler_config import CompilerConfig
@@ -702,7 +729,9 @@ Deterministic computation is supported by default.
   npu_backend = torchair.get_npu_backend(compiler_config=config)
   torch._dynamo.reset()
   npu_mode = torch.compile(QuantLightningIndexerNetwork(), fullgraph=True, backend=npu_backend, dynamic=False)
-  sparse_indices, sparse_values = npu_mode(query, key, weights, query_dequant_scale, key_dequant_scale)
+  sparse_indices, sparse_values, candidate_block_indices, candidate_block_length = npu_mode(query, key, weights, query_dequant_scale, key_dequant_scale, cu_seqlens_q, cu_seqlens_k)
   print(f"sparse_indices shape: {sparse_indices.shape}")
   print(f"sparse_values shape: {sparse_values.shape}")
+  print(f"candidate_block_indices shape: {candidate_block_indices.shape}")
+  print(f"candidate_block_length shape: {candidate_block_length.shape}")
   ```

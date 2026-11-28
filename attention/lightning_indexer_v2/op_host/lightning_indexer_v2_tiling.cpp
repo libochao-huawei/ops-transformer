@@ -1107,9 +1107,7 @@ ge::graphStatus LIV2InfoParser::ValidateInputShapesMatch()
     OP_CHECK_IF((liV2Params_.attenOut.shape->GetStorageShape().GetDim(liV2OutN2Dim + 1) != *liV2Params_.topk),
                 OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(
                     opName_, "sparse_indices", ToStringRaw(liV2Params_.attenOut.shape->GetStorageShape()),
-                    "The last dim of sparse_indices and sparse_count are " +
-                        std::to_string(liV2Params_.attenOut.shape->GetStorageShape().GetDim(liV2OutN2Dim + 1)) + ", " +
-                        std::to_string(*liV2Params_.topk) + " respectively, they must be same"),
+                    "The last dimension of sparse_indices must equal topk (" + std::to_string(*liV2Params_.topk) + ")"),
                 return ge::GRAPH_FAILED);
     // -----------------------check sparse_values------------------
     if ((npuArch_ == NpuArch::DAV_3510 || npuArch_ == NpuArch::DAV_9201 || npuArch_ == NpuArch::DAV_9202) &&

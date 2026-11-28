@@ -589,15 +589,10 @@ def check_result(
     elif seqused_k is not None:
         seqused_k = ast.literal_eval(seqused_k)
     npu_pass = True
-    max_error = 0
     max_re = 0
     thres = 0.001
-    diff_thd = 0.01
-    pct_thd = 0.005
-    max_diff_hd = 0.1
     rtol = 0.005
     atol = 0.000025
-    max_error_idx = 10000000
     cpu_output = expect.cpu().numpy()
     npu_output = result.cpu().numpy()
     real_data = result.cpu().numpy()
@@ -616,7 +611,6 @@ def check_result(
     else:
         total_rows = 0
         sp = (0, 0)
-    print(f"total_line is {total_rows}")
     npu_reshape = npu_output.reshape([total_rows, sparse_count])
     cpu_reshape = cpu_output.reshape([total_rows, sparse_count])
     if return_value:
@@ -626,7 +620,6 @@ def check_result(
         npu_topk_value = _reshape_topk_value(
             npu_topk_value, total_rows, sparse_count, params
         )
-    start_time = time()
     invalid_data = cpu_reshape != -1
     valid_lens = invalid_data.sum(axis=-1)  # (total_rows,)
     # 判断有效值部分集合是否相同
@@ -676,57 +669,21 @@ def check_result(
         )
         if not npu_pass_t:
             npu_pass = False
-    end_time = time()
-    print(f"耗时：{end_time - start_time:.6f} 秒")
     topk_precision = not diff_npu and not diff_cpu
     if topk_precision:
         print("[success]TopK精度通过, idx不同的地方的value误差在阈值之内")
     else:
         print("[fail]TopK精度失败")
-    print(f"npu_pass is {npu_pass}")
     if real_data.size == 0 and real_data.size == data_compe.size:
         print_log(
             'The npu_output is [],and it is same as bm_output, the result of data_compare is "Pass"'
         )
         return "Pass", 100.0, 0
-    start = 0
-    end = real_data.size - 1
-    if end < start:
-        end = start
     diff_result = np.isclose(
         real_data, data_compe, rtol=rtol, atol=atol, equal_nan=True
     )
-    err_idx = np.where(diff_result != np.array((True,)))[0]
-    diff_abs = abs(data_compe - real_data)
-    b1 = np.maximum(np.abs(real_data), (np.abs(data_compe)))
-    b2 = float((1.0 / (1 << 14)) / diff_thd)
-    b = np.add(np.maximum(b1, b2), 10e-10)
-    eps = 10e-10
-    err_diff = diff_abs / (b + eps)
-    err_diff = err_diff[err_idx]
-    split_count = int(end - start + 1) if end != start else 1
-    print_log("split_count:%s; max_diff_hd:%s;" % (float(split_count), max_diff_hd))
-    fulfill_percent = float(split_count - err_idx.size) / float(split_count) * 100.0
-    display_output_np_isclose(real_data, data_compe, start, end)
-    pct_thd = (1 - pct_thd) * 100.0
+    fulfill_percent = float(np.count_nonzero(diff_result)) / real_data.size * 100.0
     result = "Pass" if (npu_pass or topk_precision) else "Failed"
-    print_log(
-        "---------------------------------------------------------------------------------------"
-    )
-    print_log("Rtol   \t Atol   \t PctThd   \t PctRlt   \t Result")
-    print_log(
-        "---------------------------------------------------------------------------------------"
-    )
-    print_log(
-        "%.4f    \t %.6f  \t %.2f%%   \t %.6f%%   \t %s"
-        % (rtol, atol, pct_thd, fulfill_percent, result)
-    )
-    if len(err_diff) > 0:
-        print_log(
-            "Max-RelativeError is: %s. Threshold is: %s." % (max_error, max_diff_hd)
-        )
-    if result == "Failed":
-        display_error_output(real_data, data_compe, err_idx, err_diff[0:max_error_idx])
     return result, fulfill_percent
 
 

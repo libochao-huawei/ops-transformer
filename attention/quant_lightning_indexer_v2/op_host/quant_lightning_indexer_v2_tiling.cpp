@@ -174,8 +174,7 @@ ge::graphStatus QLIV2InfoParser::CheckRequiredAttrExistence() const
                 return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(qliV2Params_.sparseCount == nullptr,
-                OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "sparse_count", "Sparse_count is nullptr"),
-                return ge::GRAPH_FAILED);
+                OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "topk", "topk is missing"), return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(qliV2Params_.sparseMode == nullptr,
                 OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "sparse_mode", "Sparse_mode is nullptr"),
@@ -341,7 +340,7 @@ ge::graphStatus QLIV2InfoParser::GetAttrParaInfo()
         OP_LOGI(context_->GetNodeName(), "layout_key is:%s", qliV2Params_.layOutKey);
     }
     if (qliV2Params_.sparseCount != nullptr) {
-        OP_LOGI(context_->GetNodeName(), "selscted count is:%d", *qliV2Params_.sparseCount);
+        OP_LOGI(context_->GetNodeName(), "topk is:%d", *qliV2Params_.sparseCount);
     }
     if (qliV2Params_.sparseMode != nullptr) {
         OP_LOGI(context_->GetNodeName(), "sparse mode is:%d", *qliV2Params_.sparseMode);
@@ -396,11 +395,10 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
                                                   "cmp_ratio must be a power of two in [1, 128]."),
             return ge::GRAPH_FAILED);
     } else if (npuArch_ == NpuArch::DAV_3510 || npuArch_ == NpuArch::DAV_9201 || npuArch_ == NpuArch::DAV_9202) {
-        OP_CHECK_IF(
-            !((*qliV2Params_.sparseCount > 0) && (*qliV2Params_.sparseCount <= SPARSE_LIMIT_8K)),
-            OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "topk", std::to_string(*qliV2Params_.sparseCount),
-                                                  "Sparse_count must > 0 and <= " + std::to_string(SPARSE_LIMIT_8K)),
-            return ge::GRAPH_FAILED);
+        OP_CHECK_IF(!((*qliV2Params_.sparseCount > 0) && (*qliV2Params_.sparseCount <= SPARSE_LIMIT_8K)),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "topk", std::to_string(*qliV2Params_.sparseCount),
+                                                          "Expected 0 < topk <= " + std::to_string(SPARSE_LIMIT_8K)),
+                    return ge::GRAPH_FAILED);
         OP_CHECK_IF((*qliV2Params_.cmpRatio <= 0) || (*qliV2Params_.cmpRatio > 128),
                     OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "cmp_ratio", std::to_string(*qliV2Params_.cmpRatio),
                                                           "Cmp_ratio must > 0 and <= 128"),
@@ -1377,13 +1375,9 @@ ge::graphStatus QLIV2InfoParser::ValidateInputShapesMatch()
     // -----------------------check sparse_count-------------------
     OP_CHECK_IF(
         (qliV2Params_.attenOut.shape->GetStorageShape().GetDim(qliV2OutN2Dim + 1) != *qliV2Params_.sparseCount),
-        OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
-            opName_, "sparse_count and sparse_indices",
-            Ops::Base::ToString(qliV2Params_.key.shape->GetStorageShape()) + " and " +
-                Ops::Base::ToString(qliV2Params_.attenOut.shape->GetStorageShape()),
-            "BSND case sparse_count, sparse_indices last dim are " + std::to_string(*qliV2Params_.sparseCount) + ", " +
-                std::to_string(qliV2Params_.attenOut.shape->GetStorageShape().GetDim(qliV2OutN2Dim + 1)) +
-                " respectively, they must be same"),
+        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(
+            opName_, "sparse_indices", ToStringRaw(qliV2Params_.attenOut.shape->GetStorageShape()),
+            "The last dimension of sparse_indices must equal topk (" + std::to_string(*qliV2Params_.sparseCount) + ")"),
         return ge::GRAPH_FAILED);
     // -----------------------check cmp_residual_k-------------------
     if (qliV2Params_.cmpResidualK.tensor != nullptr) {

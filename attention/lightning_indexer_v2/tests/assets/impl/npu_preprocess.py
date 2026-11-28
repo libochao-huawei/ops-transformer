@@ -226,6 +226,23 @@ def run(
     **kwargs,
 ):
     """Generate metadata dynamically, or fill an existing static placeholder."""
+    if _metadata_target is None and (q is None or k is None or w is None):
+        # Let the Torch operator reject the missing tensor before any metadata lookup.
+        dtypes = kwargs.get("tensor_dtypes") or ()
+        if (
+            metadata is None
+            and len(dtypes) > METADATA_INDEX
+            and dtypes[METADATA_INDEX] is not None
+        ):
+            # TTK requires a tensor for the declared dynamic metadata slot.
+            device = next(
+                (tensor.device for tensor in (q, k, w) if torch.is_tensor(tensor)),
+                None,
+            )
+            return {
+                "metadata": torch.empty(0, dtype=torch.int32, device=device or "npu")
+            }
+        return None
     testcase_name = kwargs.get("testcase_name")
     is_error_case = expect_error(kwargs)
     del w
@@ -274,6 +291,19 @@ def run(
         force_metadata_refresh,
     )
     target = metadata if metadata is not None else _metadata_target
+    soc = (kwargs.get("short_soc_version") or "").lower()
+    seqused_k = arguments.get("seqused_k")
+    if (
+        _metadata_target is None
+        and soc.startswith("ascend950")
+        and torch.is_tensor(seqused_k)
+        and seqused_k.ndim == 1
+        and seqused_k.dtype == torch.int32
+    ):
+        # Report the invalid value before the asynchronous AICPU task runs.
+        for batch, length in enumerate(seqused_k.detach().cpu().tolist()):
+            if length < 0:
+                raise ValueError(f"seqused_k[{batch}] must be >= 0, got {length}")
     generated = run_metadata(arguments, target if target is not None else q)
     if metadata is None:
         return {"metadata": generated}

@@ -7798,7 +7798,7 @@ def _validate_qli_candidate(candidate_topk_blocks, candidate_block_size):
 def _validate_qli_compute_attributes(topk, mask_mode, cmp_ratio):
     """校验选择容量、掩码模式与压缩比例的支持范围。"""
     if int(topk) < 1 or int(topk) > 8192:
-        raise ValueError("Topk must be in ASC-supported range [1,8192]")
+        raise ValueError(f"topk must be in [1, 8192], got {topk}")
     if int(mask_mode) not in (0, 3):
         raise ValueError("Mask_mode must be 0 or 3")
     if int(cmp_ratio) < 1 or int(cmp_ratio) > 128:
@@ -7955,13 +7955,25 @@ def quant_lightning_indexer(
     PA_BBND 通过 block_table 映射物理页，TND K 使用序列边界。
     metadata 决定完整任务及 LD 分片，具体 CV 切块由编译配置选择。
     """
+    if q is None:
+        raise TypeError("q must be a Tensor, got None")
+    if k is None:
+        raise TypeError("k must be a Tensor, got None")
+    if w is None:
+        raise TypeError("w (weights) must be a Tensor, got None")
+    if descale_q is None:
+        raise TypeError("descale_q (Q scale) must be a Tensor, got None")
+    if descale_k is None:
+        raise TypeError("descale_k (K scale) must be a Tensor, got None")
     if layout_q == "TND" and cu_seqlens_q is None:
         raise ValueError("When layout_q is TND, cu_seqlens_q must be provided.")
     if layout_k == "TND" and cu_seqlens_k is None:
         raise ValueError("When layout_k is TND, cu_seqlens_k must be provided.")
     if layout_k == "PA_BBND":
-        if block_table is None or seqused_k is None:
-            raise ValueError("PA_BBND requires block_table and seqused_k")
+        if block_table is None:
+            raise ValueError("block_table must be provided for PA_BBND")
+        if seqused_k is None:
+            raise ValueError("seqused_k must be provided for PA_BBND")
         if cu_seqlens_k is not None:
             raise ValueError("PA_BBND must not supply cu_seqlens_k")
     query_heads = _validate_query_heads(q, w, descale_q)

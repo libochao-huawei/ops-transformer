@@ -42,6 +42,7 @@ METADATA = load_test_module("npu_preprocess", "impl/npu_preprocess.py")
 COMPARATOR = load_test_module("compare", "impl/compare.py").COMPARATOR
 build_data = GOLDEN.build_data
 CASE_DATA = {}
+METADATA_INDEX = 14
 OPTIONAL_INPUTS = (
     "cu_seqlens_q",
     "cu_seqlens_k",
@@ -62,6 +63,13 @@ def customize_inputs(*args, **kwargs):
     return None
 
 
+def has_missing_inputs(required, candidate_block_length, kwargs):
+    soc = str(kwargs.get("short_soc_version") or "").lower()
+    return any(tensor is None for tensor in required) or (
+        candidate_block_length is None and soc.startswith("ascend950")
+    )
+
+
 def generate_inputs(
     query,
     key,
@@ -75,6 +83,16 @@ def generate_inputs(
     candidate_block_length,
     **kwargs,
 ):
+    required = (
+        query,
+        key,
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        candidate_block_indices,
+    )
+    if has_missing_inputs(required, candidate_block_length, kwargs):
+        return None
     q, k, w = query, key, weights
     descale_q, descale_k = query_dequant_scale, key_dequant_scale
     kwargs.setdefault("layout_q", "BSND")
@@ -131,6 +149,16 @@ def golden(
     testcase_name=None,
     **kwargs,
 ):
+    required = (
+        query,
+        key,
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        candidate_block_indices,
+    )
+    if has_missing_inputs(required, candidate_block_length, kwargs):
+        return None
     q, k, w = query, key, weights
     descale_q, descale_k = query_dequant_scale, key_dequant_scale
     data = build_data(
@@ -169,6 +197,31 @@ def npu_preprocess(
     candidate_block_size=8,
     **kwargs,
 ):
+    required = (
+        query,
+        key,
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        candidate_block_indices,
+    )
+    if has_missing_inputs(required, candidate_block_length, kwargs):
+        # Let the Torch operator reject the missing tensor before any metadata lookup.
+        dtypes = kwargs.get("tensor_dtypes") or ()
+        if (
+            metadata is None
+            and len(dtypes) > METADATA_INDEX
+            and dtypes[METADATA_INDEX] is not None
+        ):
+            # TTK requires a tensor for the declared dynamic metadata slot.
+            device = next(
+                (tensor.device for tensor in required if torch.is_tensor(tensor)),
+                None,
+            )
+            return {
+                "metadata": torch.empty(0, dtype=torch.int32, device=device or "npu")
+            }
+        return None
     q, k, w = query, key, weights
     descale_q, descale_k = query_dequant_scale, key_dequant_scale
     del w, candidate_block_indices
@@ -215,6 +268,11 @@ def npu_preprocess(
     )
     if metadata is None:
         return {"metadata": generated}
+    if tuple(metadata.shape) != tuple(generated.shape):
+        raise ValueError(
+            "QSLI metadata shape mismatch: "
+            f"placeholder={tuple(metadata.shape)}, generated={tuple(generated.shape)}"
+        )
     metadata.copy_(generated)
     return None
 

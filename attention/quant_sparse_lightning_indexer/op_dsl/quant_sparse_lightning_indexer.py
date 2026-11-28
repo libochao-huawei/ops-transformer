@@ -3086,11 +3086,11 @@ def _validate_compute_attributes(
     if int(candidate_block_size) != CANDIDATE_BLOCK_SIZE:
         raise ValueError("Candidate_block_size must be 8")
     if int(topk) < 1 or int(topk) > 8192:
-        raise ValueError("Topk must be in [1,8192]")
+        raise ValueError(f"topk must be in [1, 8192], got {topk}")
     if int(mask_mode) not in (0, 3):
-        raise ValueError("Mask_mode must be 0 or 3")
+        raise ValueError(f"mask_mode must be 0 or 3, got {mask_mode}")
     if int(cmp_ratio) < 1 or int(cmp_ratio) > 128:
-        raise ValueError("Cmp_ratio must be in [1,128]")
+        raise ValueError(f"cmp_ratio must be in [1, 128], got {cmp_ratio}")
     if not -1 <= int(max_seqlen_q) < 2**31:
         raise ValueError("Max_seqlen_q must be in [-1, 2147483647]")
 
@@ -3249,13 +3249,29 @@ def quant_sparse_lightning_indexer(
     as the device-side contract so Host does not copy candidates or lengths
     back to CPU.  ``metadata`` must supply reusable device-produced S2 shard records.
     """
+    if q is None:
+        raise TypeError("q must be a Tensor, got None")
+    if k is None:
+        raise TypeError("k must be a Tensor, got None")
+    if w is None:
+        raise TypeError("w (weights) must be a Tensor, got None")
+    if descale_q is None:
+        raise TypeError("descale_q (Q scale) must be a Tensor, got None")
+    if layout_k != "PA_BBND" and descale_k is None:
+        raise TypeError("descale_k (K scale) must be a Tensor, got None")
+    if candidate_block_indices is None:
+        raise TypeError("candidate_block_indices must be a Tensor, got None")
+    if candidate_block_length is None:
+        raise TypeError("candidate_block_length must be a Tensor, got None")
     if layout_q == "TND" and cu_seqlens_q is None:
         raise ValueError("When layout_q is TND, cu_seqlens_q must be provided.")
     if layout_k == "TND" and cu_seqlens_k is None:
         raise ValueError("When layout_k is TND, cu_seqlens_k must be provided.")
     if layout_k == "PA_BBND":
-        if block_table is None or seqused_k is None:
-            raise ValueError("PA_BBND requires block_table and seqused_k")
+        if block_table is None:
+            raise ValueError("block_table must be provided for PA_BBND")
+        if seqused_k is None:
+            raise ValueError("seqused_k must be provided for PA_BBND")
         if cu_seqlens_k is not None:
             raise ValueError("PA_BBND must not supply cu_seqlens_k")
     if metadata is None:
@@ -4717,12 +4733,10 @@ def _validate_tnd_geometry(
     for name, tensor in (("seqused_q", used_q), ("seqused_k", used_k)):
         if tensor is not None:
             _validate_tnd_sequence(tensor, name, device, batch)
-    if (
-        not 1 <= int(topk) <= 8192
-        or int(mask_mode) not in (0, 3)
-        or not 1 <= int(cmp_ratio) <= 128
-    ):
-        raise ValueError("Invalid topk, mask_mode or cmp_ratio")
+    if int(mask_mode) not in (0, 3) or not 1 <= int(cmp_ratio) <= 128:
+        raise ValueError("Invalid mask_mode or cmp_ratio")
+    if not 1 <= int(topk) <= 8192:
+        raise ValueError(f"topk must be in [1, 8192], got {topk}")
     if int(mask_mode) == 3 and int(cmp_ratio) != 1:
         _validate_tnd_sequence(residual, "cmp_residual_k", device, batch)
     elif residual is not None:

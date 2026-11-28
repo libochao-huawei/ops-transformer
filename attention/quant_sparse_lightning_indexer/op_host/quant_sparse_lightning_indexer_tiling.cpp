@@ -156,8 +156,7 @@ ge::graphStatus QSLIInfoParserConsumer::CheckRequiredAttrExistence() const
                 return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(opParamInfo_.sparseCount == nullptr,
-                OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "sparse_count", "Sparse_count is nullptr"),
-                return ge::GRAPH_FAILED);
+                OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "topk", "topk is missing"), return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(opParamInfo_.sparseMode == nullptr,
                 OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "sparse_mode", "Sparse_mode is nullptr"),
@@ -307,7 +306,7 @@ ge::graphStatus QSLIInfoParserConsumer::GetAttrParaInfo()
         OP_LOGI(context_->GetNodeName(), "layout_key is:%s", opParamInfo_.layOutKey);
     }
     if (opParamInfo_.sparseCount != nullptr) {
-        OP_LOGI(context_->GetNodeName(), "selscted count is:%d", *opParamInfo_.sparseCount);
+        OP_LOGI(context_->GetNodeName(), "topk is:%d", *opParamInfo_.sparseCount);
     }
     if (opParamInfo_.sparseMode != nullptr) {
         OP_LOGI(context_->GetNodeName(), "sparse mode is:%d", *opParamInfo_.sparseMode);
@@ -343,11 +342,11 @@ ge::graphStatus QSLIInfoParserConsumer::CheckAttrParaInfo()
     }
 
     if (npuArch_ == NpuArch::DAV_2201) {
-        OP_CHECK_IF(!((*opParamInfo_.sparseCount > 0) && (*opParamInfo_.sparseCount <= SPARSE_LIMIT)),
-                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
-                        opName_, "sparse_count", std::to_string(*opParamInfo_.sparseCount).c_str(),
-                        "Sparse_count must be in (0, " + std::to_string(SPARSE_LIMIT) + "]"),
-                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(
+            !((*opParamInfo_.sparseCount > 0) && (*opParamInfo_.sparseCount <= SPARSE_LIMIT)),
+            OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "topk", std::to_string(*opParamInfo_.sparseCount).c_str(),
+                                                  "Expected 0 < topk <= " + std::to_string(SPARSE_LIMIT)),
+            return ge::GRAPH_FAILED);
         OP_CHECK_IF(
             (*opParamInfo_.cmpRatio <= 0) || (*opParamInfo_.cmpRatio > 128) ||
                 ((*opParamInfo_.cmpRatio & (*opParamInfo_.cmpRatio - 1)) != 0),
@@ -1166,15 +1165,12 @@ ge::graphStatus QSLIInfoParserConsumer::ValidateInputShapesMatch()
                         " respectively, they must be same"),
                 return ge::GRAPH_FAILED);
     // -----------------------check sparse_count-------------------
-    OP_CHECK_IF((opParamInfo_.attenOut.shape->GetStorageShape().GetDim(outN2Dim + 1) != *opParamInfo_.sparseCount),
-                OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
-                    opName_, "sparse_count and sparse_indices",
-                    Ops::Base::ToString(opParamInfo_.key.shape->GetStorageShape()) + " and " +
-                        Ops::Base::ToString(opParamInfo_.attenOut.shape->GetStorageShape()),
-                    "BSND case sparse_count, sparse_indices last dim are " + std::to_string(*opParamInfo_.sparseCount) +
-                        ", " + std::to_string(opParamInfo_.attenOut.shape->GetStorageShape().GetDim(outN2Dim + 1)) +
-                        " respectively, they must be same"),
-                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(
+        (opParamInfo_.attenOut.shape->GetStorageShape().GetDim(outN2Dim + 1) != *opParamInfo_.sparseCount),
+        OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(
+            opName_, "sparse_indices", ToStringRaw(opParamInfo_.attenOut.shape->GetStorageShape()),
+            "The last dimension of sparse_indices must equal topk (" + std::to_string(*opParamInfo_.sparseCount) + ")"),
+        return ge::GRAPH_FAILED);
     // -----------------------check cmp_residual_k-------------------
     if (opParamInfo_.cmpResidualK.tensor != nullptr) {
         OP_CHECK_IF(

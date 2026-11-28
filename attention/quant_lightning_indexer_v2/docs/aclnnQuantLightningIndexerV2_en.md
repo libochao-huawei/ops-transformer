@@ -279,12 +279,12 @@ aclnnStatus aclnnQuantLightningIndexerV2(
       <td>Core splitting information passed in by the QuantLightningIndexerV2Metadata operator.</td>
       <td>          <ul>
                 <li>Includes the number of used cores, block size, and the start point of data processed by each core.</li>
-                <li>The shape is [8 * (1 + aic_num + aiv_num) + 256], where aic_num and aiv_num are obtained from the current device. The final 256 int32 elements form a shared extension area. Passing an empty value is currently not supported.</li>
+                <li>The length must be at least the result of rounding 8 * (aic_num + aiv_num) up to a multiple of 1024 elements. The AIC and AIV core counts are obtained from the current device. Passing an empty value is currently not supported.</li>
           </ul>
       </td>
       <td>INT32</td>
       <td>ND</td>
-      <td>(8 * (1 + aic_num + aiv_num) + 256,)</td>
+      <td>(ceil(8 * (aic_num + aiv_num) / 1024) * 1024,)</td>
       <td>x</td>
     </tr>
     <tr>
@@ -577,6 +577,7 @@ The following sample code is for reference only. For details about compilation a
 #include "securec.h"
 #include "acl/acl.h"
 #include "aclnnop/aclnn_quant_lightning_indexer_v2.h"
+#include "aclnnop/aclnn_quant_lightning_indexer_v2_metadata.h"
 #include "aclnn/opdev/platform.h"
 
 using namespace std;
@@ -687,7 +688,10 @@ int InitializeTensors(TensorResources& resources) {
         LOG_PRINT("Failed to query AIV count\n");
         return ACL_ERROR_INVALID_PARAM;
     }
-    std::vector<int64_t> metadataShape = {8LL * (1 + aicCoreNum + aivCoreNum) + 256LL};
+    constexpr int64_t METADATA_ALIGNMENT = 1024;
+    const int64_t metadataCoreSize = 8LL * (aicCoreNum + aivCoreNum);
+    std::vector<int64_t> metadataShape = {(metadataCoreSize + METADATA_ALIGNMENT - 1) / METADATA_ALIGNMENT *
+                                          METADATA_ALIGNMENT};
     std::vector<int64_t> sparseIndicesShape = {B, S1, N2, topk};
     std::vector<int64_t> sparseValuesShape = {B, S1, N2, topk};
 
@@ -767,9 +771,28 @@ int ExecuteQuantLightningIndexerV2(TensorResources& resources, aclrtStream strea
         LOG_PRINT("memcpy_s layoutK failed. ERROR: %d\n", memcpyRet);
         return -1;
     }
+    // Generate the split metadata for the inputs before running the operator.
+    uint64_t metadataWorkspaceSize = 0;
+    aclOpExecutor* metadataExecutor = nullptr;
+    int ret = aclnnQuantLightningIndexerV2MetadataGetWorkspaceSize(
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        64, 1, 128, topk, quantMode, 2, 4, 8, layoutQ, layoutK, maskMode, cmpRatio,
+        resources.metadataTensor, &metadataWorkspaceSize, &metadataExecutor);
+    if (!CHECK_RET(ret == ACL_SUCCESS)) { return ret; }
+    void* metadataWorkspace = nullptr;
+    if (metadataWorkspaceSize > 0) {
+        ret = aclrtMalloc(&metadataWorkspace, metadataWorkspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (!CHECK_RET(ret == ACL_SUCCESS)) { return ret; }
+    }
+    ret = aclnnQuantLightningIndexerV2Metadata(metadataWorkspace, metadataWorkspaceSize, metadataExecutor, stream);
+    auto syncRet = aclrtSynchronizeStream(stream);
+    if (metadataWorkspace != nullptr) { aclrtFree(metadataWorkspace); }
+    if (!CHECK_RET(ret == ACL_SUCCESS)) { return ret; }
+    if (!CHECK_RET(syncRet == ACL_SUCCESS)) { return syncRet; }
+
     aclOpExecutor* executor;
 
-    int ret = aclnnQuantLightningIndexerV2GetWorkspaceSize(
+    ret = aclnnQuantLightningIndexerV2GetWorkspaceSize(
         resources.queryTensor, resources.keyTensor, resources.weightsTensor,
         resources.qScaleTensor, resources.kScaleTensor,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -890,9 +913,9 @@ int main() {
         return ret;
     }
 
-    PrintOutResult(sparseIndicesShape, resources.sparseIndicesDeviceAddr);
+    ret = PrintOutResult(sparseIndicesShape, resources.sparseIndicesDeviceAddr);
 
     CleanupResources(resources, workspaceAddr, stream, deviceId);
-    return 0;
+    return ret;
 }
 ```

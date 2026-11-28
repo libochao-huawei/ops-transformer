@@ -712,8 +712,10 @@ def metadata_geometry(
         raise ValueError(
             "MX4 metadata requires Nq=1..32 or 64, Nk=1 and logical head_dim=128"
         )
-    if mask_mode not in (0, 3) or not 1 <= cmp_ratio <= 128 or not 1 <= topk <= 8192:
-        raise ValueError("Invalid mask_mode, cmp_ratio or topk")
+    if mask_mode not in (0, 3) or not 1 <= cmp_ratio <= 128:
+        raise ValueError("Invalid mask_mode or cmp_ratio")
+    if not 1 <= topk <= 8192:
+        raise ValueError(f"topk must be in [1, 8192], got {topk}")
     tensors = [
         x for x in (cu_seqlens_q, seqused_q, seqused_k, cmp_residual_k) if x is not None
     ]
@@ -924,8 +926,10 @@ def _tnd_metadata(
         raise ValueError("TND metadata requires batch_size=None")
     if layout_q != "TND" or max_seqlen_q < -1 or max_seqlen_k < -1:
         raise ValueError("Invalid layout or sequence maximum")
-    if not 1 <= topk <= 8192 or mask_mode not in (0, 3) or not 1 <= cmp_ratio <= 128:
-        raise ValueError("Invalid topk, mask_mode or cmp_ratio")
+    if mask_mode not in (0, 3) or not 1 <= cmp_ratio <= 128:
+        raise ValueError("Invalid mask_mode or cmp_ratio")
+    if not 1 <= topk <= 8192:
+        raise ValueError(f"topk must be in [1, 8192], got {topk}")
     if candidate_topk_blocks == -1:
         if candidate_block_size != -1:
             raise ValueError("Disabled candidate requires block size -1")

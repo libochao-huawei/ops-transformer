@@ -134,6 +134,9 @@ def cpu_quant_lightning_indexer_v2(
     **kwargs,
 ):
     """Materialize Golden from the exact pytest data produced by input."""
+    required = (query, key, weights, query_dequant_scale, key_dequant_scale)
+    if any(tensor is None for tensor in required):
+        return None
     del query, key, weights, query_dequant_scale, key_dequant_scale
     del topk, quant_mode, kwargs
     data = activate_case_data(testcase_name)

@@ -239,7 +239,7 @@ aclnnStatus CheckSingleParamQliV2(int64_t numHeadsQ, int64_t numHeadsK, int64_t 
                        (quantMode == QLI_V2_QUANT_MODE_3) || (quantMode == QLI_V2_QUANT_MODE_4) ||
                        (quantMode == QLI_V2_QUANT_MODE_5),
                    ACLNN_ERR_PARAM_INVALID,
-                   "For Ascend 950PR/Ascend 950DT, quant_mode should be %lld/%lld/%lld, but got %lld",
+                   "For Ascend 950PR/Ascend 950DT, quant_mode should be %lld/%lld/%lld/%lld/%lld, but got %lld",
                    QLI_V2_QUANT_MODE_1, QLI_V2_QUANT_MODE_2, QLI_V2_QUANT_MODE_3, QLI_V2_QUANT_MODE_4,
                    QLI_V2_QUANT_MODE_5, quantMode);
         // cmp_ratio 校验
