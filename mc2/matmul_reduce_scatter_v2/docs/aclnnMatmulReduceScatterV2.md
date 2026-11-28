@@ -264,7 +264,7 @@ aclnnStatus aclnnMatmulReduceScatterV2(
         <td>amaxOutOptional(aclTensor*)</td>
         <td>输出</td>
         <td>MM计算的最大值结果，即公式中的amaxOut。</td>
-        <td>当前版本仅支持nullptr或空Tensor。</td>
+        <td>请传nullptr或空Tensor。Atlas A2/A3系列产品的aiv模式会忽略此参数，接受非空Tensor时，也不会写入amax结果。</td>
         <td>FLOAT</td>
         <td>ND</td>
         <td>1</td>

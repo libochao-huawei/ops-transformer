@@ -265,7 +265,7 @@ aclnnStatus aclnnMatmulReduceScatterV2(
         <td>amaxOutOptional(aclTensor*)</td>
         <td>Output</td>
         <td>Maximum value result of the MM calculation, that is, amaxOut in the formula.</td>
-        <td>The current version only supports nullptr or an empty tensor.</td>
+        <td>Pass nullptr or an empty tensor. In aiv mode on Atlas A2 and A3 products, this argument is ignored. No amax result is written when the API accepts a non-empty tensor.</td>
         <td>FLOAT</td>
         <td>ND</td>
         <td>1</td>
