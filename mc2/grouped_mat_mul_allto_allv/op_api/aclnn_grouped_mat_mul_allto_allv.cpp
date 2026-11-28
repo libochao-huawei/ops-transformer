@@ -131,6 +131,13 @@ aclnnStatus aclnnGroupedMatMulAlltoAllvGetWorkspaceSize(
     auto ret_send_and_recv = CheckSendAndRecv(sendCounts, recvCounts);
     CHECK_RET(ret_send_and_recv == ACLNN_SUCCESS, ret_send_and_recv);
 
+    if (GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND910B) {
+        OP_LOGE_FOR_INVALID_VALUE_WITH_REASON("aclnnGroupedMatMulAlltoAllvGetWorkspaceSize", "socVersion", "Ascend910B",
+                                              "aclnnGroupedMatMulAlltoAllv is not supported on Atlas A2. "
+                                              "Use aclnnGroupedMatMulAlltoAllvV2 with commMode=\"aiv\"");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+
     const char* commMode = "ai_cpu";
     char* str_commMode = const_cast<char*>(commMode);
     aclnnStatus ret = aclnnInnerGroupedMatMulAlltoAllvGetWorkspaceSize(

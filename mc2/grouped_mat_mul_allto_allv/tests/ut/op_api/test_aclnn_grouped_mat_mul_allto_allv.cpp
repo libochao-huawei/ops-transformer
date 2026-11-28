@@ -255,6 +255,27 @@ TEST_F(L2GroupedMatMulAlltoAllvTest, TestWithValidSendRecvCounts)
     EXPECT_NE(aclRet, ACLNN_ERR_PARAM_INVALID);
 }
 
+TEST_F(L2GroupedMatMulAlltoAllvTest, TestAtlasA2RejectsV1)
+{
+    TensorDesc gmmX = TensorDesc({128, 256}, ACL_BF16, ACL_FORMAT_ND);
+    TensorDesc gmmWeight = TensorDesc({2, 256, 128}, ACL_BF16, ACL_FORMAT_ND);
+    TensorDesc y = TensorDesc({128, 128}, ACL_BF16, ACL_FORMAT_ND);
+    constexpr int64_t epWorldSize = 8;
+    constexpr int64_t expertCount = 2;
+    IntArrayDesc counts(epWorldSize * expertCount, 8);
+    auto ut = OP_API_UT(aclnnGroupedMatMulAlltoAllv,
+                        INPUT(gmmX, gmmWeight, nullptr, nullptr, nullptr, nullptr, "test_ep_group", epWorldSize, counts,
+                              counts, false, false),
+                        OUTPUT(y, nullptr));
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    const auto savedSocVersion = GetCurrentPlatformInfo().GetSocVersion();
+    SetPlatformSocVersion(SocVersion::ASCEND910B);
+    aclnnStatus ret = ut.TestGetWorkspaceSizeWithNNopbaseInner(&workspaceSize, executor);
+    SetPlatformSocVersion(savedSocVersion);
+    EXPECT_EQ(ret, ACLNN_ERR_PARAM_INVALID);
+}
+
 // recvCounts empty array - covers lines 83-85
 TEST_F(L2GroupedMatMulAlltoAllvTest, TestRecvCountsEmpty)
 {

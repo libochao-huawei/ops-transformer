@@ -289,7 +289,7 @@ aclnnStatus aclnnGroupedMatMulAlltoAllv(
     <tr>
     <td>ACLNN_ERR_PARAM_INVALID</td>
     <td>161002</td>
-    <td>The data type, data format, or dimension of gmmX, gmmWeight, sendCountsTensorOptional, recvCountsTensorOptional, mmXOptional, mmWeightOptional, group, epWorldSize, sendCounts, or recvCounts is out of the supported range.</td>
+    <td>The data type, data format, or dimension of gmmX, gmmWeight, sendCountsTensorOptional, recvCountsTensorOptional, mmXOptional, mmWeightOptional, group, epWorldSize, sendCounts, or recvCounts is out of the supported range.<br>This API is unsupported on Atlas A2 training products. Call aclnnGroupedMatMulAlltoAllvV2 with commMode set to aiv.</td>
     </tr>
     </tbody></table>
 

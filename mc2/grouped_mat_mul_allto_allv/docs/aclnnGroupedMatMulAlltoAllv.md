@@ -287,7 +287,7 @@ aclnnStatus aclnnGroupedMatMulAlltoAllv(
     <tr>
     <td>ACLNN_ERR_PARAM_INVALID</td>
     <td>161002</td>
-    <td>gmmX、gmmWeight、sendCountsTensorOptional、recvCountsTensorOptional、mmXOptional、mmWeightOptional、group、epWorldSize、sendCounts、recvCounts的数据类型、数据格式或者维度不在支持的范围内。</td>
+    <td>gmmX、gmmWeight、sendCountsTensorOptional、recvCountsTensorOptional、mmXOptional、mmWeightOptional、group、epWorldSize、sendCounts、recvCounts的数据类型、数据格式或者维度不在支持的范围内。<br>Atlas A2 训练系列产品不支持本接口。请调用 aclnnGroupedMatMulAlltoAllvV2 并设置 commMode 为 aiv。</td>
     </tr>
     </tbody></table>
 
