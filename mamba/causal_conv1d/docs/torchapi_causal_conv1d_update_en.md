@@ -27,7 +27,7 @@
 
 - **Description**:
 
-    Causal 1D convolution state update (decode/update), encapsulating aclnnCausalConv1dUpdate. Uses cached data to pad the head of each sequence along the sequence dimension, ensuring that the output depends on both current and historical inputs. Optionally applies SiLU activation after the convolution. After the computation, updates part of the current sequence data to the cache. Supports features such as cache index (cacheIndices) and speculative decoding (numAcceptedTokens).
+    Causal 1D convolution state update (decode/update), encapsulating aclnnCausalConv1dUpdate. Uses cached data to pad the head of each sequence along the sequence dimension, ensuring that the output depends on both current and historical inputs. Optionally applies SiLU activation after the convolution. After the computation, updates part of the current sequence data to the cache. Supports features such as cache index (conv_state_indices) and speculative decoding (num_accepted_tokens).
 
 - **Formula**:
 
@@ -71,10 +71,10 @@ cann_ops_transformer.causal_conv1d_update(
 | conv_state_indices | Tensor | Optional | Cache index. Specifies the index of the cache state corresponding to each sequence in conv_state. Default None uses identity mapping. | int32 | [batch] |
 | num_accepted_tokens | Tensor | Optional | Number of accepted tokens per batch in speculative decoding. Supported only when kW=4. Default None. | int32 | [batch] |
 | query_start_loc | Tensor | Optional | Start position index of variable-length sequences. Default None. If provided, the batch size is determined by query_start_loc.size(0)-1 instead of being inferred from the shape of x. | int32 | [batch+1] |
-| max_query_len | int | Optional | Maximum query length. -1 means no limit. Default value is -1. | - | - |
-| null_block_id | int | Optional | ID marking an invalid cache slot. If conv_state_indices[i]==null_block_id, the sequence is skipped and the output is zero-filled. Default value is 0. | - | - |
-| block_idx_last_scheduled_token | Tensor | Optional | Block index of the last scheduled token. | int32 | [batch] |
-| initial_state_idx | Tensor | Optional | Initial state index. | int32 | [batch] |
+| max_query_len | int | Optional | Maximum query length. -1 means no limit. Reserved parameter, not effective in the current version. Default value is -1. | - | - |
+| null_block_id | int | Optional | ID marking an invalid cache slot. If conv_state_indices[i]==null_block_id, the sequence is skipped, and the corresponding output positions are not written (the values are undefined). Default value is 0. It is recommended to set this parameter to a value outside the valid value range of conv_state_indices (for example, -1). | - | - |
+| block_idx_last_scheduled_token | Tensor | Optional | Block index of the last scheduled token. Reserved parameter, not effective in the current version. Default None. | int32 | [batch] |
+| initial_state_idx | Tensor | Optional | Initial state index. Reserved parameter, not effective in the current version. Default None. | int32 | [batch] |
 
 ## Return Values
 
@@ -104,6 +104,9 @@ Returns the convolution output Tensor y. The shape is the same as x, and the dty
 
     torch_npu.npu.set_device(0)
 
+    # Decode scenario: x is [B, 1, D], one token per sequence; weight is [kW, D];
+    # conv_state is the [B, kW-1, D] cache state, initialized to zeros in this example;
+    # activation="silu" applies SiLU to the convolution output; y has the same shape as x, and conv_state is updated in place.
     B = 4
     D = 512
     kW = 2
@@ -120,7 +123,7 @@ Returns the convolution output Tensor y. The shape is the same as x, and the dty
 
 - Calling in graph mode
 
-    The operator is automatically converted to a GE graph operator through `torch.compile(backend="atc")` or `torchair`. No additional configuration is required.
+    The operator is automatically converted to a GE graph operator through `torch.compile` with the NPU backend provided by `torchair`. No additional configuration is required.
 
     ```python
     import torch
@@ -130,6 +133,9 @@ Returns the convolution output Tensor y. The shape is the same as x, and the dty
 
     torch_npu.npu.set_device(0)
 
+    # Graph mode example: the operator call is wrapped in an nn.Module and compiled into a GE graph
+    # through the NPU backend provided by torchair; the inputs are the same as those in single-operator
+    # mode, and the returned y has the same shape as x.
     B = 4
     D = 512
     kW = 2

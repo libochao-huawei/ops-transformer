@@ -27,7 +27,7 @@
 
 - **Description**:
 
-    Causal 1D convolution forward computation (prefill/chunk-prefill), encapsulating aclnnCausalConv1dFn. Along the sequence dimension, cache data (length: kernel width minus 1) is used to pad the head of each sequence, ensuring that the output depends on the current and historical inputs. SiLU activation is optionally applied after the convolution. After the computation, part of the current sequence data is updated to the cache. Features such as cache index (cacheIndices) and initial state mode (initialStateMode) are supported.
+    Causal 1D convolution forward computation (prefill/chunk-prefill), encapsulating aclnnCausalConv1dFn. Along the sequence dimension, cache data (length: kernel width minus 1) is used to pad the head of each sequence, ensuring that the output depends on the current and historical inputs. SiLU activation is optionally applied after the convolution. After the computation, part of the current sequence data is updated to the cache. Features such as cache index (cache_indices) and initial state flag (has_initial_state) are supported.
 
 - **Formula**:
 
@@ -65,19 +65,19 @@ cann_ops_transformer.causal_conv1d_fn(
 |--------|----------|-----------|------|----------|-------------|
 | x | Tensor | Required | Input sequence. | float16, bfloat16 | [batch, seq_len, dim] (fixed batch) or [cu_seq_len, dim] (variable length) |
 | weight | Tensor | Required | Convolution weight. | Same as x | [kW, dim], kW∈{2, 3, 4} |
-| bias | Tensor | Required | Convolution bias. None indicates that no bias is used. | Same as x | [dim] |
+| bias | Tensor | Optional | Convolution bias. Default None means no bias is used. | Same as x | [dim] |
 | conv_states | Tensor | Required | Convolution state cache, updated in place after computation. | Same as x | [num_cache_lines, state_len, dim], state_len ≥ kW-1 |
 | query_start_loc | Tensor | Required | Start index of variable-length sequences. Required for variable-length use cases; an empty Tensor can be passed for fixed-batch use cases. | int32 | [batch+1] |
 | cache_indices | Tensor | Optional | Cache indices, specifying the index of the cache state in conv_states for each sequence. The default value is None, which uses the identity mapping. | int32 | [batch] |
 | has_initial_state | Tensor | Optional | Initial state flag. 1 = use cached history, 0 = zero initialization (cold start). The default value is None, which means zero initialization for all sequences. | int32 | [batch] |
 | activation | str | Optional | Activation function type, "silu" or "none". The default value is "silu". | - | - |
 | pad_slot_id | int | Optional | Padding slot ID. The default value is -1. | - | - |
-| null_block_id | int | Optional | ID of an invalid cache slot. If cache_indices[i]==null_block_id, the sequence is skipped and the output is filled with zeros. The default value is 0. | - | - |
-| block_idx_first_scheduled_token | Tensor | Optional | Index of the first scheduled token block. | int32 | [batch] |
-| block_idx_last_scheduled_token | Tensor | Optional | Index of the last scheduled token block. | int32 | [batch] |
-| initial_state_idx | Tensor | Optional | Initial state index. | int32 | [batch] |
-| num_computed_tokens | Tensor | Optional | Number of computed tokens for each sequence. | int32 | [batch] |
-| block_size_to_align | int | Optional | Block size for cache state alignment. The default value is 0. | - | - |
+| null_block_id | int | Optional | ID of an invalid cache slot. If cache_indices[i]==null_block_id, the sequence is skipped, and the corresponding output positions are not written (the values are undefined). The default value is 0. It is recommended to set this parameter to a value outside the valid value range of cache_indices (for example, -1). | - | - |
+| block_idx_first_scheduled_token | Tensor | Optional | Index of the first scheduled token block. Reserved parameter, not effective in the current version. Default None. | int32 | [batch] |
+| block_idx_last_scheduled_token | Tensor | Optional | Index of the last scheduled token block. Reserved parameter, not effective in the current version. Default None. | int32 | [batch] |
+| initial_state_idx | Tensor | Optional | Initial state index. Reserved parameter, not effective in the current version. Default None. | int32 | [batch] |
+| num_computed_tokens | Tensor | Optional | Number of computed tokens for each sequence. Reserved parameter, not effective in the current version. Default None. | int32 | [batch] |
+| block_size_to_align | int | Optional | Block size for cache state alignment. Reserved parameter, not effective in the current version. The default value is 0. | - | - |
 
 ## Return Values
 
@@ -106,6 +106,10 @@ Returns the convolution output tensor y, with the same shape as x and the same d
 
     torch_npu.npu.set_device(0)
 
+    # Prefill with fixed batch: x is [B, S, D], where B sequences each contain S tokens;
+    # query_start_loc is [batch+1], [0, S, 2*S] in this example, matching B=2;
+    # conv_states is the [B, kW-1, D] cache state, initialized to zeros in this example, and bias is [D];
+    # activation="silu" applies SiLU to the convolution output; y has the same shape as x, and conv_states is updated in place.
     B = 2
     S = 16
     D = 512
@@ -125,7 +129,7 @@ Returns the convolution output tensor y, with the same shape as x and the same d
 
 - Call in graph mode
 
-    The operator is automatically converted to a GE graph operator through `torch.compile(backend="atc")` or `torchair`. No additional configuration is required.
+    The operator is automatically converted to a GE graph operator through `torch.compile` with the NPU backend provided by `torchair`. No additional configuration is required.
 
     ```python
     import torch
@@ -135,6 +139,9 @@ Returns the convolution output tensor y, with the same shape as x and the same d
 
     torch_npu.npu.set_device(0)
 
+    # Graph mode example: the operator call is wrapped in an nn.Module and compiled into a GE graph
+    # through the NPU backend provided by torchair; the inputs are the same as those in single-operator
+    # mode, and the returned y has the same shape as x.
     B = 2
     S = 16
     D = 512

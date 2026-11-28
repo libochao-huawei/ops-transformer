@@ -174,11 +174,11 @@ def _causal_conv1d_fn(
     for i in range(batch_size):
         cache_idx = int(cache_indices_list[i])
         if cache_indices_t is not None and cache_idx == null_block_id:
+            # 对齐 vLLM 语义：命中 null_block_id 的 batch 跳过计算，y 不被写入。
+            # ST 框架将纯输出张量预填为常量 1，kernel 不写则保留预填值，golden 以同值对拍。
             cur_seq_len = x_t.shape[1] if is_3d else seq_list[i].shape[0]
             output_list.append(
-                torch.zeros(
-                    cur_seq_len, x_t.shape[-1], dtype=torch.float32, device=device
-                )
+                torch.ones(cur_seq_len, x_t.shape[-1], dtype=dtype, device=device)
             )
             continue
 
@@ -277,11 +277,11 @@ def _causal_conv1d_update(
     for i in range(batch_size):
         cache_idx = int(cache_indices_list[i])
         if cache_indices_t is not None and cache_idx == null_block_id:
+            # 对齐 vLLM 语义：命中 null_block_id 的 batch 跳过计算，y 不被写入。
+            # ST 框架将纯输出张量预填为常量 1，kernel 不写则保留预填值，golden 以同值对拍。
             cur_seq_len = x_t.shape[1] if is_3d else seq_list[i].shape[0]
             output_list.append(
-                torch.zeros(
-                    cur_seq_len, x_t.shape[-1], dtype=torch.float32, device=device
-                )
+                torch.ones(cur_seq_len, x_t.shape[-1], dtype=dtype, device=device)
             )
             continue
 

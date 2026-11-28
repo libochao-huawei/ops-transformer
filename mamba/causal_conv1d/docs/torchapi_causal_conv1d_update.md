@@ -25,7 +25,7 @@
 
 - **接口功能**：
 
-    因果一维卷积状态更新（decode/update），封装aclnnCausalConv1dUpdate。沿序列维度使用缓存数据对各序列头部进行padding，确保输出依赖当前及历史输入；卷积完成后可选施加SiLU激活；计算完成后将当前序列部分数据更新到缓存。支持缓存索引（cacheIndices）、投机解码（numAcceptedTokens）等特性。
+    因果一维卷积状态更新（decode/update），封装aclnnCausalConv1dUpdate。沿序列维度使用缓存数据对各序列头部进行padding，确保输出依赖当前及历史输入；卷积完成后可选施加SiLU激活；计算完成后将当前序列部分数据更新到缓存。支持缓存索引（`conv_state_indices`）、投机解码（`num_accepted_tokens`）等特性。
 
 - **计算公式**：
 
@@ -69,10 +69,10 @@ cann_ops_transformer.causal_conv1d_update(
 | conv_state_indices | Tensor | 可选 | 缓存索引，指定每个序列对应的缓存状态在conv_state中的索引。默认None使用恒等映射。 | int32 | [batch] |
 | num_accepted_tokens | Tensor | 可选 | 投机解码中每个batch已接受的token数，仅kW=4支持。默认None。 | int32 | [batch] |
 | query_start_loc | Tensor | 可选 | 变长序列起始位置索引。默认None。提供时，batch大小由query_start_loc.size(0)-1决定，而非由x的shape推导。 | int32 | [batch+1] |
-| max_query_len | int | 可选 | 最大查询长度，-1表示不限制。默认值为-1。 | - | - |
-| null_block_id | int | 可选 | 无效缓存槽位标记ID，conv_state_indices[i]==null_block_id时跳过该序列并输出填零。默认值为0。 | - | - |
-| block_idx_last_scheduled_token | Tensor | 可选 | 最后调度token块索引。 | int32 | [batch] |
-| initial_state_idx | Tensor | 可选 | 初始状态索引。 | int32 | [batch] |
+| max_query_len | int | 可选 | 最大查询长度，-1表示不限制。预留参数，当前版本不生效。默认值为-1。 | - | - |
+| null_block_id | int | 可选 | 无效缓存槽位标记ID，conv_state_indices[i]==null_block_id时跳过该序列，输出对应位置不被写入，取值未定义。默认值为0，建议设置为不会出现在conv_state_indices有效取值范围内的值（如-1）。 | - | - |
+| block_idx_last_scheduled_token | Tensor | 可选 | 最后调度token块索引。预留参数，当前版本不生效。默认None。 | int32 | [batch] |
+| initial_state_idx | Tensor | 可选 | 初始状态索引。预留参数，当前版本不生效。默认None。 | int32 | [batch] |
 
 ## 返回值说明
 
@@ -102,6 +102,9 @@ cann_ops_transformer.causal_conv1d_update(
 
     torch_npu.npu.set_device(0)
 
+    # decode场景：x为[B, 1, D]，每个序列1个token；weight为[kW, D]；
+    # conv_state为[B, kW-1, D]缓存状态，本例初始化为零；
+    # activation="silu"对卷积输出施加SiLU激活，返回y的shape与x一致，conv_state原地更新。
     B = 4
     D = 512
     kW = 2
@@ -118,7 +121,7 @@ cann_ops_transformer.causal_conv1d_update(
 
 - 图模式调用
 
-    通过`torch.compile(backend="atc")`或`torchair`自动将算子转换为GE图算子，无需额外配置。
+    通过`torchair`提供的NPU后端配合`torch.compile`，算子自动转换为GE图算子，无需额外配置。
 
     ```python
     import torch
@@ -128,6 +131,8 @@ cann_ops_transformer.causal_conv1d_update(
 
     torch_npu.npu.set_device(0)
 
+    # 图模式示例：将算子调用封装为nn.Module，通过torchair提供的NPU后端编译为GE图执行；
+    # 输入与单算子模式一致，返回y的shape与x一致。
     B = 4
     D = 512
     kW = 2

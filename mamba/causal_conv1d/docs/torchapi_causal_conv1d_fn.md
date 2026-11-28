@@ -25,7 +25,7 @@
 
 - **接口功能**：
 
-    因果一维卷积前向计算（prefill/chunk-prefill），封装aclnnCausalConv1dFn。沿序列维度使用缓存数据（长度为卷积核宽减1）对各序列头部进行padding，确保输出依赖当前及历史输入；卷积完成后可选施加SiLU激活；计算完成后将当前序列部分数据更新到缓存。支持缓存索引（`cache_indices`）、初始状态标志（`has_initial_state`）与初始状态索引（`initial_state_idx`）等特性。
+    因果一维卷积前向计算（prefill/chunk-prefill），封装aclnnCausalConv1dFn。沿序列维度使用缓存数据（长度为卷积核宽减1）对各序列头部进行padding，确保输出依赖当前及历史输入；卷积完成后可选施加SiLU激活；计算完成后将当前序列部分数据更新到缓存。支持缓存索引（`cache_indices`）与初始状态标志（`has_initial_state`）等特性。
 
 - **计算公式**：
 
@@ -63,19 +63,19 @@ cann_ops_transformer.causal_conv1d_fn(
 |--------|----------|-----------|------|----------|-------------|
 | x | Tensor | 必选 | 输入序列。 | float16、bfloat16 | [batch, seq_len, dim]（固定batch）或 [cu_seq_len, dim]（变长） |
 | weight | Tensor | 必选 | 卷积权重。 | 同x | [kW, dim]，kW∈{2, 3, 4} |
-| bias | Tensor | 必选 | 卷积偏置，None表示不使用。 | 同x | [dim] |
+| bias | Tensor | 可选 | 卷积偏置。默认None表示不使用。 | 同x | [dim] |
 | conv_states | Tensor | 必选 | 卷积状态缓存，计算后原地更新。 | 同x | [num_cache_lines, state_len, dim]，state_len ≥ kW-1 |
 | query_start_loc | Tensor | 必选 | 变长序列起始位置索引。变长场景必须提供，固定batch场景可传空Tensor。 | int32 | [batch+1] |
 | cache_indices | Tensor | 可选 | 缓存索引，指定每个序列对应的缓存状态在conv_states中的索引。默认None使用恒等映射。 | int32 | [batch] |
 | has_initial_state | Tensor | 可选 | 初始状态标志。1=使用缓存历史，0=零初始化（冷启动）。默认None全部零初始化。 | int32 | [batch] |
 | activation | str | 可选 | 激活函数类型，“silu”或“none”。默认值为“silu”。 | - | - |
 | pad_slot_id | int | 可选 | 填充槽位ID，标识无需参与卷积计算的padding位置，命中该槽位的序列按padding处理。默认值为-1。 | - | - |
-| null_block_id | int | 可选 | 无效缓存槽位标记ID，cache_indices[i]==null_block_id时跳过该序列并输出填零。默认值为0。 | - | - |
-| block_idx_first_scheduled_token | Tensor | 可选 | 首个调度token块索引。 | int32 | [batch] |
-| block_idx_last_scheduled_token | Tensor | 可选 | 最后调度token块索引。 | int32 | [batch] |
-| initial_state_idx | Tensor | 可选 | 初始状态索引。 | int32 | [batch] |
-| num_computed_tokens | Tensor | 可选 | 各序列已完成的token数。 | int32 | [batch] |
-| block_size_to_align | int | 可选 | 缓存状态对齐的块大小。默认值为0。 | - | - |
+| null_block_id | int | 可选 | 无效缓存槽位标记ID，cache_indices[i]==null_block_id时跳过该序列，输出对应位置不被写入，取值未定义。默认值为0，建议设置为不会出现在cache_indices有效取值范围内的值（如-1）。 | - | - |
+| block_idx_first_scheduled_token | Tensor | 可选 | 首个调度token块索引。预留参数，当前版本不生效。默认None。 | int32 | [batch] |
+| block_idx_last_scheduled_token | Tensor | 可选 | 最后调度token块索引。预留参数，当前版本不生效。默认None。 | int32 | [batch] |
+| initial_state_idx | Tensor | 可选 | 初始状态索引。预留参数，当前版本不生效。默认None。 | int32 | [batch] |
+| num_computed_tokens | Tensor | 可选 | 各序列已完成的token数。预留参数，当前版本不生效。默认None。 | int32 | [batch] |
+| block_size_to_align | int | 可选 | 缓存状态对齐的块大小。预留参数，当前版本不生效。默认值为0。 | - | - |
 
 ## 返回值说明
 
@@ -104,6 +104,10 @@ cann_ops_transformer.causal_conv1d_fn(
 
     torch_npu.npu.set_device(0)
 
+    # prefill固定batch场景：x为[B, S, D]，B个序列，每个序列S个token；
+    # query_start_loc为[batch+1]，本例取[0, S, 2*S]，对应B=2；
+    # conv_states为[B, kW-1, D]缓存状态，本例初始化为零；bias为[D]偏置；
+    # activation="silu"对卷积输出施加SiLU激活，返回y的shape与x一致，conv_states原地更新。
     B = 2
     S = 16
     D = 512
@@ -123,7 +127,7 @@ cann_ops_transformer.causal_conv1d_fn(
 
 - 图模式调用
 
-    通过`torch.compile(backend="atc")`或`torchair`自动将算子转换为GE图算子，无需额外配置。
+    通过`torchair`提供的NPU后端配合`torch.compile`，算子自动转换为GE图算子，无需额外配置。
 
     ```python
     import torch
@@ -133,6 +137,8 @@ cann_ops_transformer.causal_conv1d_fn(
 
     torch_npu.npu.set_device(0)
 
+    # 图模式示例：将算子调用封装为nn.Module，通过torchair提供的NPU后端编译为GE图执行；
+    # 输入与单算子模式一致，返回y的shape与x一致。
     B = 2
     S = 16
     D = 512

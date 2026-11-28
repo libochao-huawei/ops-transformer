@@ -193,7 +193,7 @@ aclnnStatus aclnnCausalConv1dFn(
     <tr>
       <td>cacheIndicesOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>缓存索引，指定每个序列对应的缓存状态在convStates中的索引。不传时使用恒等映射。</td>
+      <td>缓存索引，指定每个序列对应的缓存状态在convStates中的索引。传入nullptr时使用恒等映射。</td>
       <td>shape为[batch]。值∈[0, numCacheLines)，或等于nullBlockId表示跳过该序列。nullBlockId可被多个序列重复使用（padding场景）；除nullBlockId外的值不应重复，否则多个序列读写同一缓存槽位会导致历史状态错误和写入冲突。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -203,8 +203,8 @@ aclnnStatus aclnnCausalConv1dFn(
     <tr>
       <td>initialStateModeOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>初始状态模式，表示各序列是否使用缓存的初始状态。不传时全部从零初始化。</td>
-      <td>shape为[batch]。值：0=零初始化，1=使用缓存状态。开启时需额外workspace用于快照。</td>
+      <td>初始状态模式，表示各序列是否使用缓存的初始状态。传入nullptr时全部从零初始化。</td>
+      <td>shape为[batch]。值：0=零初始化，1=使用缓存状态。开启时需额外workspace用于快照。3D输入seqLen=1属于decode场景，不支持该参数。</td>
       <td>INT32</td>
       <td>ND</td>
       <td>1</td>
@@ -213,7 +213,7 @@ aclnnStatus aclnnCausalConv1dFn(
     <tr>
       <td>blockIdxFirstScheduledTokenOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>首个调度token块索引，指向cacheIndices中首个待填充缓存块的位置。</td>
+      <td>首个调度token块索引，指向cacheIndices中首个待填充缓存块的位置。预留参数，当前版本不生效。</td>
       <td>shape为[batch]。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -223,7 +223,7 @@ aclnnStatus aclnnCausalConv1dFn(
     <tr>
       <td>blockIdxLastScheduledTokenOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>最后调度token块索引，指向cacheIndices中最后一个待填充缓存块的位置。</td>
+      <td>最后调度token块索引，指向cacheIndices中最后一个待填充缓存块的位置。预留参数，当前版本不生效。</td>
       <td>shape为[batch]。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -233,7 +233,7 @@ aclnnStatus aclnnCausalConv1dFn(
     <tr>
       <td>initialStateIdxOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>初始状态索引，指向cacheIndices中初始状态所在位置。</td>
+      <td>初始状态索引，指向cacheIndices中初始状态所在位置。预留参数，当前版本不生效。</td>
       <td>shape为[batch]。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -243,7 +243,7 @@ aclnnStatus aclnnCausalConv1dFn(
     <tr>
       <td>numComputedTokensOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>各序列已完成的token数。</td>
+      <td>各序列已完成的token数。预留参数，当前版本不生效。</td>
       <td>shape为[batch]。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -254,7 +254,7 @@ aclnnStatus aclnnCausalConv1dFn(
       <td>activation（const char*）</td>
       <td>输入</td>
       <td>激活函数类型。</td>
-      <td>"silu"：SiLU；"none"：无激活。</td>
+      <td>"silu"：SiLU；"none"：无激活。默认值为"silu"。</td>
       <td>STRING</td>
       <td>-</td>
       <td>-</td>
@@ -264,7 +264,7 @@ aclnnStatus aclnnCausalConv1dFn(
       <td>nullBlockId（int64_t）</td>
       <td>输入</td>
       <td>用于跳过不需要参与计算的batch。</td>
-      <td>当cacheIndices[i]==nullBlockId时跳过该batch，对应输出填零。用户应设置为一个不会出现在cacheIndices中的值（如-1），以避免误跳过有效batch。</td>
+      <td>当cacheIndices[i]==nullBlockId时跳过该batch，y对应位置不被写入，取值未定义，调用方应自行初始化该区域或确保后续计算不依赖其取值。nullBlockId应设置为不会出现在cacheIndices中的值（如-1），以避免误跳过有效batch。</td>
       <td>INT64</td>
       <td>-</td>
       <td>-</td>
@@ -273,7 +273,7 @@ aclnnStatus aclnnCausalConv1dFn(
     <tr>
       <td>blockSizeToAlign（int64_t）</td>
       <td>输入</td>
-      <td>缓存状态对齐的块大小。</td>
+      <td>缓存状态对齐的块大小。预留参数，当前版本不生效。</td>
       <td>-</td>
       <td>INT64</td>
       <td>-</td>
@@ -334,20 +334,30 @@ aclnnStatus aclnnCausalConv1dFn(
     <tr>
       <td>ACLNN_ERR_PARAM_NULLPTR</td>
       <td>161001</td>
-      <td>传入的x、weight、convStatesRef、y是空指针。</td>
+      <td>传入的x、weight、convStatesRef、y、workspaceSize、executor是空指针。</td>
     </tr>
     <tr>
-      <td>ACLNN_ERR_INNER_TILING_ERROR</td>
-      <td>561002</td>
+      <td>ACLNN_ERR_PARAM_INVALID</td>
+      <td>161002</td>
       <td>
       输入和输出的数据类型不在支持的范围内。<br>
       x、weight、convStatesRef、biasOptional、y的数据类型不一致。<br>
       queryStartLocOptional、cacheIndicesOptional、initialStateModeOptional等的数据类型不是INT32。<br>
       输入、输出Tensor的shape不在支持的范围内。<br>
+      y与x的shape不一致。<br>
       输入的属性不在支持的范围内。<br>
+      weight、biasOptional、queryStartLocOptional等输入Tensor非连续。<br>
       dim不满足对齐要求（需满足 (dim * dtypeSize) % 32 == 0）。<br>
       K不在[2,4]范围内。<br>
       变长场景未提供queryStartLocOptional。<br>
+      </td>
+    </tr>
+    <tr>
+      <td>ACLNN_ERR_INNER_TILING_ERROR</td>
+      <td>561002</td>
+      <td>
+      底层算子调用失败，例如tiling校验不通过。<br>
+      3D输入seqLen=1属于decode场景，不支持initialStateModeOptional。<br>
       </td>
     </tr>
   </tbody></table>
@@ -402,7 +412,7 @@ aclnnStatus aclnnCausalConv1dFn(
 
 - 输入shape限制：
   - prefill场景（固定batch）：
-    - x为3维[batch, seqLen, dim]，seqLen > 0。
+    - x为3维[batch, seqLen, dim]，seqLen > 1；seqLen=1属于decode场景。
     - weight为2维[K, dim]，K∈{2,3,4}。
     - convStatesRef为3维[numCacheLines, stateLen, dim]，stateLen ≥ K-1，numCacheLines ≥ batch。
     - dim范围[64, 16384]且满足 (dim * dtypeSize) % 32 == 0，batch范围[1, 1024]。
@@ -415,7 +425,7 @@ aclnnStatus aclnnCausalConv1dFn(
 - 输入值域限制：
   - queryStartLocOptional[0]必须为0，queryStartLocOptional[-1]必须等于cuSeqLen，值必须非递减。
   - cacheIndicesOptional中的值∈[0, numCacheLines)，或等于nullBlockId表示跳过。nullBlockId可重复；除nullBlockId外的值不应重复，否则多个序列读写同一缓存槽位会导致历史状态错误和写入冲突。
-  - initialStateModeOptional值∈{0,1}。
+  - initialStateModeOptional值∈{0,1}；3D输入seqLen=1属于decode场景，不支持该参数。
 
 - 卷积核宽度K仅支持2、3、4。
 - K为编译时已知常量，支持FnRolling快速路径优化。

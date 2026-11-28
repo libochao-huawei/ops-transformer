@@ -32,7 +32,7 @@ namespace {
 
 static int64_t ParseActivationStr(const char* str)
 {
-    if (str == nullptr || std::strcmp(str, "") == 0 || std::strcmp(str, "silu") == 0) {
+    if (str == nullptr || std::strcmp(str, "silu") == 0) {
         return 1;
     }
     if (std::strcmp(str, "none") == 0) {
@@ -244,10 +244,9 @@ static bool CheckScenarioConstraints(const aclTensor* x, const aclTensor* convSt
 
 static bool CheckOutputShape(const aclTensor* x, const aclTensor* y)
 {
-    auto xDimNum = x->GetViewShape().GetDimNum();
-    auto yDimNum = y->GetViewShape().GetDimNum();
-    if (yDimNum != xDimNum) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "y dim num(%zuD) must match x dim num(%zuD).", yDimNum, xDimNum);
+    if (y->GetViewShape() != x->GetViewShape()) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "y shape(%s) must match x shape(%s).",
+                op::ToString(y->GetViewShape()).GetString(), op::ToString(x->GetViewShape()).GetString());
         return false;
     }
     return true;

@@ -185,7 +185,7 @@ aclnnStatus aclnnCausalConv1dUpdate(
     <tr>
       <td>cacheIndicesOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>缓存索引，指定每个序列对应的缓存状态在convStates中的索引。不传时使用恒等映射。</td>
+      <td>缓存索引，指定每个序列对应的缓存状态在convStates中的索引。传入nullptr时使用恒等映射。</td>
       <td>shape为[batch]。值∈[0, numCacheLines)，或等于nullBlockId表示跳过该序列。nullBlockId可被多个序列重复使用（padding场景）；除nullBlockId外的值不应重复，否则多个序列读写同一缓存槽位会导致历史状态错误和写入冲突。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -195,7 +195,7 @@ aclnnStatus aclnnCausalConv1dUpdate(
     <tr>
       <td>numAcceptedTokensOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>投机解码中每个batch已接受的token数，用于确定从convStates中读取历史状态的起始位置。仅K=4支持，不传时从convStates的起始位置开始读取历史。</td>
+      <td>投机解码中每个batch已接受的token数，用于确定从convStates中读取历史状态的起始位置。仅K=4支持，传入nullptr时从convStates的起始位置开始读取历史。</td>
       <td>shape为[batch]，dtype为INT32。取值范围[0, stateLen - (K - 1)]，其中stateLen为convStates.shape[1]，K为weight.shape[0]。算子内部计算offset = max(numAcceptedTokens[i] - 1, 0)，从convStates的第offset个位置开始读取历史状态进行卷积计算。超出此范围会导致convStates越界访问。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -205,7 +205,7 @@ aclnnStatus aclnnCausalConv1dUpdate(
     <tr>
       <td>blockIdxLastScheduledTokenOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>最后调度token块索引，指向cacheIndices中最后一个待填充缓存块的位置。</td>
+      <td>最后调度token块索引，指向cacheIndices中最后一个待填充缓存块的位置。预留参数，当前版本不生效。</td>
       <td>shape为[batch]。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -215,7 +215,7 @@ aclnnStatus aclnnCausalConv1dUpdate(
     <tr>
       <td>initialStateIdxOptional（aclTensor*）</td>
       <td>可选输入</td>
-      <td>初始状态索引，指向cacheIndices中初始状态所在位置。</td>
+      <td>初始状态索引，指向cacheIndices中初始状态所在位置。预留参数，当前版本不生效。</td>
       <td>shape为[batch]。</td>
       <td>INT32</td>
       <td>ND</td>
@@ -226,7 +226,7 @@ aclnnStatus aclnnCausalConv1dUpdate(
       <td>activation（const char*）</td>
       <td>输入</td>
       <td>激活函数类型。</td>
-      <td>"silu"：SiLU；"none"：无激活。</td>
+      <td>"silu"：SiLU；"none"：无激活。默认值为"silu"。</td>
       <td>STRING</td>
       <td>-</td>
       <td>-</td>
@@ -236,7 +236,7 @@ aclnnStatus aclnnCausalConv1dUpdate(
       <td>nullBlockId（int64_t）</td>
       <td>输入</td>
       <td>用于跳过不需要参与计算的batch。</td>
-      <td>当cacheIndices[i]==nullBlockId时跳过该batch，对应输出填零。用户应设置为一个不会出现在cacheIndices中的值（如-1），以避免误跳过有效batch。</td>
+      <td>当cacheIndices[i]==nullBlockId时跳过该batch，y对应位置不被写入，取值未定义，调用方应自行初始化该区域或确保后续计算不依赖其取值。nullBlockId应设置为不会出现在cacheIndices中的值（如-1），以避免误跳过有效batch。</td>
       <td>INT64</td>
       <td>-</td>
       <td>-</td>
@@ -245,7 +245,7 @@ aclnnStatus aclnnCausalConv1dUpdate(
     <tr>
       <td>maxQueryLen（int64_t）</td>
       <td>输入</td>
-      <td>最大查询长度。</td>
+      <td>最大查询长度。预留参数，当前版本不生效。</td>
       <td>-1表示不限制。</td>
       <td>INT64</td>
       <td>-</td>
@@ -306,21 +306,30 @@ aclnnStatus aclnnCausalConv1dUpdate(
     <tr>
       <td>ACLNN_ERR_PARAM_NULLPTR</td>
       <td>161001</td>
-      <td>传入的x、weight、convStatesRef、y是空指针。</td>
+      <td>传入的x、weight、convStatesRef、y、workspaceSize、executor是空指针。</td>
     </tr>
     <tr>
-      <td>ACLNN_ERR_INNER_TILING_ERROR</td>
-      <td>561002</td>
+      <td>ACLNN_ERR_PARAM_INVALID</td>
+      <td>161002</td>
       <td>
       输入和输出的数据类型不在支持的范围内。<br>
       x、weight、convStatesRef、biasOptional、y的数据类型不一致。<br>
       cacheIndicesOptional、queryStartLocOptional、numAcceptedTokensOptional等的数据类型不是INT32。<br>
       输入、输出Tensor的shape不在支持的范围内。<br>
+      y与x的shape不一致。<br>
       输入的属性不在支持的范围内。<br>
+      weight、biasOptional、queryStartLocOptional等输入Tensor非连续。<br>
       dim不满足对齐要求（需满足 (dim * dtypeSize) % 32 == 0）。<br>
       K不在[2,4]范围内。<br>
       变长场景未提供queryStartLocOptional。<br>
       K≠4时提供了numAcceptedTokensOptional。<br>
+      </td>
+    </tr>
+    <tr>
+      <td>ACLNN_ERR_INNER_TILING_ERROR</td>
+      <td>561002</td>
+      <td>
+      底层算子调用失败，例如tiling校验不通过。<br>
       </td>
     </tr>
   </tbody></table>

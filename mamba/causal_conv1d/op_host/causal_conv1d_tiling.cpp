@@ -219,7 +219,7 @@ ge::graphStatus CausalConv1dTiling::SetupFnInitStateWorkspace()
 
 static int64_t ParseActivationModeStr(const char* str)
 {
-    if (str == nullptr || std::strcmp(str, "") == 0 || std::strcmp(str, "silu") == 0) {
+    if (str == nullptr || std::strcmp(str, "silu") == 0) {
         return 1;
     }
     if (std::strcmp(str, "none") == 0) {

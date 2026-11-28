@@ -437,12 +437,12 @@ TEST_F(l2_causal_conv1d_fn_test, Ascend950_fn_numCacheLines_less_than_batch)
     EXPECT_EQ(ret, ACLNN_ERR_PARAM_INVALID);
 }
 
-TEST_F(l2_causal_conv1d_fn_test, Ascend950_fn_y_dimnum_mismatch)
+TEST_F(l2_causal_conv1d_fn_test, Ascend950_fn_y_shape_mismatch)
 {
     auto x = TensorDesc({4, 16, 512}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-10, 10);
     auto weight = TensorDesc({4, 512}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-10, 10);
     auto convStates = TensorDesc({4, 4, 512}, ACL_FLOAT16, ACL_FORMAT_ND).ValueRange(-10, 10);
-    auto y = TensorDesc({64, 512}, ACL_FLOAT16, ACL_FORMAT_ND);
+    auto y = TensorDesc({4, 8, 512}, ACL_FLOAT16, ACL_FORMAT_ND);
     const char* activation = "silu";
     auto ut = OP_API_UT(aclnnCausalConv1dFn,
                         INPUT(x, weight, convStates, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
